@@ -108,11 +108,12 @@
   .leaflet-div-icon{background:transparent;border:none;}
 
   #dataStatus{
-    position:absolute;left:14px;top:12px;z-index:1000;
+    position:absolute;right:14px;top:12px;max-width:calc(100% - 70px);z-index:1000;
     padding:6px 12px;border-radius:20px;font-size:12px;font-weight:600;
-    box-shadow:0 2px 8px rgba(0,0,0,.15);display:flex;align-items:center;gap:6px;
+    box-shadow:0 2px 8px rgba(0,0,0,.15);display:inline-flex;align-items:center;gap:6px;
   }
   #dataStatus .sw{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
+  #dataStatus #dataStatusText{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   #dataStatus.st-loading{background:#fff;color:var(--muted);}
   #dataStatus.st-loading .sw{background:#9ca3af;animation:pulse 1.2s infinite;}
   #dataStatus.st-ok{background:#eaf5ee;color:#1f6b45;}
@@ -131,6 +132,15 @@
     align-items:center;justify-content:center;
   }
   #fabPin.show{display:flex;}
+
+  #btnLocateFab{
+    position:absolute;left:14px;top:100px;z-index:1000;
+    width:44px;height:44px;border-radius:50%;background:#fff;color:var(--accent);border:1px solid var(--line);
+    box-shadow:0 2px 8px rgba(0,0,0,.2);cursor:pointer;display:flex;
+    align-items:center;justify-content:center;padding:0;
+  }
+  #btnLocateFab svg{width:22px;height:22px;}
+  #btnLocateFab.active{color:#fff;background:var(--accent);}
 
   #liveStatus{
     position:absolute;left:14px;bottom:14px;right:78px;z-index:1000;background:#fff;border:1px solid var(--line);
@@ -195,6 +205,9 @@
       <button id="btnStopNoSave" class="livebtn danger-text">Stop (don't save)</button>
     </div>
     <button id="fabPin" title="Drop a pin at my current location">+</button>
+    <button id="btnLocateFab" title="Center on my location">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
+    </button>
 
     <div id="panel">
       <div class="section">
@@ -276,7 +289,6 @@
 
       <div class="section">
         <h3>Data</h3>
-        <button class="small-btn" id="btnLocate" style="width:100%;margin-bottom:6px;">Center on my location</button>
         <button class="small-btn" id="btnExport" style="width:100%;margin-bottom:6px;">Export pins + segments (JSON)</button>
         <button class="small-btn danger-text" id="btnClear" style="width:100%;">Clear all data</button>
       </div>
@@ -338,6 +350,7 @@
   // ---------- map ----------
   const map = L.map('map', {
     zoomControl: true,
+    zoomSnap: 0.25, zoomDelta: 0.5, wheelPxPerZoomLevel: 90,
     rotate: true, rotateControl: false, bearing: 0,
     touchRotate: false, shiftKeyRotate: false
   }).setView([39.83, -98.58], 4); // center of US fallback
@@ -628,20 +641,32 @@
   }
 
   const segLayer = L.layerGroup().addTo(map);
-  const segPolylines = {}; // key -> polyline
+  const segHitLayer = L.layerGroup().addTo(map); // invisible wide tap-targets, drawn above segLayer
+  const segPolylines = {}; // key -> visible polyline
+  const segHitLines = {};  // key -> invisible fat hit-target polyline
 
   function segColor(state){ return STATE_COLOR[state] || STATE_COLOR.neutral; }
 
   function drawSegment(key, latlngs, state){
     if(segPolylines[key]){ segLayer.removeLayer(segPolylines[key]); }
     const pl = L.polyline(latlngs, {
-      color: segColor(state), weight: state==='neutral' ? 4 : 6, opacity: state==='neutral' ? 0.55 : 0.9
+      color: segColor(state), weight: state==='neutral' ? 4 : 6, opacity: state==='neutral' ? 0.55 : 0.9,
+      interactive: false // clicks are handled by the wider invisible hit-line below
     }).addTo(segLayer);
-    pl.on('click', (e)=>{
-      L.DomEvent.stopPropagation(e);
-      cycleSegment(key, latlngs);
-    });
     segPolylines[key] = pl;
+
+    if(!segHitLines[key]){
+      // a much fatter, fully transparent line makes it far easier to tap a
+      // thin road on a phone screen without changing how thin it looks
+      const hit = L.polyline(latlngs, {
+        color: '#000', weight: 26, opacity: 0, interactive: true
+      }).addTo(segHitLayer);
+      hit.on('click', (e)=>{
+        L.DomEvent.stopPropagation(e);
+        cycleSegment(key, latlngs);
+      });
+      segHitLines[key] = hit;
+    }
   }
 
   function cycleSegment(key, latlngs){
@@ -1172,15 +1197,15 @@ ${pts}
   };
 
   // ---------- locate ----------
-  document.getElementById('btnLocate').onclick = ()=>{
+  document.getElementById('btnLocateFab').onclick = function(){
     if(!navigator.geolocation){ showWarn('Geolocation not available in this browser.', 3000); return; }
-    showHint('Locating…');
+    this.classList.add('active');
     navigator.geolocation.getCurrentPosition(
       pos=>{
         map.setView([pos.coords.latitude, pos.coords.longitude], 16);
-        showHint('');
+        this.classList.remove('active');
       },
-      err=>{ showHint(''); showWarn('Could not get your location: '+err.message, 3500); },
+      err=>{ this.classList.remove('active'); showWarn('Could not get your location: '+err.message, 3500); },
       { enableHighAccuracy:true, timeout:8000 }
     );
   };
