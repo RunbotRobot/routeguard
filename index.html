@@ -210,8 +210,12 @@
           <span>Show my location &amp; heading</span>
           <input type="checkbox" id="showLocationToggle" checked style="width:auto;">
         </div>
+        <div class="legend-row" style="justify-content:space-between;margin-top:6px;">
+          <span>Rotate map to face me <b>(experimental)</b></span>
+          <input type="checkbox" id="rotateMapToggle" style="width:auto;">
+        </div>
         <div style="font-size:11.5px;color:var(--muted);margin-top:4px;">
-          Shows in every mode, not just while recording a run.
+          Shows in every mode, not just while recording a run. Map rotation is new — if pins or roads ever look like they've shifted from where they should be, turn this off immediately; everything reverts to normal north-up.
         </div>
         <div id="headingBadge" style="font-size:11.5px;color:var(--muted);margin-top:6px;display:none;">Facing —</div>
       </div>
@@ -300,6 +304,7 @@
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/leaflet-rotate@0.2.8/dist/leaflet-rotate-src.js"></script>
 <script>
 (function(){
   "use strict";
@@ -331,7 +336,12 @@
   const STATE_COLOR = { neutral:"#8b93a1", safe:"#2f8f5b", avoid:"#c1443c" };
 
   // ---------- map ----------
-  const map = L.map('map', { zoomControl: true }).setView([39.83, -98.58], 4); // center of US fallback
+  const map = L.map('map', {
+    zoomControl: true,
+    rotate: true, rotateControl: false, bearing: 0,
+    touchRotate: false, shiftKeyRotate: false
+  }).setView([39.83, -98.58], 4); // center of US fallback
+  const mapRotationSupported = (typeof map.setBearing === 'function');
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19,
     attribution: '&copy; OpenStreetMap contributors'
@@ -353,9 +363,9 @@
   function setMode(m){
     mode = m;
     [btnPin,btnRoute,btnBrowse].forEach(b=>b.classList.remove('active'));
-    if(m==='pin'){ btnPin.classList.add('active'); showHint('Tap the map to drop a pin.'); }
-    if(m==='route'){ btnRoute.classList.add('active'); routeClicks=[]; showHint('Tap a start point, then an end point.'); }
-    if(m==='browse'){ btnBrowse.classList.add('active'); showHint(''); }
+    if(m==='pin'){ btnPin.classList.add('active'); showHint('Tap the map to drop a pin.'); suspendRotationForPrecision(true); }
+    if(m==='route'){ btnRoute.classList.add('active'); routeClicks=[]; showHint('Tap a start point, then an end point.'); suspendRotationForPrecision(true); }
+    if(m==='browse'){ btnBrowse.classList.add('active'); showHint(''); suspendRotationForPrecision(false); }
   }
   btnPin.onclick = ()=>setMode('pin');
   btnRoute.onclick = ()=>setMode('route');
@@ -413,6 +423,7 @@
   let lastLoadedBounds = null;
   let dataLoadInFlight = false;
   let overpassAbort = null;
+  let lastPoiCount = null, lastRoadCount = null;
 
   function setDataStatus(state, extra){
     dataStatusEl.className = state;
@@ -434,12 +445,18 @@
     return m+'m ago';
   }
 
-  // periodically refresh the "updated Xs ago" text without refetching
+  function okStatusText(){
+    const counts = (lastPoiCount != null) ? `${lastPoiCount} location${lastPoiCount===1?'':'s'}, ${lastRoadCount} road segment${lastRoadCount===1?'':'s'} · ` : '';
+    return `${counts}Updated ${ageLabel(lastSuccessAt)}`;
+  }
+
+  // tick every second so "Updated Xs ago" counts up in real time, and the
+  // location/road counts stay visible instead of getting overwritten
   setInterval(()=>{
     if(lastSuccessAt && dataStatusEl.className === 'st-ok'){
-      setDataStatus('st-ok', `Updated ${ageLabel(lastSuccessAt)}`);
+      setDataStatus('st-ok', okStatusText());
     }
-  }, 5000);
+  }, 1000);
 
   function tagsToCategory(tags){
     if(!tags) return null;
@@ -542,7 +559,9 @@
         const {poiCount, roadEdgeCount} = applyOverpassResults(data);
         lastSuccessAt = Date.now();
         lastLoadedBounds = b;
-        setDataStatus('st-ok', `Updated just now · ${poiCount} location${poiCount===1?'':'s'}, ${roadEdgeCount} road segments`);
+        lastPoiCount = poiCount;
+        lastRoadCount = roadEdgeCount;
+        setDataStatus('st-ok', okStatusText());
         dataLoadInFlight = false;
         return;
       }catch(err){
@@ -919,13 +938,48 @@
     return `Facing ${dirs[i]} (${Math.round(deg)}°)`;
   }
 
+  // ---------- map rotation (experimental, opt-in) ----------
+  const rotateMapToggle = document.getElementById('rotateMapToggle');
+  let rotateMapActive = false;
+
+  if(!mapRotationSupported){
+    rotateMapToggle.disabled = true;
+    rotateMapToggle.parentElement.title = 'Rotation plugin failed to load — check your connection and reload';
+  }
+
+  rotateMapToggle.onchange = ()=>{
+    if(!mapRotationSupported){ rotateMapToggle.checked = false; return; }
+    rotateMapActive = rotateMapToggle.checked;
+    if(!rotateMapActive){
+      map.setBearing(0);
+    } else if(lastHeadingDeg != null){
+      map.setBearing(lastHeadingDeg);
+    }
+  };
+
+  // Safety net: always drop back to north-up while precisely placing a pin or
+  // a route point, regardless of the toggle above, since accurate taps matter
+  // most in exactly those two modes. Rotation resumes automatically in browse mode.
+  function suspendRotationForPrecision(suspend){
+    if(!mapRotationSupported || !rotateMapActive) return;
+    if(suspend) map.setBearing(0);
+    else map.setBearing(lastHeadingDeg || 0);
+  }
+
   function setHeading(deg){
     lastHeadingDeg = deg;
     if(!coneEl && liveMarker){
       const el = liveMarker.getElement();
       if(el) coneEl = el.querySelector('#liveCone');
     }
-    if(coneEl) coneEl.style.transform = `rotate(${deg}deg)`;
+    if(rotateMapActive && mode === 'browse'){
+      // the map itself rotates to face this heading; keep the marker's own
+      // cone fixed pointing "up" so it doesn't double-rotate on top of that
+      if(coneEl) coneEl.style.transform = 'rotate(0deg)';
+      map.setBearing(deg);
+    } else {
+      if(coneEl) coneEl.style.transform = `rotate(${deg}deg)`;
+    }
     headingBadge.textContent = headingLabel(deg);
   }
 
