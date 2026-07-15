@@ -127,6 +127,14 @@
 
   #main{position:relative;}
   .leaflet-tile-pane{ filter: grayscale(45%) brightness(1.2) contrast(0.8) saturate(60%); }
+  body.satellite-mode .leaflet-tile-pane{ filter: none; }
+  #btnSatellite{
+    position:absolute;left:14px;top:154px;z-index:1000;
+    width:44px;height:44px;border-radius:50%;background:#fff;color:var(--accent);border:1px solid var(--line);
+    box-shadow:0 2px 8px rgba(0,0,0,.2);cursor:pointer;display:flex;
+    align-items:center;justify-content:center;padding:0;font-size:18px;
+  }
+  #btnSatellite.active{color:#fff;background:var(--accent);}
   .leaflet-control-scale{
     margin-bottom:56px !important; margin-left:14px !important;
     background:rgba(255,255,255,.85); padding:2px 6px; border-radius:4px;
@@ -195,7 +203,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.18</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.19</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -216,13 +224,14 @@
     <button id="btnLocateFab" title="Center on my location">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
     </button>
+    <button id="btnSatellite" title="Toggle satellite view">🛰</button>
 
     <div id="panel">
       <div class="section">
         <h3>Mode</h3>
         <button class="tool" id="btnPin"><span class="dot" style="background:#c1443c"></span>Add pin</button>
         <button class="tool" id="btnRoute"><span class="dot" style="background:#2f5d50"></span>Plan route</button>
-        <button class="tool active" id="btnBrowse"><span class="dot" style="background:#8b93a1"></span>Browse / mark segments</button>
+        <button class="tool active" id="btnBrowse"><span class="dot" style="background:#8b93a1"></span>Browse / mark lines</button>
       </div>
 
       <div class="section">
@@ -236,7 +245,7 @@
           <input type="checkbox" id="rotateMapToggle" style="width:auto;" disabled>
         </div>
         <div style="font-size:11.5px;color:var(--muted);margin-top:4px;">
-          Shows in every mode, not just while recording a run. Map rotation is new — if pins or roads ever look like they've shifted from where they should be, turn this off immediately; everything reverts to normal north-up.
+          Shows in every mode, not just while recording a run. Map rotation is new — if pins or lines ever look like they've shifted from where they should be, turn this off immediately; everything reverts to normal north-up.
         </div>
         <div id="headingBadge" style="font-size:11.5px;color:var(--muted);margin-top:6px;display:none;">Facing —</div>
       </div>
@@ -245,7 +254,7 @@
         <h3>Record Run</h3>
         <button class="small-btn primary" id="btnStartRecord" style="width:100%;">Start recording</button>
         <div style="font-size:11px;color:var(--muted);margin-top:4px;">
-          Records a GPX track you can save or send to Strava. Works independently of the mode above — you can still drop pins or mark segments while recording.
+          Records a GPX track you can save or send to Strava. Works independently of the mode above — you can still drop pins or mark lines while recording.
         </div>
       </div>
 
@@ -261,8 +270,22 @@
       </div>
 
       <div class="section">
+        <h3>Line coloring <b style="font-weight:700;">(new — test carefully)</b></h3>
+        <label class="field-label">Touch mode</label>
+        <select class="field-input" id="paintModeSelect">
+          <option value="pan">Pan (normal map dragging)</option>
+          <option value="gray">Paint gray — swipe to unmark</option>
+          <option value="green">Paint green — swipe to mark safe</option>
+          <option value="red">Paint red — swipe to mark avoid</option>
+        </select>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px;">
+          In a paint mode, dragging your finger across lines colors each one it crosses, instead of panning the map. Switch back to "Pan" to move the map normally. This is brand new — if it feels off, switch back to Pan and let me know what happened.
+        </div>
+      </div>
+
+      <div class="section">
         <h3>Legend</h3>
-        <div class="legend-row"><span class="legend-swatch" style="background:var(--neutral)"></span>Unmarked road</div>
+        <div class="legend-row"><span class="legend-swatch" style="background:var(--neutral)"></span>Unmarked line</div>
         <div class="legend-row"><span class="legend-swatch" style="background:var(--safe)"></span>Marked safe</div>
         <div class="legend-row"><span class="legend-swatch" style="background:var(--avoid)"></span>Marked avoid (never routed)</div>
         <div class="legend-row"><span class="legend-pin" style="background:#c1443c"></span>School</div>
@@ -297,7 +320,9 @@
 
       <div class="section">
         <h3>Data</h3>
-        <button class="small-btn" id="btnExport" style="width:100%;margin-bottom:6px;">Export pins + segments (JSON)</button>
+        <button class="small-btn" id="btnExport" style="width:100%;margin-bottom:6px;">Export pins + lines (JSON)</button>
+        <button class="small-btn" id="btnImport" style="width:100%;margin-bottom:6px;">Import from backup file</button>
+        <input type="file" id="importFileInput" accept="application/json,.json" style="display:none;">
         <button class="small-btn danger-text" id="btnClear" style="width:100%;">Clear all data</button>
       </div>
     </div>
@@ -341,15 +366,23 @@
 
   // ---------- storage ----------
   const LS_PINS = "rg_pins";
-  const LS_SEGS = "rg_segments";
+  const LS_SEGS = "rg_segments";       // user-marked lines only (safe/avoid) — small, safety-critical
+  const LS_LINE_CACHE = "rg_line_cache"; // every line geometry ever discovered, regardless of marking
+  const LS_POI_CACHE = "rg_poi_cache";   // every auto-detected location ever discovered
 
   function loadPins(){ try{return JSON.parse(localStorage.getItem(LS_PINS))||[];}catch(e){return [];} }
   function savePins(p){ localStorage.setItem(LS_PINS, JSON.stringify(p)); }
   function loadSegs(){ try{return JSON.parse(localStorage.getItem(LS_SEGS))||{};}catch(e){return {};} }
   function saveSegs(s){ localStorage.setItem(LS_SEGS, JSON.stringify(s)); }
+  function loadLineCache(){ try{return JSON.parse(localStorage.getItem(LS_LINE_CACHE))||{};}catch(e){return {};} }
+  function saveLineCache(c){ try{localStorage.setItem(LS_LINE_CACHE, JSON.stringify(c));}catch(e){console.error('Could not save line cache (storage may be full):', e);} }
+  function loadPoiCache(){ try{return JSON.parse(localStorage.getItem(LS_POI_CACHE))||{};}catch(e){return {};} }
+  function savePoiCache(c){ try{localStorage.setItem(LS_POI_CACHE, JSON.stringify(c));}catch(e){console.error('Could not save location cache (storage may be full):', e);} }
 
   let pins = loadPins();
   let segments = loadSegs(); // key -> {state:'safe'|'avoid', latlngs:[[lat,lng],[lat,lng]]}
+  let lineCache = loadLineCache(); // key -> latlngs — every line ever seen, kept until a fresh fetch of that exact area proves it's gone
+  let poiCache = loadPoiCache();   // OSM type+id -> {lat,lng,category,label} — every auto-detected location ever seen
 
   const CATEGORY_COLOR = { school:"#c1443c", playground:"#d98c2b", childcare:"#8a4fbf", other:"#3b6fd9" };
   const STATE_COLOR = { neutral:"#5b6472", safe:"#2f8f5b", avoid:"#c1443c" };
@@ -370,10 +403,36 @@
     markerZoomAnimation: false
   }).setView([39.83, -98.58], 4); // center of US fallback
   const mapRotationSupported = false; // rotation plugin removed after it destabilized the map in real-world testing
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+
+  const streetLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19,
     attribution: '&copy; OpenStreetMap contributors'
   }).addTo(map);
+
+  const satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 19,
+    attribution: 'Imagery &copy; Esri'
+  });
+
+  let satelliteMode = false;
+  function setSatelliteMode(on){
+    satelliteMode = on;
+    if(on){
+      map.removeLayer(streetLayer);
+      satelliteLayer.addTo(map);
+      // the dimming filter is there so route colors stand out against busy
+      // street-map linework — satellite imagery has no competing linework, and
+      // dimming it just makes it harder to see what's actually on the ground,
+      // which defeats the point of switching to it
+      document.body.classList.add('satellite-mode');
+    } else {
+      map.removeLayer(satelliteLayer);
+      streetLayer.addTo(map);
+      document.body.classList.remove('satellite-mode');
+    }
+    const btn = document.getElementById('btnSatellite');
+    if(btn) btn.classList.toggle('active', on);
+  }
 
   L.control.scale({ metric: false, imperial: true, position: 'bottomleft', maxWidth: 120 }).addTo(map);
 
@@ -473,7 +532,7 @@
   function setDataStatus(state, extra){
     dataStatusEl.className = state;
     if(state === 'st-loading'){
-      dataStatusText.textContent = 'Loading nearby locations & roads…';
+      dataStatusText.textContent = 'Loading nearby locations & lines…';
     } else if(state === 'st-ok'){
       dataStatusText.textContent = extra || 'Nearby data loaded';
     } else if(state === 'st-stale'){
@@ -481,7 +540,7 @@
     } else if(state === 'st-fail'){
       dataStatusText.textContent = extra || '⚠ Could not load nearby data — do not assume the area is clear';
     } else if(state === 'st-zoom'){
-      dataStatusText.textContent = extra || 'Zoom in further to auto-load nearby locations & roads — tap to zoom in';
+      dataStatusText.textContent = extra || 'Zoom in further to auto-load nearby locations & lines — tap to zoom in';
     }
     dataStatusEl.style.cursor = (state === 'st-zoom') ? 'pointer' : 'default';
   }
@@ -508,7 +567,7 @@
   }
 
   function okStatusText(){
-    const counts = (lastPoiCount != null) ? `${lastPoiCount} location${lastPoiCount===1?'':'s'}, ${lastRoadCount} road segment${lastRoadCount===1?'':'s'} · ` : '';
+    const counts = (lastPoiCount != null) ? `${lastPoiCount} location${lastPoiCount===1?'':'s'}, ${lastRoadCount} line${lastRoadCount===1?'':'s'} · ` : '';
     return `${counts}Updated ${ageLabel(lastSuccessAt)}`;
   }
 
@@ -535,18 +594,21 @@
     return tags && (tags.name) ? tags.name : capitalize(category);
   }
 
-  const autoPinMarkers = {}; // OSM type+id -> marker, persists across fetches like road segments already do
+  const autoPinMarkers = {}; // OSM type+id -> marker, persists across fetches like lines already do
 
-  function applyOverpassResults(data){
-    let newPoiCount = 0, roadEdgeCount = 0;
+  function applyOverpassResults(data, fetchBounds){
+    const seenLineKeys = new Set();
+    const seenPoiKeys = new Set();
+
     (data.elements||[]).forEach(el=>{
       if(!el.tags) return;
       if(el.tags.highway && el.geometry && el.geometry.length > 1){
-        // road: draw every consecutive pair as a clickable segment
         const pts = el.geometry.map(g=>[g.lat, g.lon]);
         for(let i=0;i<pts.length-1;i++){
           const pair = [pts[i], pts[i+1]];
           const key = edgeKey(pair[0], pair[1]);
+          seenLineKeys.add(key);
+          lineCache[key] = pair;
           const state = segments[key] ? segments[key].state : 'neutral';
           drawSegment(key, pair, state);
         }
@@ -559,25 +621,75 @@
       if(lat==null || lng==null) return;
 
       const poiKey = el.type + el.id;
-      if(autoPinMarkers[poiKey]) return; // already known — keep it, don't recreate (also preserves any open popup)
-
-      const color = CATEGORY_COLOR[category] || CATEGORY_COLOR.other;
+      seenPoiKeys.add(poiKey);
       const label = tagsToLabel(el.tags, category);
-      const m = L.marker([lat,lng], {icon: pinIcon(color, true)}).addTo(autoPinLayer);
-      m.bindPopup(`<b>${escapeHtml(label)}</b><br>${capitalize(category)} · from map data<br><button id="confirm-${el.type}${el.id}" style="margin-top:6px;font-size:12px;padding:4px 8px;border-radius:5px;border:1px solid #ccc;cursor:pointer;">Save as permanent pin</button>`);
-      m.on('popupopen', ()=>{
-        const btn = document.getElementById(`confirm-${el.type}${el.id}`);
-        if(btn) btn.onclick = ()=>{
-          pins.push({lat, lng, category, label});
-          savePins(pins); renderPins();
-          m.closePopup();
-        };
-      });
-      autoPinMarkers[poiKey] = m;
-      newPoiCount++;
+      poiCache[poiKey] = {lat, lng, category, label};
+      if(autoPinMarkers[poiKey]) return; // already drawn — keep it, don't recreate (also preserves any open popup)
+      drawAutoPin(poiKey, lat, lng, category, label);
     });
-    return { poiCount: Object.keys(autoPinMarkers).length, roadEdgeCount: Object.keys(segPolylines).length };
+
+    // Reconciliation: within the area we just freshly queried, remove any
+    // previously-cached neutral line or auto-detected pin that this fetch
+    // didn't report — Overpass just authoritatively told us it's not there
+    // anymore. Marked lines (safe/avoid) and pins you've saved permanently
+    // are never touched by this, regardless of what a fetch does or doesn't
+    // report — those only ever change by your own action.
+    if(fetchBounds){
+      Object.keys(lineCache).forEach(key=>{
+        if(seenLineKeys.has(key)) return;
+        if(segments[key]) return; // marked — never auto-remove
+        const latlngs = lineCache[key];
+        const bothInside = latlngs.every(p => fetchBounds.contains(p));
+        if(bothInside){
+          delete lineCache[key];
+          if(segPolylines[key]){ segLayer.removeLayer(segPolylines[key]); delete segPolylines[key]; }
+          if(segCasingLines[key]){ segLayer.removeLayer(segCasingLines[key]); delete segCasingLines[key]; }
+          if(segHitLines[key]){ segHitLayer.removeLayer(segHitLines[key]); delete segHitLines[key]; }
+        }
+      });
+      Object.keys(poiCache).forEach(key=>{
+        if(seenPoiKeys.has(key)) return;
+        const p = poiCache[key];
+        if(fetchBounds.contains([p.lat, p.lng])){
+          delete poiCache[key];
+          if(autoPinMarkers[key]){ autoPinLayer.removeLayer(autoPinMarkers[key]); delete autoPinMarkers[key]; }
+        }
+      });
+    }
+
+    saveLineCache(lineCache);
+    savePoiCache(poiCache);
+    return { poiCount: Object.keys(poiCache).length, roadEdgeCount: Object.keys(lineCache).length };
   }
+
+  function drawAutoPin(poiKey, lat, lng, category, label){
+    const color = CATEGORY_COLOR[category] || CATEGORY_COLOR.other;
+    const m = L.marker([lat,lng], {icon: pinIcon(color, true)}).addTo(autoPinLayer);
+    m.bindPopup(`<b>${escapeHtml(label)}</b><br>${capitalize(category)} · from map data<br><button id="confirm-${poiKey}" style="margin-top:6px;font-size:12px;padding:4px 8px;border-radius:5px;border:1px solid #ccc;cursor:pointer;">Save as permanent pin</button>`);
+    m.on('popupopen', ()=>{
+      const btn = document.getElementById(`confirm-${poiKey}`);
+      if(btn) btn.onclick = ()=>{
+        pins.push({lat, lng, category, label});
+        savePins(pins); renderPins();
+        m.closePopup();
+      };
+    });
+    autoPinMarkers[poiKey] = m;
+  }
+
+  // draw everything already cached from a previous session immediately on
+  // load, before any network request even starts — no blank map while waiting
+  function renderCachedLinesAndPois(){
+    Object.keys(lineCache).forEach(key=>{
+      const state = segments[key] ? segments[key].state : 'neutral';
+      drawSegment(key, lineCache[key], state);
+    });
+    Object.keys(poiCache).forEach(key=>{
+      const p = poiCache[key];
+      drawAutoPin(key, p.lat, p.lng, p.category, p.label);
+    });
+  }
+
 
   let loadTickTimer = null;
   let loadStartedAt = null;
@@ -589,7 +701,7 @@
       const secs = Math.round((Date.now() - loadStartedAt) / 1000);
       const base = lastSuccessAt
         ? `Refreshing… (${secs}s) — showing data from ${ageLabel(lastSuccessAt)}`
-        : `Loading nearby locations & roads… (${secs}s)`;
+        : `Loading nearby locations & lines… (${secs}s)`;
       setDataStatus(lastSuccessAt ? 'st-stale' : 'st-loading', base);
     }, 1000);
   }
@@ -652,7 +764,7 @@
     try{
       const data = await Promise.any(attempts.map(a => a.promise));
       attempts.forEach(a => a.controller.abort()); // cancel the losers
-      const {poiCount, roadEdgeCount} = applyOverpassResults(data);
+      const {poiCount, roadEdgeCount} = applyOverpassResults(data, b);
       lastSuccessAt = Date.now();
       lastLoadedBounds = b;
       lastPoiCount = poiCount;
@@ -792,11 +904,121 @@
       }).addTo(segHitLayer);
       hit.on('click', (e)=>{
         L.DomEvent.stopPropagation(e);
+        if(paintMode !== 'pan') return; // handled by the paint-drag logic instead
         cycleSegment(key, latlngs);
+      });
+      // long-press (or right-click on desktop) identifies the spot instead of
+      // cycling its color — kept separate so it never slows down quick tapping
+      hit.on('contextmenu', (e)=>{
+        L.DomEvent.stopPropagation(e);
+        if(e.originalEvent && e.originalEvent.preventDefault) e.originalEvent.preventDefault();
+        showIdentifyPopup(e.latlng);
       });
       segHitLines[key] = hit;
     }
   }
+
+  // ---------- identify a location (long-press) ----------
+  function mapsLinks(lat, lng){
+    return {
+      satellite: `https://www.google.com/maps/@${lat},${lng},19z/data=!3m1!1e3`,
+      street: `https://www.google.com/maps/@${lat},${lng},19z`
+    };
+  }
+
+  async function showIdentifyPopup(latlng){
+    const links = mapsLinks(latlng.lat, latlng.lng);
+    const popup = L.popup({maxWidth: 260})
+      .setLatLng(latlng)
+      .setContent(`<div style="font-size:12.5px;">Looking up what's here…</div>`)
+      .openOn(map);
+    try{
+      const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${latlng.lat}&lon=${latlng.lng}&zoom=18&addressdetails=1`);
+      if(!res.ok) throw new Error('lookup failed');
+      const data = await res.json();
+      const name = data.name || (data.address && (data.address.amenity || data.address.building)) || null;
+      const addr = data.display_name ? escapeHtml(data.display_name) : 'No address data available for this exact point.';
+      popup.setContent(`
+        <div style="font-size:12.5px;max-width:220px;">
+          ${name ? `<b>${escapeHtml(name)}</b><br>` : ''}
+          ${addr}<br><br>
+          <a href="${links.satellite}" target="_blank" rel="noopener">Open satellite view</a> ·
+          <a href="${links.street}" target="_blank" rel="noopener">Street map</a>
+        </div>`);
+    }catch(err){
+      popup.setContent(`
+        <div style="font-size:12.5px;max-width:220px;">
+          Could not look up an address for this point.<br><br>
+          <a href="${links.satellite}" target="_blank" rel="noopener">Open satellite view</a> ·
+          <a href="${links.street}" target="_blank" rel="noopener">Street map</a>
+        </div>`);
+    }
+  }
+
+  // ---------- paint mode: swipe across lines to color them ----------
+  let paintMode = 'pan';
+  let painting = false;
+  let paintMoveThrottle = 0;
+  const PAINT_HIT_PX = 18;
+  const PAINT_STATE_MAP = { gray: 'neutral', green: 'safe', red: 'avoid' };
+
+  function pointToSegmentDistPx(p, a, b){
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const lengthSq = dx*dx + dy*dy;
+    if(lengthSq === 0) return Math.hypot(p.x - a.x, p.y - a.y);
+    let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / lengthSq;
+    t = Math.max(0, Math.min(1, t));
+    return Math.hypot(p.x - (a.x + t*dx), p.y - (a.y + t*dy));
+  }
+
+  function applyPaintAt(containerPoint){
+    try{
+      const targetState = PAINT_STATE_MAP[paintMode];
+      if(!targetState) return; // paintMode is 'pan' — nothing to do
+      let bestKey = null, bestDist = PAINT_HIT_PX;
+      Object.keys(lineCache).forEach(key=>{
+        const latlngs = lineCache[key];
+        if(!latlngs || latlngs.length < 2) return;
+        const a = map.latLngToContainerPoint(latlngs[0]);
+        const b = map.latLngToContainerPoint(latlngs[1]);
+        const d = pointToSegmentDistPx(containerPoint, a, b);
+        if(d < bestDist){ bestDist = d; bestKey = key; }
+      });
+      if(!bestKey) return;
+      const cur = segments[bestKey] ? segments[bestKey].state : 'neutral';
+      if(cur === targetState) return;
+      if(targetState === 'neutral'){ delete segments[bestKey]; }
+      else { segments[bestKey] = { state: targetState, latlngs: lineCache[bestKey] }; }
+      saveSegs(segments);
+      drawSegment(bestKey, lineCache[bestKey], targetState);
+    }catch(err){
+      console.error('Paint mode hit an error (non-fatal):', err);
+    }
+  }
+
+  const paintModeSelect = document.getElementById('paintModeSelect');
+  paintModeSelect.addEventListener('change', ()=>{
+    paintMode = paintModeSelect.value;
+    if(paintMode === 'pan'){ map.dragging.enable(); }
+    else { map.dragging.disable(); }
+  });
+
+  map.on('mousedown', (e)=>{
+    if(paintMode === 'pan') return;
+    painting = true;
+    applyPaintAt(e.containerPoint);
+  });
+  map.on('mousemove', (e)=>{
+    if(!painting || paintMode === 'pan') return;
+    const now = Date.now();
+    if(now - paintMoveThrottle < 40) return; // throttle — swiping can fire many events per second
+    paintMoveThrottle = now;
+    applyPaintAt(e.containerPoint);
+  });
+  map.on('mouseup', ()=>{ painting = false; });
+  // safety net: if a touch ends outside the map or gets interrupted, don't
+  // leave painting stuck "on" for the next unrelated tap
+  document.addEventListener('touchend', ()=>{ painting = false; }, {passive:true});
 
   // rescale every existing line's thickness as you zoom, rather than only
   // newly-drawn ones — cheap: just updates stroke width, doesn't recreate anything
@@ -819,6 +1041,8 @@
       segments[key] = { state: next, latlngs: latlngs };
     }
     saveSegs(segments);
+    lineCache[key] = latlngs;
+    saveLineCache(lineCache);
     drawSegment(key, latlngs, next);
   }
 
@@ -862,7 +1086,7 @@
   }
 
   async function planRoute(a,b){
-    showHint('Finding a route that avoids marked segments…');
+    showHint('Finding a route that avoids marked lines…');
     try{
       const routes = await fetchRoute(a,b);
       let best = null, bestScore = Infinity;
@@ -875,7 +1099,7 @@
       // but keep any that are marked safe/avoid (they persist globally anyway)
       renderRoutePairs(best);
       if(bestScore > 0){
-        showWarn(`⚠ Could not fully avoid marked segments — this route still crosses ${bestScore} avoided segment${bestScore>1?'s':''}. Tap red segments below to inspect, or plan a different start/end.`, null);
+        showWarn(`⚠ Could not fully avoid marked lines — this route still crosses ${bestScore} avoided line${bestScore>1?'s':''}. Tap red lines below to inspect, or plan a different start/end.`, null);
       } else {
         showWarn('', null);
       }
@@ -1339,31 +1563,100 @@ ${pts}
   document.getElementById('btnLocateFab').onclick = function(){
     if(!navigator.geolocation){ showWarn('Geolocation not available in this browser.', 3000); return; }
     this.classList.add('active');
+    followMode = true; // tapping locate means "resume following" — but if the
+                        // user pans before this resolves (e.g. waiting on a GPS
+                        // fix in a tunnel), dragstart flips this back to false,
+                        // and the check below then correctly discards this
+                        // now-stale request instead of snapping the view back
     navigator.geolocation.getCurrentPosition(
       pos=>{
-        map.setView([pos.coords.latitude, pos.coords.longitude], map.getZoom());
         this.classList.remove('active');
+        if(!followMode) return; // user moved on since requesting this — don't override them
+        map.setView([pos.coords.latitude, pos.coords.longitude], map.getZoom());
       },
       err=>{ this.classList.remove('active'); showWarn('Could not get your location: '+err.message, 3500); },
       { enableHighAccuracy:true, timeout:8000 }
     );
   };
 
-  // ---------- export / clear ----------
+  document.getElementById('btnSatellite').onclick = ()=> setSatelliteMode(!satelliteMode);
+
+  // ---------- export / import / clear ----------
   document.getElementById('btnExport').onclick = ()=>{
-    const data = { pins, segments };
+    const data = { pins, segments, lineCache, poiCache, exportedAt: new Date().toISOString(), version: 'routeguard-1' };
     const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = 'routeguard-data.json';
+    const stamp = new Date().toISOString().replace(/[:.]/g,'-');
+    a.href = url; a.download = `routeguard-backup-${stamp}.json`;
     document.body.appendChild(a); a.click(); document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
 
+  const importFileInput = document.getElementById('importFileInput');
+  document.getElementById('btnImport').onclick = ()=> importFileInput.click();
+
+  importFileInput.addEventListener('change', (e)=>{
+    const file = e.target.files[0];
+    if(!file) return;
+    const reader = new FileReader();
+    reader.onload = (evt)=>{
+      try{
+        const data = JSON.parse(evt.target.result);
+        let addedPins = 0, addedLines = 0, addedPois = 0;
+
+        // pins: merge by near-identical position + category, skip exact duplicates
+        if(Array.isArray(data.pins)){
+          data.pins.forEach(p=>{
+            if(p == null || typeof p.lat !== 'number' || typeof p.lng !== 'number') return;
+            const dup = pins.some(existing =>
+              existing.category === p.category &&
+              Math.abs(existing.lat - p.lat) < 0.00005 && Math.abs(existing.lng - p.lng) < 0.00005);
+            if(!dup){ pins.push({lat:p.lat, lng:p.lng, category:p.category||'other', label:p.label||''}); addedPins++; }
+          });
+        }
+        // marked lines: merge, never overwrite a line already marked locally
+        if(data.segments && typeof data.segments === 'object'){
+          Object.keys(data.segments).forEach(key=>{
+            if(segments[key]) return;
+            const entry = data.segments[key];
+            if(entry && entry.state && Array.isArray(entry.latlngs)){
+              segments[key] = entry;
+              lineCache[key] = entry.latlngs;
+              addedLines++;
+            }
+          });
+        }
+        // full line geometry cache
+        if(data.lineCache && typeof data.lineCache === 'object'){
+          Object.keys(data.lineCache).forEach(key=>{
+            if(!lineCache[key]){ lineCache[key] = data.lineCache[key]; addedLines++; }
+          });
+        }
+        // auto-detected POI cache
+        if(data.poiCache && typeof data.poiCache === 'object'){
+          Object.keys(data.poiCache).forEach(key=>{
+            if(!poiCache[key]){ poiCache[key] = data.poiCache[key]; addedPois++; }
+          });
+        }
+
+        savePins(pins); saveSegs(segments); saveLineCache(lineCache); savePoiCache(poiCache);
+        renderPins();
+        renderStoredSegments();
+        renderCachedLinesAndPois();
+        showWarn(`Imported: ${addedPins} pin${addedPins===1?'':'s'}, ${addedLines} line${addedLines===1?'':'s'}, ${addedPois} location${addedPois===1?'':'s'} added. Existing data was kept, not replaced.`, 6000);
+      }catch(err){
+        showWarn('Could not read that file — make sure it\'s a RouteGuard backup JSON file.', 4000);
+      }
+      importFileInput.value = '';
+    };
+    reader.readAsText(file);
+  });
+
   document.getElementById('btnClear').onclick = ()=>{
     if(document.getElementById('btnClear').dataset.confirm === '1'){
-      pins = []; segments = {};
-      savePins(pins); saveSegs(segments);
+      pins = []; segments = {}; lineCache = {}; poiCache = {};
+      savePins(pins); saveSegs(segments); saveLineCache(lineCache); savePoiCache(poiCache);
       renderPins();
       segLayer.clearLayers();
       segHitLayer.clearLayers();
@@ -1387,7 +1680,8 @@ ${pts}
 
   // ---------- init ----------
   renderPins();
-  renderStoredSegments();
+  renderStoredSegments();   // marked lines (safe/avoid) — always drawn regardless of cache, since this is the safety-critical data
+  renderCachedLinesAndPois(); // everything else ever seen — instant, no waiting on a network fetch
 
   // if a recording was in progress when the page was reloaded (crash, manual
   // refresh, new version), resume it instead of silently losing the run
