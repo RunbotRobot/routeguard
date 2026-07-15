@@ -195,7 +195,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.16</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.17</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -658,8 +658,11 @@
 
   // only refetch on user-driven map changes (drag/zoom), never on programmatic
   // panning like the live-tracking follow camera — that was flooding the free
-  // Overpass servers with a request roughly every second while running
-  map.on('dragend zoomend', ()=> loadNearbyData(false));
+  // Overpass servers with a request roughly every second while running.
+  // force=true here: a deliberate pan/zoom should always try immediately —
+  // the 15s throttle below is only meant to rate-limit the automatic
+  // live-tracking refresh, which can fire far more often than a human can pan.
+  map.on('dragend zoomend', ()=> loadNearbyData(true));
 
   autoLoadToggle.onchange = ()=>{
     if(autoLoadToggle.checked){ loadNearbyData(true); }
