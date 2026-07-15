@@ -195,7 +195,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.17</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.18</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -442,7 +442,9 @@
   const OVERPASS_ENDPOINTS = [
     'https://overpass-api.de/api/interpreter',
     'https://overpass.kumi.systems/api/interpreter',
-    'https://overpass.private.coffee/api/interpreter'
+    'https://overpass.private.coffee/api/interpreter',
+    'https://z.overpass-api.de/api/interpreter',
+    'https://lz4.overpass-api.de/api/interpreter'
   ];
   const ROAD_HIGHWAY_TYPES = 'footway|path|residential|living_street|pedestrian|track|service|unclassified|tertiary|secondary|steps|cycleway';
 
@@ -452,6 +454,19 @@
   let lastAttemptAt = 0;      // ms epoch of last attempt (success or fail), for throttling
   let lastLoadedBounds = null;
   let dataLoadInFlight = false;
+  let retryCount = 0;
+  let retryTimer = null;
+  const RETRY_DELAYS_MS = [8000, 20000, 45000, 90000]; // backs off, caps at 90s, stops after 4 tries until you pan again
+
+  function scheduleRetry(){
+    if(retryTimer) clearTimeout(retryTimer);
+    if(retryCount >= RETRY_DELAYS_MS.length) return; // give up auto-retrying; a manual pan/zoom will try again
+    const delay = RETRY_DELAYS_MS[retryCount];
+    retryCount++;
+    retryTimer = setTimeout(()=>{
+      if(autoLoadToggle.checked && map.getZoom() >= MIN_ZOOM_FOR_AUTO) loadNearbyData(true);
+    }, delay);
+  }
   let lastPoiCount = null, lastRoadCount = null;
   let zoomTooFarOut = false;
 
@@ -584,7 +599,7 @@
 
   function fetchOverpassMirror(endpoint, query){
     const controller = new AbortController();
-    const timeoutId = setTimeout(()=>controller.abort(), 15000);
+    const timeoutId = setTimeout(()=>controller.abort(), 20000);
     const promise = fetch(endpoint, {
       method:'POST', body:'data='+encodeURIComponent(query), signal: controller.signal
     }).then(res=>{
@@ -644,6 +659,8 @@
       lastRoadCount = roadEdgeCount;
       stopLoadTicker();
       setDataStatus('st-ok', okStatusText());
+      retryCount = 0;
+      if(retryTimer){ clearTimeout(retryTimer); retryTimer = null; }
     }catch(aggregateErr){
       stopLoadTicker();
       if(lastSuccessAt){
@@ -651,6 +668,7 @@
       } else {
         setDataStatus('st-fail', '⚠ Could not load nearby data — do not assume this area is clear');
       }
+      scheduleRetry();
     }finally{
       dataLoadInFlight = false;
     }
@@ -662,7 +680,11 @@
   // force=true here: a deliberate pan/zoom should always try immediately —
   // the 15s throttle below is only meant to rate-limit the automatic
   // live-tracking refresh, which can fire far more often than a human can pan.
-  map.on('dragend zoomend', ()=> loadNearbyData(true));
+  map.on('dragend zoomend', ()=>{
+    retryCount = 0;
+    if(retryTimer){ clearTimeout(retryTimer); retryTimer = null; }
+    loadNearbyData(true);
+  });
 
   autoLoadToggle.onchange = ()=>{
     if(autoLoadToggle.checked){ loadNearbyData(true); }
