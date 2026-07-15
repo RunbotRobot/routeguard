@@ -22,7 +22,7 @@
     --accent-2:#8a6d3b;
     --safe:#2f8f5b;
     --avoid:#c1443c;
-    --neutral:#8b93a1;
+    --neutral:#5b6472;
     --muted:#6b7280;
   }
   *{box-sizing:border-box;}
@@ -124,6 +124,7 @@
   #dataStatus.st-fail .sw{background:var(--avoid);}
 
   #main{position:relative;}
+  .leaflet-tile-pane{ filter: grayscale(45%) brightness(1.2) contrast(0.8) saturate(60%); }
 
   #fabPin{
     position:absolute;right:14px;bottom:14px;z-index:1000;
@@ -187,7 +188,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.13</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.14</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -344,7 +345,7 @@
   let segments = loadSegs(); // key -> {state:'safe'|'avoid', latlngs:[[lat,lng],[lat,lng]]}
 
   const CATEGORY_COLOR = { school:"#c1443c", playground:"#d98c2b", childcare:"#8a4fbf", other:"#3b6fd9" };
-  const STATE_COLOR = { neutral:"#8b93a1", safe:"#2f8f5b", avoid:"#c1443c" };
+  const STATE_COLOR = { neutral:"#5b6472", safe:"#2f8f5b", avoid:"#c1443c" };
 
   // ---------- map ----------
   const map = L.map('map', {
@@ -684,12 +685,24 @@
   const segPolylines = {}; // key -> visible polyline
   const segHitLines = {};  // key -> invisible fat hit-target polyline
 
+  const segCasingLines = {}; // key -> white outline drawn beneath the colored line, for contrast on any background
+
   function segColor(state){ return STATE_COLOR[state] || STATE_COLOR.neutral; }
 
   function drawSegment(key, latlngs, state){
+    if(segCasingLines[key]){ segLayer.removeLayer(segCasingLines[key]); }
     if(segPolylines[key]){ segLayer.removeLayer(segPolylines[key]); }
+
+    const weight = state==='neutral' ? 5 : 7;
+    // a white outline underneath guarantees the colored line reads clearly
+    // even over busy basemap art (transit lines, other roads, etc.)
+    const casing = L.polyline(latlngs, {
+      color:'#fff', weight: weight+3, opacity:0.9, interactive:false
+    }).addTo(segLayer);
+    segCasingLines[key] = casing;
+
     const pl = L.polyline(latlngs, {
-      color: segColor(state), weight: state==='neutral' ? 4 : 6, opacity: state==='neutral' ? 0.55 : 0.9,
+      color: segColor(state), weight, opacity: 1,
       interactive: false // clicks are handled by the wider invisible hit-line below
     }).addTo(segLayer);
     segPolylines[key] = pl;
@@ -1266,6 +1279,7 @@ ${pts}
       segLayer.clearLayers();
       segHitLayer.clearLayers();
       Object.keys(segPolylines).forEach(k=>delete segPolylines[k]);
+      Object.keys(segCasingLines).forEach(k=>delete segCasingLines[k]);
       Object.keys(segHitLines).forEach(k=>delete segHitLines[k]);
       autoPinLayer.clearLayers();
       Object.keys(autoPinMarkers).forEach(k=>delete autoPinMarkers[k]);
