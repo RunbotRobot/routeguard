@@ -108,12 +108,12 @@
   .leaflet-div-icon{background:transparent;border:none;}
 
   #dataStatus{
-    position:absolute;right:14px;top:12px;max-width:calc(100% - 70px);z-index:1000;
-    padding:6px 12px;border-radius:20px;font-size:12px;font-weight:600;
-    box-shadow:0 2px 8px rgba(0,0,0,.15);display:inline-flex;align-items:center;gap:6px;
+    position:absolute;right:14px;top:12px;max-width:min(78vw, 320px);z-index:1000;
+    padding:7px 12px;border-radius:14px;font-size:12px;font-weight:600;line-height:1.35;
+    box-shadow:0 2px 8px rgba(0,0,0,.15);display:inline-flex;align-items:flex-start;gap:6px;
   }
-  #dataStatus .sw{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
-  #dataStatus #dataStatusText{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  #dataStatus .sw{width:8px;height:8px;border-radius:50%;flex-shrink:0;margin-top:3px;}
+  #dataStatus #dataStatusText{white-space:normal;overflow-wrap:break-word;}
   #dataStatus.st-loading{background:#fff;color:var(--muted);}
   #dataStatus.st-loading .sw{background:#9ca3af;animation:pulse 1.2s infinite;}
   #dataStatus.st-ok{background:#eaf5ee;color:#1f6b45;}
@@ -122,6 +122,8 @@
   #dataStatus.st-stale .sw{background:#d98c2b;}
   #dataStatus.st-fail{background:#fbe9e7;color:#9c2a20;}
   #dataStatus.st-fail .sw{background:var(--avoid);}
+  #dataStatus.st-zoom{background:#eaf0fb;color:#1c4a8a;}
+  #dataStatus.st-zoom .sw{background:#3b6fd9;}
 
   #main{position:relative;}
   .leaflet-tile-pane{ filter: grayscale(45%) brightness(1.2) contrast(0.8) saturate(60%); }
@@ -193,7 +195,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.15</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.16</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -451,6 +453,7 @@
   let lastLoadedBounds = null;
   let dataLoadInFlight = false;
   let lastPoiCount = null, lastRoadCount = null;
+  let zoomTooFarOut = false;
 
   function setDataStatus(state, extra){
     dataStatusEl.className = state;
@@ -462,8 +465,25 @@
       dataStatusText.textContent = extra || 'Showing older data — retrying…';
     } else if(state === 'st-fail'){
       dataStatusText.textContent = extra || '⚠ Could not load nearby data — do not assume the area is clear';
+    } else if(state === 'st-zoom'){
+      dataStatusText.textContent = extra || 'Zoom in further to auto-load nearby locations & roads — tap to zoom in';
     }
+    dataStatusEl.style.cursor = (state === 'st-zoom') ? 'pointer' : 'default';
   }
+
+  // Tapping the badge zooms straight to the level needed to load data —
+  // harmless no-op if already zoomed in enough.
+  dataStatusEl.addEventListener('click', ()=>{
+    if(map.getZoom() < MIN_ZOOM_FOR_AUTO) map.setZoom(MIN_ZOOM_FOR_AUTO);
+  });
+
+  // Keep the "zoom in further" message actively displayed for as long as
+  // you're zoomed too far out, instead of it only appearing once per pan/zoom
+  // action and then getting silently left behind by other status changes.
+  map.on('zoom', ()=>{
+    zoomTooFarOut = map.getZoom() < MIN_ZOOM_FOR_AUTO;
+    if(zoomTooFarOut) setDataStatus('st-zoom');
+  });
 
   function ageLabel(ms){
     const s = Math.round((Date.now()-ms)/1000);
@@ -477,10 +497,13 @@
     return `${counts}Updated ${ageLabel(lastSuccessAt)}`;
   }
 
-  // tick every second so "Updated Xs ago" counts up in real time, and the
-  // location/road counts stay visible instead of getting overwritten
+  // tick every second so "Updated Xs ago" counts up in real time, the
+  // location/road counts stay visible instead of getting overwritten, and the
+  // "zoom in further" message stays put for as long as it's still true
   setInterval(()=>{
-    if(lastSuccessAt && dataStatusEl.className === 'st-ok'){
+    if(zoomTooFarOut){
+      if(dataStatusEl.className !== 'st-zoom') setDataStatus('st-zoom');
+    } else if(lastSuccessAt && dataStatusEl.className === 'st-ok'){
       setDataStatus('st-ok', okStatusText());
     }
   }, 1000);
@@ -575,9 +598,11 @@
   async function loadNearbyData(force){
     if(!autoLoadToggle.checked) return;
     if(map.getZoom() < MIN_ZOOM_FOR_AUTO){
-      setDataStatus('st-fail', 'Zoom in further to auto-load nearby locations & roads');
+      zoomTooFarOut = true;
+      setDataStatus('st-zoom');
       return;
     }
+    zoomTooFarOut = false;
     const now = Date.now();
     if(!force && (now - lastAttemptAt) < MIN_REFETCH_INTERVAL_MS) return;
     if(dataLoadInFlight) return;
@@ -687,6 +712,13 @@
     return ka < kb ? ka+'|'+kb : kb+'|'+ka;
   }
 
+  // Canvas rendering (vs. Leaflet's default SVG) is generally cheaper to
+  // repaint per-frame with hundreds of line elements, which is likely why
+  // lines were lagging behind a drag gesture until release. Wider padding
+  // also pre-renders more area beyond the visible edge so panning reveals
+  // already-drawn lines instead of empty space.
+  const segRenderer = L.canvas({ padding: 0.6 });
+
   const segLayer = L.layerGroup().addTo(map);
   const segHitLayer = L.layerGroup().addTo(map); // invisible wide tap-targets, drawn above segLayer
   const segPolylines = {}; // key -> visible polyline
@@ -717,12 +749,12 @@
     // a white outline underneath guarantees the colored line reads clearly
     // even over busy basemap art (transit lines, other roads, etc.)
     const casing = L.polyline(latlngs, {
-      color:'#fff', weight: casingWeight, opacity:0.9, interactive:false
+      renderer: segRenderer, color:'#fff', weight: casingWeight, opacity:0.9, interactive:false
     }).addTo(segLayer);
     segCasingLines[key] = casing;
 
     const pl = L.polyline(latlngs, {
-      color: segColor(state), weight, opacity: 1,
+      renderer: segRenderer, color: segColor(state), weight, opacity: 1,
       interactive: false // clicks are handled by the wider invisible hit-line below
     }).addTo(segLayer);
     segPolylines[key] = pl;
@@ -731,7 +763,7 @@
       // a much fatter, fully transparent line makes it far easier to tap a
       // thin road on a phone screen without changing how thin it looks
       const hit = L.polyline(latlngs, {
-        color: '#000', weight: 26, opacity: 0, interactive: true
+        renderer: segRenderer, color: '#000', weight: 26, opacity: 0, interactive: true
       }).addTo(segHitLayer);
       hit.on('click', (e)=>{
         L.DomEvent.stopPropagation(e);
