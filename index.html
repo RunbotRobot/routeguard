@@ -203,7 +203,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.19</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.20</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -267,6 +267,11 @@
         <div style="font-size:11.5px;color:var(--muted);margin-top:4px;">
           Schools, playgrounds, parks &amp; listed childcare load automatically as you zoom in (zoom to street level). Add pins manually for anything missing, like unlisted home daycares.
         </div>
+        <label class="field-label">Tile cache relay URL (optional)</label>
+        <input class="field-input" id="tileCacheUrl" type="text" placeholder="https://your-worker.workers.dev" />
+        <div style="font-size:11px;color:var(--muted);margin-top:4px;">
+          If set, tries your own cache first for faster, more reliable loads on areas you've visited before — falls back to direct public servers automatically if unset or unreachable.
+        </div>
       </div>
 
       <div class="section">
@@ -274,12 +279,12 @@
         <label class="field-label">Touch mode</label>
         <select class="field-input" id="paintModeSelect">
           <option value="pan">Pan (normal map dragging)</option>
-          <option value="gray">Paint gray — swipe to unmark</option>
-          <option value="green">Paint green — swipe to mark safe</option>
-          <option value="red">Paint red — swipe to mark avoid</option>
+          <option value="gray" style="background:#5b6472;color:#fff;">Paint gray — swipe to unmark</option>
+          <option value="green" style="background:#2f8f5b;color:#fff;">Paint green — swipe to mark safe</option>
+          <option value="red" style="background:#c1443c;color:#fff;">Paint red — swipe to mark avoid</option>
         </select>
         <div style="font-size:11px;color:var(--muted);margin-top:4px;">
-          In a paint mode, dragging your finger across lines colors each one it crosses, instead of panning the map. Switch back to "Pan" to move the map normally. This is brand new — if it feels off, switch back to Pan and let me know what happened.
+          In a paint mode, dragging your finger across lines colors each one it crosses, instead of panning the map. Switch back to "Pan" to move the map normally. Only works zoomed in close — stays as normal panning if you're too far out, so one swipe can't accidentally recolor a huge area. This is brand new — if it feels off, switch back to Pan and let me know what happened.
         </div>
       </div>
 
@@ -320,6 +325,7 @@
 
       <div class="section">
         <h3>Data</h3>
+        <div id="storageUsage" style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">Storage: calculating…</div>
         <button class="small-btn" id="btnExport" style="width:100%;margin-bottom:6px;">Export pins + lines (JSON)</button>
         <button class="small-btn" id="btnImport" style="width:100%;margin-bottom:6px;">Import from backup file</button>
         <input type="file" id="importFileInput" accept="application/json,.json" style="display:none;">
@@ -379,10 +385,34 @@
   function loadPoiCache(){ try{return JSON.parse(localStorage.getItem(LS_POI_CACHE))||{};}catch(e){return {};} }
   function savePoiCache(c){ try{localStorage.setItem(LS_POI_CACHE, JSON.stringify(c));}catch(e){console.error('Could not save location cache (storage may be full):', e);} }
 
+  const LS_TILE_CACHE_CFG = "rg_tile_cache_cfg";
+  function loadTileCacheCfg(){ try{return JSON.parse(localStorage.getItem(LS_TILE_CACHE_CFG))||{};}catch(e){return {};} }
+  function saveTileCacheCfg(c){ localStorage.setItem(LS_TILE_CACHE_CFG, JSON.stringify(c)); }
+
   let pins = loadPins();
   let segments = loadSegs(); // key -> {state:'safe'|'avoid', latlngs:[[lat,lng],[lat,lng]]}
   let lineCache = loadLineCache(); // key -> latlngs — every line ever seen, kept until a fresh fetch of that exact area proves it's gone
   let poiCache = loadPoiCache();   // OSM type+id -> {lat,lng,category,label} — every auto-detected location ever seen
+
+  // storage usage is per-origin (this app's own site data), not shared with
+  // other websites or apps on the phone — each site gets its own separate
+  // quota, typically 5-10MB depending on browser
+  function updateStorageUsageDisplay(){
+    const el = document.getElementById('storageUsage');
+    if(!el) return;
+    try{
+      let bytes = 0;
+      for(let i=0;i<localStorage.length;i++){
+        const k = localStorage.key(i);
+        bytes += (k.length + (localStorage.getItem(k)||'').length) * 2; // UTF-16, ~2 bytes/char
+      }
+      const kb = bytes/1024;
+      const label = kb < 1024 ? `${kb.toFixed(1)} KB` : `${(kb/1024).toFixed(2)} MB`;
+      el.textContent = `Storage used: ${label} (typical limit is 5–10 MB, only for this site)`;
+    }catch(err){
+      el.textContent = 'Storage: could not calculate';
+    }
+  }
 
   const CATEGORY_COLOR = { school:"#c1443c", playground:"#d98c2b", childcare:"#8a4fbf", other:"#3b6fd9" };
   const STATE_COLOR = { neutral:"#5b6472", safe:"#2f8f5b", avoid:"#c1443c" };
@@ -722,6 +752,39 @@
     return { promise, controller };
   }
 
+  const TILE_GRID_SIZE = 0.02; // must match the worker's GRID_SIZE constant
+  function gridCellsForBounds(b){
+    const cells = [];
+    const latStart = Math.floor(b.getSouth()/TILE_GRID_SIZE)*TILE_GRID_SIZE;
+    const latEnd = Math.floor(b.getNorth()/TILE_GRID_SIZE)*TILE_GRID_SIZE;
+    const lngStart = Math.floor(b.getWest()/TILE_GRID_SIZE)*TILE_GRID_SIZE;
+    const lngEnd = Math.floor(b.getEast()/TILE_GRID_SIZE)*TILE_GRID_SIZE;
+    for(let la=latStart; la<=latEnd+1e-9; la+=TILE_GRID_SIZE){
+      for(let ln=lngStart; ln<=lngEnd+1e-9; ln+=TILE_GRID_SIZE){
+        cells.push({lat: la+TILE_GRID_SIZE/2, lng: ln+TILE_GRID_SIZE/2});
+      }
+    }
+    return cells;
+  }
+
+  async function loadViaTileCache(cacheUrl, b){
+    const cells = gridCellsForBounds(b);
+    if(cells.length > 12) throw new Error('view too large for tile cache — too many cells'); // sanity guard
+    const results = await Promise.all(cells.map(c=>{
+      const controller = new AbortController();
+      const timeoutId = setTimeout(()=>controller.abort(), 15000);
+      return fetch(`${cacheUrl}/tile?lat=${c.lat}&lng=${c.lng}`, {signal: controller.signal})
+        .then(res=>{ clearTimeout(timeoutId); if(!res.ok) throw new Error('HTTP '+res.status); return res.json(); })
+        .catch(err=>{ clearTimeout(timeoutId); throw err; });
+    }));
+    // merge every cell's elements into one combined result; duplicates across
+    // adjacent cells are harmless — applyOverpassResults keys everything and
+    // just no-ops on a repeat
+    const merged = { elements: [] };
+    results.forEach(r=>{ if(r && Array.isArray(r.elements)) merged.elements.push(...r.elements); });
+    return merged;
+  }
+
   async function loadNearbyData(force){
     if(!autoLoadToggle.checked) return;
     if(map.getZoom() < MIN_ZOOM_FOR_AUTO){
@@ -738,6 +801,32 @@
     startLoadTicker();
 
     const b = map.getBounds();
+    const cfg = loadTileCacheCfg();
+
+    // path 1: your own tile cache, if configured — try this first
+    if(cfg.url){
+      try{
+        const data = await loadViaTileCache(cfg.url, b);
+        const {poiCount, roadEdgeCount} = applyOverpassResults(data, b);
+        lastSuccessAt = Date.now();
+        lastLoadedBounds = b;
+        lastPoiCount = poiCount;
+        lastRoadCount = roadEdgeCount;
+        stopLoadTicker();
+        setDataStatus('st-ok', okStatusText() + ' · via your cache');
+        retryCount = 0;
+        if(retryTimer){ clearTimeout(retryTimer); retryTimer = null; }
+        dataLoadInFlight = false;
+        return;
+      }catch(err){
+        console.error('Tile cache failed, falling back to direct Overpass:', err);
+        // fall through to path 2 below
+      }
+    }
+
+    // path 2: direct Overpass, racing multiple public mirrors — the original
+    // approach, always available as a fallback whether or not a tile cache
+    // is configured
     const bbox = `${b.getSouth()},${b.getWest()},${b.getNorth()},${b.getEast()}`;
     const query = `[out:json][timeout:25];
       (
@@ -806,6 +895,12 @@
       setDataStatus('st-fail', 'Auto-load is off');
     }
   };
+
+  const tileCacheUrlInput = document.getElementById('tileCacheUrl');
+  tileCacheUrlInput.value = (loadTileCacheCfg().url) || '';
+  tileCacheUrlInput.addEventListener('change', ()=>{
+    saveTileCacheCfg({ url: tileCacheUrlInput.value.trim().replace(/\/$/,'') });
+  });
 
   // while running with live tracking, refresh only if we've actually moved
   // near the edge of the last-loaded area, and never more than the throttle allows
@@ -960,7 +1055,11 @@
   let painting = false;
   let paintMoveThrottle = 0;
   const PAINT_HIT_PX = 18;
+  const PAINT_MIN_ZOOM = MIN_ZOOM_FOR_AUTO; // same threshold as auto-loading — below this, way too much
+                                             // ground is visible per pixel to risk a swipe touching lines
+                                             // far outside where you meant to color
   const PAINT_STATE_MAP = { gray: 'neutral', green: 'safe', red: 'avoid' };
+  const PAINT_COLOR = { pan: '', gray: STATE_COLOR.neutral, green: STATE_COLOR.safe, red: STATE_COLOR.avoid };
 
   function pointToSegmentDistPx(p, a, b){
     const dx = b.x - a.x, dy = b.y - a.y;
@@ -973,6 +1072,7 @@
 
   function applyPaintAt(containerPoint){
     try{
+      if(map.getZoom() < PAINT_MIN_ZOOM) return; // redundant safety check, see updateDraggingForPaintMode
       const targetState = PAINT_STATE_MAP[paintMode];
       if(!targetState) return; // paintMode is 'pan' — nothing to do
       let bestKey = null, bestDist = PAINT_HIT_PX;
@@ -990,35 +1090,74 @@
       if(targetState === 'neutral'){ delete segments[bestKey]; }
       else { segments[bestKey] = { state: targetState, latlngs: lineCache[bestKey] }; }
       saveSegs(segments);
+      lineCache[bestKey] = lineCache[bestKey]; // already present; kept for clarity
       drawSegment(bestKey, lineCache[bestKey], targetState);
     }catch(err){
       console.error('Paint mode hit an error (non-fatal):', err);
     }
   }
 
+  // Only actually disable map dragging when a color mode is selected AND
+  // you're zoomed in close enough for painting to be safe. Otherwise dragging
+  // stays on, so you're never stuck unable to pan.
+  function updateDraggingForPaintMode(){
+    const zoomOk = map.getZoom() >= PAINT_MIN_ZOOM;
+    if(paintMode !== 'pan' && zoomOk){
+      map.dragging.disable();
+    } else {
+      map.dragging.enable();
+    }
+    if(paintMode !== 'pan' && !zoomOk){
+      showWarn('Zoom in closer to use paint mode — staying zoomed out risks accidentally coloring a huge area in one swipe.', 4000);
+    }
+  }
+
   const paintModeSelect = document.getElementById('paintModeSelect');
   paintModeSelect.addEventListener('change', ()=>{
     paintMode = paintModeSelect.value;
-    if(paintMode === 'pan'){ map.dragging.enable(); }
-    else { map.dragging.disable(); }
+    paintModeSelect.style.background = PAINT_COLOR[paintMode] || '';
+    paintModeSelect.style.color = paintMode === 'pan' ? '' : '#fff';
+    updateDraggingForPaintMode();
   });
+  map.on('zoomend', updateDraggingForPaintMode);
 
-  map.on('mousedown', (e)=>{
-    if(paintMode === 'pan') return;
+  // Direct DOM listeners on the map container, not Leaflet's synthetic map
+  // events — those route through the same internal relay as the drag handler,
+  // and with dragging disabled that relay apparently doesn't forward touch
+  // gestures as mouse events at all (confirmed: dragging correctly stopped,
+  // but paint never fired either). This bypasses that entirely.
+  const mapContainerEl = map.getContainer();
+
+  function eventToContainerPoint(evt){
+    const touch = evt.touches && evt.touches[0];
+    const clientX = touch ? touch.clientX : evt.clientX;
+    const clientY = touch ? touch.clientY : evt.clientY;
+    const rect = mapContainerEl.getBoundingClientRect();
+    return L.point(clientX - rect.left, clientY - rect.top);
+  }
+  function paintPointerDown(evt){
+    if(paintMode === 'pan' || map.getZoom() < PAINT_MIN_ZOOM) return;
     painting = true;
-    applyPaintAt(e.containerPoint);
-  });
-  map.on('mousemove', (e)=>{
+    applyPaintAt(eventToContainerPoint(evt));
+    if(evt.cancelable) evt.preventDefault();
+  }
+  function paintPointerMove(evt){
     if(!painting || paintMode === 'pan') return;
     const now = Date.now();
     if(now - paintMoveThrottle < 40) return; // throttle — swiping can fire many events per second
     paintMoveThrottle = now;
-    applyPaintAt(e.containerPoint);
-  });
-  map.on('mouseup', ()=>{ painting = false; });
-  // safety net: if a touch ends outside the map or gets interrupted, don't
-  // leave painting stuck "on" for the next unrelated tap
-  document.addEventListener('touchend', ()=>{ painting = false; }, {passive:true});
+    applyPaintAt(eventToContainerPoint(evt));
+    if(evt.cancelable) evt.preventDefault();
+  }
+  function paintPointerEnd(){ painting = false; }
+
+  mapContainerEl.addEventListener('mousedown', paintPointerDown);
+  mapContainerEl.addEventListener('mousemove', paintPointerMove);
+  mapContainerEl.addEventListener('mouseup', paintPointerEnd);
+  mapContainerEl.addEventListener('touchstart', paintPointerDown, {passive:false});
+  mapContainerEl.addEventListener('touchmove', paintPointerMove, {passive:false});
+  mapContainerEl.addEventListener('touchend', paintPointerEnd);
+  mapContainerEl.addEventListener('touchcancel', paintPointerEnd);
 
   // rescale every existing line's thickness as you zoom, rather than only
   // newly-drawn ones — cheap: just updates stroke width, doesn't recreate anything
@@ -1682,6 +1821,8 @@ ${pts}
   renderPins();
   renderStoredSegments();   // marked lines (safe/avoid) — always drawn regardless of cache, since this is the safety-critical data
   renderCachedLinesAndPois(); // everything else ever seen — instant, no waiting on a network fetch
+  updateStorageUsageDisplay();
+  setInterval(updateStorageUsageDisplay, 8000);
 
   // if a recording was in progress when the page was reloaded (crash, manual
   // refresh, new version), resume it instead of silently losing the run
