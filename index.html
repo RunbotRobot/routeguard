@@ -125,6 +125,11 @@
 
   #main{position:relative;}
   .leaflet-tile-pane{ filter: grayscale(45%) brightness(1.2) contrast(0.8) saturate(60%); }
+  .leaflet-control-scale{
+    margin-bottom:56px !important; margin-left:14px !important;
+    background:rgba(255,255,255,.85); padding:2px 6px; border-radius:4px;
+    font-size:11px !important;
+  }
 
   #fabPin{
     position:absolute;right:14px;bottom:14px;z-index:1000;
@@ -188,7 +193,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.14</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.15</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -367,6 +372,8 @@
     maxZoom: 19,
     attribution: '&copy; OpenStreetMap contributors'
   }).addTo(map);
+
+  L.control.scale({ metric: false, imperial: true, position: 'bottomleft', maxWidth: 120 }).addTo(map);
 
   const hint = document.getElementById('hint');
   const warnbar = document.getElementById('warnbar');
@@ -689,15 +696,28 @@
 
   function segColor(state){ return STATE_COLOR[state] || STATE_COLOR.neutral; }
 
+  // Line weight is tuned to look right around zoom 17 (close-up, running-level
+  // detail). Zooming out compresses real-world distance per pixel, so a fixed
+  // pixel weight makes roads look thick and bunched together — scale it down
+  // as you zoom out, with a floor so lines never fully disappear.
+  const SEG_REFERENCE_ZOOM = 17;
+  function segWeightsForZoom(state, zoom){
+    const base = state === 'neutral' ? 5 : 7;
+    const scale = Math.max(0.28, Math.min(1.4, Math.pow(1.4, (zoom - SEG_REFERENCE_ZOOM) / 2)));
+    const weight = Math.max(1.2, base * scale);
+    const casing = weight + Math.max(1, 3 * scale);
+    return { weight, casing };
+  }
+
   function drawSegment(key, latlngs, state){
     if(segCasingLines[key]){ segLayer.removeLayer(segCasingLines[key]); }
     if(segPolylines[key]){ segLayer.removeLayer(segPolylines[key]); }
 
-    const weight = state==='neutral' ? 5 : 7;
+    const { weight, casing: casingWeight } = segWeightsForZoom(state, map.getZoom());
     // a white outline underneath guarantees the colored line reads clearly
     // even over busy basemap art (transit lines, other roads, etc.)
     const casing = L.polyline(latlngs, {
-      color:'#fff', weight: weight+3, opacity:0.9, interactive:false
+      color:'#fff', weight: casingWeight, opacity:0.9, interactive:false
     }).addTo(segLayer);
     segCasingLines[key] = casing;
 
@@ -720,6 +740,18 @@
       segHitLines[key] = hit;
     }
   }
+
+  // rescale every existing line's thickness as you zoom, rather than only
+  // newly-drawn ones — cheap: just updates stroke width, doesn't recreate anything
+  map.on('zoomend', ()=>{
+    const zoom = map.getZoom();
+    Object.keys(segPolylines).forEach(key=>{
+      const state = segments[key] ? segments[key].state : 'neutral';
+      const { weight, casing } = segWeightsForZoom(state, zoom);
+      segPolylines[key].setStyle({ weight });
+      if(segCasingLines[key]) segCasingLines[key].setStyle({ weight: casing });
+    });
+  });
 
   function cycleSegment(key, latlngs){
     const cur = segments[key] ? segments[key].state : 'neutral';
