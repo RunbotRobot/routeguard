@@ -203,7 +203,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.21</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.22</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -277,6 +277,19 @@
       </div>
 
       <div class="section">
+        <h3>Official WA state directory</h3>
+        <div class="legend-row" style="justify-content:space-between;">
+          <span>Show state-licensed centers &amp; school-age programs</span>
+          <input type="checkbox" id="officialDataToggle" checked style="width:auto;">
+        </div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px;">
+          King County only for now. Sourced directly from DCYF's open dataset via your tile cache worker, refreshed monthly. This does <b>not</b> include Family Home (in-home) daycares — Washington only publishes those at city-level precision, not exact addresses, so they can't be pin-plotted from any public source. Keep adding those manually as you find them.
+        </div>
+        <div id="officialDataStatus" style="font-size:11.5px;margin-top:6px;color:var(--muted);">Not loaded yet</div>
+        <button class="small-btn" id="btnRefreshOfficial" style="width:100%;margin-top:6px;">Refresh now</button>
+      </div>
+
+      <div class="section">
         <h3>Line coloring <b style="font-weight:700;">(new — test carefully)</b></h3>
         <label class="field-label">Touch mode</label>
         <select class="field-input" id="paintModeSelect">
@@ -300,6 +313,7 @@
         <div class="legend-row"><span class="legend-pin" style="background:#8a4fbf"></span>Childcare / home daycare</div>
         <div class="legend-row"><span class="legend-pin" style="background:#3b6fd9"></span>Park / other</div>
         <div class="legend-row" style="margin-top:4px;"><span class="legend-pin" style="background:#999;border-style:dashed;"></span>Solid ring = added by you · dashed = auto-detected</div>
+        <div class="legend-row"><span class="legend-pin" style="background:#999;border:3px solid #d4a300;"></span>Gold ring = official WA state licensing data</div>
       </div>
 
       <div class="section">
@@ -388,7 +402,14 @@
   function savePoiCache(c){ try{localStorage.setItem(LS_POI_CACHE, JSON.stringify(c));}catch(e){console.error('Could not save location cache (storage may be full):', e);} }
 
   const LS_TILE_CACHE_CFG = "rg_tile_cache_cfg";
-  function loadTileCacheCfg(){ try{return JSON.parse(localStorage.getItem(LS_TILE_CACHE_CFG))||{};}catch(e){return {};} }
+  const DEFAULT_TILE_CACHE_URL = "https://sweet-bar-0621.runbotrobot.workers.dev";
+  function loadTileCacheCfg(){
+    try{
+      const stored = JSON.parse(localStorage.getItem(LS_TILE_CACHE_CFG));
+      if(stored && stored.url) return stored;
+    }catch(e){}
+    return { url: DEFAULT_TILE_CACHE_URL };
+  }
   function saveTileCacheCfg(c){ localStorage.setItem(LS_TILE_CACHE_CFG, JSON.stringify(c)); }
 
   let pins = loadPins();
@@ -956,6 +977,75 @@
   // only when a data load happens to need it
   checkTileCacheHealth(true);
   setInterval(()=> checkTileCacheHealth(false), 10 * 60 * 1000); // every 10 minutes
+
+  // ---------- official WA state directory (centers, school-age, outdoor programs) ----------
+  const LS_OFFICIAL_CACHE = "rg_official_cache";
+  const OFFICIAL_REFRESH_MS = 30 * 24 * 60 * 60 * 1000; // ~monthly, as requested
+  function loadOfficialCache(){ try{return JSON.parse(localStorage.getItem(LS_OFFICIAL_CACHE))||null;}catch(e){return null;} }
+  function saveOfficialCache(c){ try{localStorage.setItem(LS_OFFICIAL_CACHE, JSON.stringify(c));}catch(e){console.error('Could not save official directory cache:', e);} }
+
+  const officialPinLayer = L.layerGroup().addTo(map);
+  const officialPinMarkers = {};
+  const officialDataToggle = document.getElementById('officialDataToggle');
+  const officialDataStatusEl = document.getElementById('officialDataStatus');
+
+  function officialPinIcon(color){
+    return L.divIcon({
+      html:`<div style="width:16px;height:16px;border-radius:50%;background:${color};border:3px solid #d4a300;box-shadow:0 1px 4px rgba(0,0,0,.4)"></div>`,
+      className:'', iconSize:[16,16], iconAnchor:[8,8]
+    });
+  }
+
+  function renderOfficialRecords(records){
+    officialPinLayer.clearLayers();
+    Object.keys(officialPinMarkers).forEach(k=>delete officialPinMarkers[k]);
+    if(!officialDataToggle.checked) return;
+    records.forEach(r=>{
+      const color = r.type === 'SCHOOL-AGE PROGRAM' ? CATEGORY_COLOR.school : CATEGORY_COLOR.childcare;
+      const m = L.marker([r.lat, r.lng], {icon: officialPinIcon(color)}).addTo(officialPinLayer);
+      m.bindPopup(`<b>${escapeHtml(r.name||'Unnamed provider')}</b><br>${escapeHtml(r.type||'')} · official WA state licensing data<br>${escapeHtml(r.address||'')}${r.city ? ', '+escapeHtml(r.city) : ''}<br><a href="https://www.findchildcarewa.org/PSS_Search?p=DEL Licensed" target="_blank" rel="noopener">Check current status on Child Care Check</a>`);
+      officialPinMarkers[r.id] = m;
+    });
+  }
+
+  async function loadOfficialChildcareData(force){
+    const cfg = loadTileCacheCfg();
+    if(!cfg.url){ officialDataStatusEl.textContent = 'Needs a tile cache worker configured above'; return; }
+    const cached = loadOfficialCache();
+    const now = Date.now();
+    if(!force && cached && (now - cached.fetchedAt) < OFFICIAL_REFRESH_MS){
+      renderOfficialRecords(cached.records);
+      officialDataStatusEl.textContent = `${cached.records.length} locations · updated ${ageLabel(cached.fetchedAt)}`;
+      return;
+    }
+    officialDataStatusEl.textContent = 'Loading…';
+    try{
+      const controller = new AbortController();
+      const timeoutId = setTimeout(()=>controller.abort(), 20000);
+      const res = await fetch(`${cfg.url}/official-childcare?county=KING`, {signal: controller.signal});
+      clearTimeout(timeoutId);
+      if(!res.ok) throw new Error('HTTP '+res.status);
+      const data = await res.json();
+      saveOfficialCache({records: data.records, fetchedAt: Date.now()});
+      renderOfficialRecords(data.records);
+      officialDataStatusEl.textContent = `${data.records.length} locations · updated just now`;
+    }catch(err){
+      console.error('Official childcare data load failed:', err);
+      if(cached){
+        renderOfficialRecords(cached.records);
+        officialDataStatusEl.textContent = `⚠ Refresh failed — showing ${cached.records.length} locations from ${ageLabel(cached.fetchedAt)}`;
+      } else {
+        officialDataStatusEl.textContent = '⚠ Could not load official directory data';
+      }
+    }
+  }
+
+  officialDataToggle.addEventListener('change', ()=>{
+    const cached = loadOfficialCache();
+    if(cached) renderOfficialRecords(cached.records);
+  });
+  document.getElementById('btnRefreshOfficial').onclick = ()=> loadOfficialChildcareData(true);
+  loadOfficialChildcareData(false);
 
   // while running with live tracking, refresh only if we've actually moved
   // near the edge of the last-loaded area, and never more than the throttle allows
