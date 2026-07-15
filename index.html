@@ -203,7 +203,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.20</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.21</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -272,6 +272,8 @@
         <div style="font-size:11px;color:var(--muted);margin-top:4px;">
           If set, tries your own cache first for faster, more reliable loads on areas you've visited before — falls back to direct public servers automatically if unset or unreachable.
         </div>
+        <div id="tileCacheStatus" style="font-size:11.5px;margin-top:6px;color:var(--muted);">Not configured</div>
+        <button class="small-btn" id="btnTestTileCache" style="width:100%;margin-top:6px;">Test connection</button>
       </div>
 
       <div class="section">
@@ -814,12 +816,19 @@
         lastRoadCount = roadEdgeCount;
         stopLoadTicker();
         setDataStatus('st-ok', okStatusText() + ' · via your cache');
+        setTileCacheStatus('✓ Working (last used just now)', true);
+        tileCacheLastKnownGood = true;
         retryCount = 0;
         if(retryTimer){ clearTimeout(retryTimer); retryTimer = null; }
         dataLoadInFlight = false;
         return;
       }catch(err){
         console.error('Tile cache failed, falling back to direct Overpass:', err);
+        setTileCacheStatus('✗ Unreachable — falling back to direct fetch', false);
+        if(tileCacheLastKnownGood !== false){
+          showWarn('⚠ Your tile cache worker stopped responding — RouteGuard will keep working using direct public servers instead.', 6000);
+        }
+        tileCacheLastKnownGood = false;
         // fall through to path 2 below
       }
     }
@@ -897,10 +906,56 @@
   };
 
   const tileCacheUrlInput = document.getElementById('tileCacheUrl');
+  const tileCacheStatusEl = document.getElementById('tileCacheStatus');
+  let tileCacheLastKnownGood = null; // was it working last time we knew?
+
+  function setTileCacheStatus(text, ok){
+    tileCacheStatusEl.textContent = text;
+    tileCacheStatusEl.style.color = ok === true ? '#1f6b45' : ok === false ? '#9c2a20' : 'var(--muted)';
+  }
+
+  async function checkTileCacheHealth(silent){
+    const cfg = loadTileCacheCfg();
+    if(!cfg.url){ setTileCacheStatus('Not configured', null); return; }
+    setTileCacheStatus('Checking…', null);
+    try{
+      const controller = new AbortController();
+      const timeoutId = setTimeout(()=>controller.abort(), 8000);
+      const res = await fetch(cfg.url + '/health', {signal: controller.signal});
+      clearTimeout(timeoutId);
+      if(!res.ok) throw new Error('HTTP '+res.status);
+      const data = await res.json();
+      if(!data.kvBound){
+        setTileCacheStatus('⚠ Worker reachable but KV storage isn\'t bound — see setup step 3 in the worker file', false);
+      } else {
+        setTileCacheStatus('✓ Working (checked just now)', true);
+      }
+      if(tileCacheLastKnownGood === false && !silent){
+        showWarn('Tile cache is back up.', 3000);
+      }
+      tileCacheLastKnownGood = true;
+    }catch(err){
+      setTileCacheStatus('✗ Unreachable — falling back to direct fetch', false);
+      if(tileCacheLastKnownGood !== false){
+        showWarn('⚠ Your tile cache worker stopped responding — RouteGuard will keep working using direct public servers instead.', 6000);
+      }
+      tileCacheLastKnownGood = false;
+    }
+  }
+
+  document.getElementById('btnTestTileCache').onclick = ()=> checkTileCacheHealth(false);
+
   tileCacheUrlInput.value = (loadTileCacheCfg().url) || '';
   tileCacheUrlInput.addEventListener('change', ()=>{
     saveTileCacheCfg({ url: tileCacheUrlInput.value.trim().replace(/\/$/,'') });
+    tileCacheLastKnownGood = null;
+    checkTileCacheHealth(true);
   });
+
+  // check on load, then periodically, so you find out passively rather than
+  // only when a data load happens to need it
+  checkTileCacheHealth(true);
+  setInterval(()=> checkTileCacheHealth(false), 10 * 60 * 1000); // every 10 minutes
 
   // while running with live tracking, refresh only if we've actually moved
   // near the edge of the last-loaded area, and never more than the throttle allows
