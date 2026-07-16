@@ -203,7 +203,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.22</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.23</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -212,6 +212,7 @@
     <div id="map"></div>
     <div id="dataStatus" class="st-loading"><span class="sw"></span><span id="dataStatusText">Not loaded yet</span></div>
     <div id="hint"></div>
+    <button id="btnCancelRoute" style="display:none;position:absolute;left:50%;top:52px;transform:translateX(-50%);z-index:1000;background:#c1443c;color:#fff;border:none;padding:6px 14px;border-radius:16px;font-size:12.5px;box-shadow:0 3px 10px rgba(0,0,0,.2);cursor:pointer;">Cancel route</button>
     <div id="warnbar"></div>
     <div id="liveStatus">
       <span class="liveDot"></span><span id="liveStatusText">Tracking…</span>
@@ -505,8 +506,11 @@
   function setMode(m){
     mode = m;
     [btnPin,btnRoute,btnBrowse].forEach(b=>b.classList.remove('active'));
+    routeClicks = [];
+    if(startEndLayer) startEndLayer.clearLayers();
+    if(btnCancelRoute) btnCancelRoute.style.display = 'none';
     if(m==='pin'){ btnPin.classList.add('active'); showHint('Tap the map to drop a pin.'); }
-    if(m==='route'){ btnRoute.classList.add('active'); routeClicks=[]; showHint('Tap a start point, then an end point.'); }
+    if(m==='route'){ btnRoute.classList.add('active'); showHint('Tap a start point, then an end point.'); }
     if(m==='browse'){ btnBrowse.classList.add('active'); showHint(''); }
   }
   btnPin.onclick = ()=>setMode('pin');
@@ -1405,6 +1409,15 @@
   }
 
   // ---------- map click handling ----------
+  const btnCancelRoute = document.getElementById('btnCancelRoute');
+  function cancelRoutePlanning(){
+    routeClicks = [];
+    startEndLayer.clearLayers();
+    btnCancelRoute.style.display = 'none';
+    if(mode === 'route') showHint('Tap a start point, then an end point.');
+  }
+  btnCancelRoute.onclick = cancelRoutePlanning;
+
   map.on('click', (e)=>{
     if(mode === 'pin'){
       openPinModal(e.latlng);
@@ -1418,9 +1431,11 @@
       }).addTo(startEndLayer);
       if(routeClicks.length === 1){
         showHint('Now tap your end point.');
+        btnCancelRoute.style.display = 'block';
       } else if(routeClicks.length === 2){
         planRoute(routeClicks[0], routeClicks[1]);
         routeClicks = [];
+        btnCancelRoute.style.display = 'none';
       }
     }
   });
