@@ -203,7 +203,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.24</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.25</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -802,7 +802,7 @@
       const timeoutId = setTimeout(()=>controller.abort(), 15000);
       return fetch(`${cacheUrl}/tile?lat=${c.lat}&lng=${c.lng}`, {signal: controller.signal})
         .then(res=>{ clearTimeout(timeoutId); if(!res.ok) throw new Error('HTTP '+res.status); return res.json(); })
-        .catch(err=>{ clearTimeout(timeoutId); throw err; });
+        .catch(err=>{ clearTimeout(timeoutId); if(err.name === 'AbortError') throw new Error('timed out after 15s'); throw err; });
     }));
     // merge every cell's elements into one combined result; duplicates across
     // adjacent cells are harmless — applyOverpassResults keys everything and
@@ -849,9 +849,10 @@
         return;
       }catch(err){
         console.error('Tile cache failed, falling back to direct Overpass:', err);
-        setTileCacheStatus('✗ Unreachable — falling back to direct fetch', false);
+        const reason = (err && err.message) ? err.message : String(err);
+        setTileCacheStatus(`✗ Unreachable (${reason}) — falling back to direct fetch`, false);
         if(tileCacheLastKnownGood !== false){
-          showWarn('⚠ Your tile cache worker stopped responding — RouteGuard will keep working using direct public servers instead.', 6000);
+          showWarn(`⚠ Your tile cache worker stopped responding (${reason}) — RouteGuard will keep working using direct public servers instead.`, 6000);
         }
         tileCacheLastKnownGood = false;
         // fall through to path 2 below
@@ -960,9 +961,10 @@
       }
       tileCacheLastKnownGood = true;
     }catch(err){
-      setTileCacheStatus('✗ Unreachable — falling back to direct fetch', false);
+      const reason = (err && err.name === 'AbortError') ? 'timed out after 8s' : ((err && err.message) ? err.message : String(err));
+      setTileCacheStatus(`✗ Unreachable (${reason}) — falling back to direct fetch`, false);
       if(tileCacheLastKnownGood !== false){
-        showWarn('⚠ Your tile cache worker stopped responding — RouteGuard will keep working using direct public servers instead.', 6000);
+        showWarn(`⚠ Your tile cache worker stopped responding (${reason}) — RouteGuard will keep working using direct public servers instead.`, 6000);
       }
       tileCacheLastKnownGood = false;
     }
