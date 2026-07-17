@@ -211,7 +211,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.27</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.28</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -785,6 +785,25 @@
     if(loadTickTimer){ clearInterval(loadTickTimer); loadTickTimer = null; }
   }
 
+  function buildOverpassQuery(bbox){
+    return `[out:json][timeout:25];
+      (
+        node["amenity"="school"](${bbox});
+        way["amenity"="school"](${bbox});
+        node["amenity"="kindergarten"](${bbox});
+        node["amenity"="childcare"](${bbox});
+        node["leisure"="playground"](${bbox});
+        way["leisure"="playground"](${bbox});
+        node["leisure"="park"](${bbox});
+        way["leisure"="park"](${bbox});
+      )->.pois;
+      .pois out center;
+      (
+        way["highway"~"^(${ROAD_HIGHWAY_TYPES})$"](${bbox});
+      )->.roads;
+      .roads out geom;`;
+  }
+
   function fetchOverpassMirror(endpoint, query){
     const controller = new AbortController();
     const timeoutId = setTimeout(()=>controller.abort(), 20000);
@@ -842,6 +861,39 @@
     return merged;
   }
 
+  // Cloudflare Workers share egress IPs across every Workers script on the
+  // platform, so public Overpass mirrors rate-limit the worker's own tile
+  // fetches far more than they rate-limit a single phone's direct requests.
+  // When the direct fallback below succeeds, hand its data to the worker
+  // per grid cell so the shared cache benefits from the connection that
+  // actually works, instead of depending on the worker's own outbound calls.
+  // Best-effort and silent: failures here don't affect the current view,
+  // which already rendered from the direct fetch — this only affects
+  // whether future visits get served from cache.
+  let lastPopulateAttemptAt = 0;
+  const MIN_POPULATE_INTERVAL_MS = 60000; // don't pile more load on the same mirrors every pan/zoom
+  async function populateTileCacheInBackground(cacheUrl, b){
+    const now = Date.now();
+    if((now - lastPopulateAttemptAt) < MIN_POPULATE_INTERVAL_MS) return;
+    lastPopulateAttemptAt = now;
+    const cells = gridCellsForBounds(b);
+    if(cells.length > 12) return; // same sanity guard as loadViaTileCache
+    await Promise.all(cells.map(async c=>{
+      try{
+        const cellBbox = `${c.lat-TILE_GRID_SIZE/2},${c.lng-TILE_GRID_SIZE/2},${c.lat+TILE_GRID_SIZE/2},${c.lng+TILE_GRID_SIZE/2}`;
+        const query = buildOverpassQuery(cellBbox);
+        const attempts = OVERPASS_ENDPOINTS.map(endpoint => fetchOverpassMirror(endpoint, query));
+        const data = await Promise.any(attempts.map(a => a.promise));
+        attempts.forEach(a => a.controller.abort());
+        await fetch(`${cacheUrl}/tile?lat=${c.lat}&lng=${c.lng}`, {
+          method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data)
+        });
+      }catch(err){
+        console.error('Background tile-cache populate failed for cell', c, err);
+      }
+    }));
+  }
+
   async function loadNearbyData(force){
     if(!autoLoadToggle.checked) return;
     if(map.getZoom() < MIN_ZOOM_FOR_AUTO){
@@ -893,22 +945,7 @@
     // approach, always available as a fallback whether or not a tile cache
     // is configured
     const bbox = `${b.getSouth()},${b.getWest()},${b.getNorth()},${b.getEast()}`;
-    const query = `[out:json][timeout:25];
-      (
-        node["amenity"="school"](${bbox});
-        way["amenity"="school"](${bbox});
-        node["amenity"="kindergarten"](${bbox});
-        node["amenity"="childcare"](${bbox});
-        node["leisure"="playground"](${bbox});
-        way["leisure"="playground"](${bbox});
-        node["leisure"="park"](${bbox});
-        way["leisure"="park"](${bbox});
-      )->.pois;
-      .pois out center;
-      (
-        way["highway"~"^(${ROAD_HIGHWAY_TYPES})$"](${bbox});
-      )->.roads;
-      .roads out geom;`;
+    const query = buildOverpassQuery(bbox);
 
     // try every mirror at once and take whichever answers first, instead of
     // waiting out a full timeout on one before trying the next (that's what
@@ -927,6 +964,7 @@
       setDataStatus('st-ok', okStatusText());
       retryCount = 0;
       if(retryTimer){ clearTimeout(retryTimer); retryTimer = null; }
+      if(cfg.url){ populateTileCacheInBackground(cfg.url, b); } // fire-and-forget
     }catch(aggregateErr){
       stopLoadTicker();
       if(lastSuccessAt){
