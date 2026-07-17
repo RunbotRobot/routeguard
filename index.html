@@ -91,9 +91,16 @@
   }
   #warnbar{
     position:absolute;left:50%;bottom:14px;transform:translateX(-50%);
-    background:#fff;border:1px solid var(--avoid);color:var(--avoid);padding:8px 14px;border-radius:8px;
+    background:#fff;border:1px solid var(--avoid);color:var(--avoid);padding:8px 10px 8px 14px;border-radius:8px;
     font-size:12.5px;z-index:1000;box-shadow:0 3px 10px rgba(0,0,0,.15);display:none;max-width:90%;
+    align-items:flex-start;gap:8px;
   }
+  #warnbarText{ user-select:text;-webkit-user-select:text;white-space:pre-wrap;word-break:break-word; }
+  #warnbarClose{
+    background:none;border:none;color:inherit;font-size:18px;line-height:1;cursor:pointer;
+    padding:0 2px;flex:none;opacity:.65;
+  }
+  #warnbarClose:hover, #warnbarClose:active{ opacity:1; }
 
   /* modal */
   #modalWrap{position:absolute;inset:0;background:rgba(20,24,30,.4);display:none;align-items:center;justify-content:center;z-index:2000;}
@@ -203,7 +210,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.25</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.26</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -213,7 +220,7 @@
     <div id="dataStatus" class="st-loading"><span class="sw"></span><span id="dataStatusText">Not loaded yet</span></div>
     <div id="hint"></div>
     <button id="btnCancelRoute" style="display:none;position:absolute;left:50%;top:52px;transform:translateX(-50%);z-index:1000;background:#c1443c;color:#fff;border:none;padding:6px 14px;border-radius:16px;font-size:12.5px;box-shadow:0 3px 10px rgba(0,0,0,.2);cursor:pointer;">Cancel route</button>
-    <div id="warnbar"></div>
+    <div id="warnbar"><span id="warnbarText"></span><button id="warnbarClose" aria-label="Dismiss">&times;</button></div>
     <div id="liveStatus">
       <span class="liveDot"></span><span id="liveStatusText">Tracking…</span>
       <button id="btnCompass" class="livebtn">Enable compass</button>
@@ -380,9 +387,10 @@
     console.error('Unhandled error:', e.error || e.message);
     try{
       const w = document.getElementById('warnbar');
-      if(w){
-        w.textContent = '⚠ Something went wrong (' + (e.message||'unknown error') + '). Some features may not work — reloading the page usually fixes this.';
-        w.style.display = 'block';
+      const wt = document.getElementById('warnbarText');
+      if(w && wt){
+        wt.textContent = '⚠ Something went wrong (' + (e.message||'unknown error') + '). Some features may not work — reloading the page usually fixes this.';
+        w.style.display = 'flex';
       }
     }catch(_){}
   });
@@ -492,11 +500,21 @@
 
   const hint = document.getElementById('hint');
   const warnbar = document.getElementById('warnbar');
+  const warnbarText = document.getElementById('warnbarText');
+  const warnbarClose = document.getElementById('warnbarClose');
   function showHint(msg){ hint.textContent = msg; hint.style.display = msg ? 'block' : 'none'; }
   function showWarn(msg, ms){
-    warnbar.textContent = msg; warnbar.style.display = msg ? 'block' : 'none';
-    if(ms){ clearTimeout(showWarn._t); showWarn._t = setTimeout(()=>{warnbar.style.display='none';}, ms); }
+    clearTimeout(showWarn._t);
+    warnbarText.textContent = msg;
+    warnbar.style.display = msg ? 'flex' : 'none';
+    // messages starting with ⚠ are real problems (as opposed to plain
+    // confirmations like "Connected to Strava.") — those stay up until the
+    // user taps the close button, since they're often worth reading closely
+    // or copying, and a phone can't rely on a console to recover them later
+    const isWarning = !!msg && msg.indexOf('⚠') === 0;
+    if(ms && !isWarning){ showWarn._t = setTimeout(()=>{warnbar.style.display='none';}, ms); }
   }
+  warnbarClose.onclick = ()=>{ clearTimeout(showWarn._t); warnbar.style.display = 'none'; };
 
   // ---------- modes ----------
   let mode = 'browse'; // 'pin' | 'route' | 'browse'
