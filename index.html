@@ -215,7 +215,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.37</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.38</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -1684,112 +1684,40 @@
   // ---------- custom avoidance router ----------
   // The free OSRM demo has no concept of an exclusion zone, so getting an
   // actual guarantee (rather than best-effort picking among OSRM's own
-  // alternatives) means building our own routable graph from OSM data and
-  // running our own pathfinding, treating any edge within the buffer of a
-  // known location or marked avoid-line as impassable. This is entirely
-  // separate from the line-marking/display pipeline (lineCache, segments,
-  // drawSegment) — it fetches its own node+way graph and never touches that
-  // safety-critical, already-working system.
+  // alternatives) means building our own routable graph and running our
+  // own pathfinding, treating any edge within the buffer of a known
+  // location or marked avoid-line as impassable. The graph is built
+  // read-only from lineCache (populated by the same area-loading step this
+  // needs to run anyway for the blocking check) rather than a second
+  // fetch — it never writes to lineCache/segments/drawSegment, so the
+  // already-working line-marking/display pipeline is untouched.
 
-  function buildRoutingGraphQuery(bbox){
-    return `[out:json][timeout:25];
-      way["highway"~"^(${ROAD_HIGHWAY_TYPES})$"]["foot"!="no"]["access"!="private"](${bbox});
-      (._;>;);
-      out body;`;
-  }
-
-  async function fetchRoutingGraphChunk(cellBounds){
-    const bbox = `${cellBounds.getSouth()},${cellBounds.getWest()},${cellBounds.getNorth()},${cellBounds.getEast()}`;
-    const query = buildRoutingGraphQuery(bbox);
-    const attempts = OVERPASS_ENDPOINTS.map(endpoint => fetchOverpassMirror(endpoint, query));
-    const data = await Promise.any(attempts.map(a=>a.promise));
-    attempts.forEach(a=>a.controller.abort());
-    return data.elements || [];
-  }
-
-  // coarser than TILE_GRID_SIZE (~3.5mi vs ~1.5mi per cell) so a long
-  // ultra-distance route's search area splits into tens of chunks rather
-  // than hundreds — a single Overpass query covering a 20-30 mile route's
-  // whole search area risks timing out or returning a huge, slow response
-  const ROUTING_GRID_SIZE = 0.05;
-  function routingGridCellsForBounds(b){
-    const cells = [];
-    const latStart = Math.floor(b.getSouth()/ROUTING_GRID_SIZE)*ROUTING_GRID_SIZE;
-    const latEnd = Math.floor(b.getNorth()/ROUTING_GRID_SIZE)*ROUTING_GRID_SIZE;
-    const lngStart = Math.floor(b.getWest()/ROUTING_GRID_SIZE)*ROUTING_GRID_SIZE;
-    const lngEnd = Math.floor(b.getEast()/ROUTING_GRID_SIZE)*ROUTING_GRID_SIZE;
-    for(let la=latStart; la<=latEnd+1e-9; la+=ROUTING_GRID_SIZE){
-      for(let ln=lngStart; ln<=lngEnd+1e-9; ln+=ROUTING_GRID_SIZE){
-        cells.push(L.latLngBounds([la,ln],[la+ROUTING_GRID_SIZE, ln+ROUTING_GRID_SIZE]));
-      }
-    }
-    return cells;
-  }
-
-  // fetches the routing graph in chunks instead of one giant query, with a
-  // small concurrency limit (fast enough for a long route without
-  // hammering the same free, rate-limit-sensitive Overpass mirrors we've
-  // already run into this session) — shows progress on the same bar used
-  // for area-loading, and is cancelable the same way
-  async function fetchRoutingGraphDataWithProgress(bounds){
-    const cells = routingGridCellsForBounds(bounds);
-    const progressEl = document.getElementById('routeLoadProgress');
-    const textEl = document.getElementById('routeLoadProgressText');
-    const barEl = document.getElementById('routeLoadProgressBar');
-    const cancelBtn = document.getElementById('btnCancelRouteLoad');
-    let cancelled = false;
-    cancelBtn.onclick = ()=>{ cancelled = true; };
-    progressEl.style.display = 'block';
-    const total = cells.length;
-    let done = 0;
-    const allElements = [];
-    textEl.textContent = `Fetching road network… (0/${total})`;
-    barEl.style.width = '0%';
-
-    async function worker(){
-      while(true){
-        if(cancelled) return;
-        const cell = cells.shift();
-        if(!cell) return;
-        try{
-          const elements = await fetchRoutingGraphChunk(cell);
-          allElements.push(...elements);
-        }catch(err){
-          console.error('Could not fetch a chunk of the routing graph:', err);
-        }
-        done++;
-        textEl.textContent = `Fetching road network… (${done}/${total})`;
-        barEl.style.width = `${Math.round(done/total*100)}%`;
-      }
-    }
-    const workerCount = Math.min(3, cells.length) || 1;
-    await Promise.all(Array.from({length: workerCount}, worker));
-    progressEl.style.display = 'none';
-    return { elements: allElements, cancelled };
-  }
-
-  // nodeById: id -> {lat,lng}. adjacency: id -> [{to, dist, blocked}] —
-  // built from consecutive node pairs within each way, so shared node ids
-  // across different ways naturally connect the graph at intersections
-  function buildRoutingGraph(elements){
+  // Builds the routing graph directly from lineCache instead of a separate
+  // fetch. lineCache already holds every road segment the POI-loading step
+  // (which we run regardless, to give the blocking check complete location
+  // data) fetches via Overpass's out geom — a second out-body-with-node-IDs
+  // query for the same roads was pure redundant network time. Two segments
+  // sharing a real OSM intersection have byte-identical source coordinates
+  // for that point, so roundCoord (already used for edgeKey elsewhere in
+  // this file, ~1m precision) is enough to recognize shared intersections
+  // without needing actual node IDs — this is the same "coordinate as node
+  // identity" trick the rest of the app already relies on.
+  function buildRoutingGraphFromLineCache(bounds){
     const nodeById = new Map();
     const adjacency = new Map();
-    elements.forEach(el=>{
-      if(el.type === 'node') nodeById.set(el.id, { lat: el.lat, lng: el.lon });
-    });
-    elements.forEach(el=>{
-      if(el.type !== 'way' || !el.nodes) return;
-      for(let i=0;i<el.nodes.length-1;i++){
-        const aId = el.nodes[i], bId = el.nodes[i+1];
-        const a = nodeById.get(aId), b = nodeById.get(bId);
-        if(!a || !b) continue;
-        const dist = haversineMeters(a.lat, a.lng, b.lat, b.lng);
-        if(dist === 0) continue;
-        if(!adjacency.has(aId)) adjacency.set(aId, []);
-        if(!adjacency.has(bId)) adjacency.set(bId, []);
-        adjacency.get(aId).push({ to: bId, dist, blocked: false });
-        adjacency.get(bId).push({ to: aId, dist, blocked: false });
-      }
+    const nodeKeyFor = pt => roundCoord(pt[0])+','+roundCoord(pt[1]);
+    Object.values(lineCache).forEach(pair=>{
+      const [p1, p2] = pair;
+      if(!bounds.contains(p1) && !bounds.contains(p2)) return;
+      const k1 = nodeKeyFor(p1), k2 = nodeKeyFor(p2);
+      const dist = haversineMeters(p1[0], p1[1], p2[0], p2[1]);
+      if(dist === 0) return;
+      if(!nodeById.has(k1)) nodeById.set(k1, { lat: p1[0], lng: p1[1] });
+      if(!nodeById.has(k2)) nodeById.set(k2, { lat: p2[0], lng: p2[1] });
+      if(!adjacency.has(k1)) adjacency.set(k1, []);
+      if(!adjacency.has(k2)) adjacency.set(k2, []);
+      adjacency.get(k1).push({ to: k2, dist, blocked: false });
+      adjacency.get(k2).push({ to: k1, dist, blocked: false });
     });
     return { nodeById, adjacency };
   }
@@ -1997,9 +1925,10 @@
       if(result.cancelled) return { cancelled: true };
     }
 
-    const graphResult = await fetchRoutingGraphDataWithProgress(bounds);
-    if(graphResult.cancelled) return { cancelled: true };
-    const graph = buildRoutingGraph(graphResult.elements);
+    // no separate fetch — lineCache already has every road segment in this
+    // area from the load-cells step just above, since that's exactly what
+    // populates it
+    const graph = buildRoutingGraphFromLineCache(bounds);
     if(graph.nodeById.size === 0) throw new Error('no road data returned for this area');
 
     const locations = allKnownLocationsForProximityCheck();
