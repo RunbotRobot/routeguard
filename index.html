@@ -211,7 +211,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.26</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.27</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -823,8 +823,16 @@
       // cache miss aborts client-side before the worker even gives up
       const timeoutId = setTimeout(()=>controller.abort(), 25000);
       return fetch(`${cacheUrl}/tile?lat=${c.lat}&lng=${c.lng}`, {signal: controller.signal})
-        .then(res=>{ clearTimeout(timeoutId); if(!res.ok) throw new Error('HTTP '+res.status); return res.json(); })
-        .catch(err=>{ clearTimeout(timeoutId); if(err.name === 'AbortError') throw new Error('timed out after 15s'); throw err; });
+        .then(async res=>{
+          clearTimeout(timeoutId);
+          if(!res.ok){
+            let detail = '';
+            try{ const body = await res.json(); if(body && body.error) detail = ': '+body.error; }catch(_){}
+            throw new Error('HTTP '+res.status+detail);
+          }
+          return res.json();
+        })
+        .catch(err=>{ clearTimeout(timeoutId); if(err.name === 'AbortError') throw new Error('timed out after 25s'); throw err; });
     }));
     // merge every cell's elements into one combined result; duplicates across
     // adjacent cells are harmless — applyOverpassResults keys everything and
