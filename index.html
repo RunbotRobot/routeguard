@@ -203,7 +203,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.23</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.24</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -506,11 +506,11 @@
   function setMode(m){
     mode = m;
     [btnPin,btnRoute,btnBrowse].forEach(b=>b.classList.remove('active'));
-    routeClicks = [];
-    if(startEndLayer) startEndLayer.clearLayers();
-    if(btnCancelRoute) btnCancelRoute.style.display = 'none';
     if(m==='pin'){ btnPin.classList.add('active'); showHint('Tap the map to drop a pin.'); }
-    if(m==='route'){ btnRoute.classList.add('active'); showHint('Tap a start point, then an end point.'); }
+    if(m==='route'){
+      btnRoute.classList.add('active');
+      showHint(routeClicks.length === 1 ? 'Now tap your end point.' : 'Tap a start point, then an end point.');
+    }
     if(m==='browse'){ btnBrowse.classList.add('active'); showHint(''); }
   }
   btnPin.onclick = ()=>setMode('pin');
