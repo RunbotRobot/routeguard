@@ -96,7 +96,12 @@
     font-size:12.5px;z-index:1000;box-shadow:0 3px 10px rgba(0,0,0,.15);display:none;max-width:90%;
     align-items:flex-start;gap:8px;
   }
+  #warnbarContent{ display:flex; flex-direction:column; align-items:flex-start; gap:6px; flex:1; min-width:0; }
   #warnbarText{ user-select:text;-webkit-user-select:text;white-space:pre-wrap;word-break:break-word; }
+  #btnShowRouteAnyway{
+    background:none;border:1px solid currentColor;color:inherit;border-radius:10px;
+    font-size:11px;padding:3px 10px;cursor:pointer;white-space:nowrap;
+  }
   #warnbarClose{
     background:none;border:none;color:inherit;font-size:18px;line-height:1;cursor:pointer;
     padding:0 2px;flex:none;opacity:.65;
@@ -215,7 +220,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.38</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.39</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -232,7 +237,13 @@
       </div>
       <button id="btnCancelRouteLoad" style="margin-top:8px;background:#c1443c;color:#fff;border:none;padding:5px 12px;border-radius:14px;font-size:12px;cursor:pointer;">Cancel</button>
     </div>
-    <div id="warnbar"><span id="warnbarText"></span><button id="btnShowRouteAnyway" style="display:none;background:none;border:1px solid currentColor;color:inherit;border-radius:10px;font-size:11px;padding:2px 8px;cursor:pointer;flex:none;white-space:nowrap;">Show anyway</button><button id="warnbarClose" aria-label="Dismiss">&times;</button></div>
+    <div id="warnbar">
+      <div id="warnbarContent">
+        <span id="warnbarText"></span>
+        <button id="btnShowRouteAnyway" style="display:none;">Show anyway</button>
+      </div>
+      <button id="warnbarClose" aria-label="Dismiss">&times;</button>
+    </div>
     <div id="liveStatus">
       <span class="liveDot"></span><span id="liveStatusText">Tracking…</span>
       <button id="btnCompass" class="livebtn">Enable compass</button>
@@ -1877,16 +1888,28 @@
     return pairs;
   }
 
+  // clearing a 1000ft (~305m) buffer only ever needs local maneuvering room,
+  // not miles of lateral space — a margin many times the buffer itself is
+  // already generous. This was previously capped at 4800m (~3mi) and scaled
+  // with route length, which on a 20-30 mile route meant a huge search area
+  // before the router could even start looking for a path — by far the
+  // largest cost once the redundant graph fetch was removed, and also why
+  // panning/zooming got sluggish afterward (that much loaded/rendered data).
+  function avoidanceMarginMeters(straightLineMeters){
+    return Math.max(400, Math.min(straightLineMeters * 0.15, 1200));
+  }
+
   // bounding area to search for a path in — the straight line between start
-  // and end, expanded with enough margin to actually have room to route
-  // around obstacles near either point
+  // and end, expanded with margin. Only used for the (free, in-memory)
+  // graph-build filter, where being a bit generous costs nothing; the
+  // network-costly load step uses corridorCellsForRoute below instead,
+  // since this simple bbox is the full rectangle between the two points
+  // for anything but a purely north-south or east-west route — a diagonal
+  // 20 mile route would otherwise mean loading a ~20x20 mile area instead
+  // of a narrow corridor along the direct line.
   function expandedBoundsForRoute(a, b){
     const straightLineMeters = haversineMeters(a.lat, a.lng, b.lat, b.lng);
-    // capped rather than scaling forever with route length — detours to
-    // clear a specific location are a local, not a route-length-proportional
-    // need, and letting the margin grow unbounded on a 20-30 mile route would
-    // needlessly balloon the search area on both sides
-    const marginMeters = Math.max(400, Math.min(straightLineMeters * 0.35, 4800));
+    const marginMeters = avoidanceMarginMeters(straightLineMeters);
     const midLat = (a.lat+b.lat)/2;
     const latMargin = marginMeters / 111320;
     const lngMargin = marginMeters / (111320 * Math.cos(midLat * Math.PI/180));
@@ -1895,6 +1918,29 @@
     const west = Math.min(a.lng,b.lng) - lngMargin;
     const east = Math.max(a.lng,b.lng) + lngMargin;
     return L.latLngBounds([south,west],[north,east]);
+  }
+
+  // grid cells to actually load: stepped along the straight line between a
+  // and b (roughly one step per margin-width), each contributing the cells
+  // within margin of that point — a corridor hugging the direct path,
+  // rather than expandedBoundsForRoute's full bounding rectangle
+  function corridorCellsForRoute(a, b){
+    const straightLineMeters = haversineMeters(a.lat, a.lng, b.lat, b.lng);
+    const marginMeters = avoidanceMarginMeters(straightLineMeters);
+    const steps = Math.max(1, Math.ceil(straightLineMeters / marginMeters));
+    const cellMap = new Map();
+    for(let i=0;i<=steps;i++){
+      const t = i/steps;
+      const lat = a.lat + (b.lat-a.lat)*t;
+      const lng = a.lng + (b.lng-a.lng)*t;
+      const latMargin = marginMeters / 111320;
+      const lngMargin = marginMeters / (111320 * Math.cos(lat * Math.PI/180));
+      const localBounds = L.latLngBounds([lat-latMargin,lng-lngMargin],[lat+latMargin,lng+lngMargin]);
+      gridCellsForBounds(localBounds).forEach(c=>{
+        cellMap.set(cellKeyForCellCenter(c.lat,c.lng), c);
+      });
+    }
+    return [...cellMap.values()];
   }
 
   // past this straight-line distance, fall back to best-effort OSRM routing
@@ -1915,11 +1961,13 @@
     }
     const bounds = expandedBoundsForRoute(a, b);
 
-    // make sure every cell in the whole search area (not just the eventual
-    // path) has been checked against every data source — otherwise the
-    // router could treat an unvisited area as clear simply because we don't
-    // have data for it yet
-    const missingCells = gridCellsForBounds(bounds).filter(c=>!loadedCells.has(cellKeyForCellCenter(c.lat,c.lng)));
+    // make sure every cell along the corridor (not just the eventual path)
+    // has been checked against every data source — otherwise the router
+    // could treat an unvisited area as clear simply because we don't have
+    // data for it yet. Uses the corridor, not expandedBoundsForRoute's full
+    // bounding rectangle, since that rectangle is far larger than the
+    // corridor for anything but a purely north-south/east-west route.
+    const missingCells = corridorCellsForRoute(a, b).filter(c=>!loadedCells.has(cellKeyForCellCenter(c.lat,c.lng)));
     if(missingCells.length){
       const result = await loadCellsWithProgress(missingCells);
       if(result.cancelled) return { cancelled: true };
