@@ -215,7 +215,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.33</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.34</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -441,15 +441,54 @@
   const LS_LOADED_CELLS = "rg_loaded_cells"; // grid cells (see TILE_GRID_SIZE) fully checked against every data source
 
   function loadPins(){ try{return JSON.parse(localStorage.getItem(LS_PINS))||[];}catch(e){return [];} }
-  function savePins(p){ localStorage.setItem(LS_PINS, JSON.stringify(p)); }
   function loadSegs(){ try{return JSON.parse(localStorage.getItem(LS_SEGS))||{};}catch(e){return {};} }
-  function saveSegs(s){ localStorage.setItem(LS_SEGS, JSON.stringify(s)); }
   function loadLineCache(){ try{return JSON.parse(localStorage.getItem(LS_LINE_CACHE))||{};}catch(e){return {};} }
-  function saveLineCache(c){ try{localStorage.setItem(LS_LINE_CACHE, JSON.stringify(c));}catch(e){console.error('Could not save line cache (storage may be full):', e);} }
   function loadPoiCache(){ try{return JSON.parse(localStorage.getItem(LS_POI_CACHE))||{};}catch(e){return {};} }
-  function savePoiCache(c){ try{localStorage.setItem(LS_POI_CACHE, JSON.stringify(c));}catch(e){console.error('Could not save location cache (storage may be full):', e);} }
   function loadLoadedCells(){ try{return new Set(JSON.parse(localStorage.getItem(LS_LOADED_CELLS))||[]);}catch(e){return new Set();} }
-  function saveLoadedCells(s){ try{localStorage.setItem(LS_LOADED_CELLS, JSON.stringify([...s]));}catch(e){console.error('Could not save loaded-area tracking (storage may be full):', e);} }
+
+  // lineCache/poiCache (every road/POI ever auto-detected, kept forever) are
+  // by far the biggest thing this app stores, and are always safely
+  // re-fetchable — so if a write of safety-critical data (marked lines,
+  // pins) hits the shared localStorage quota, free space by clearing THOSE
+  // first, never the other way around, then retry once.
+  function pruneBulkCachesForSpace(){
+    lineCache = {};
+    poiCache = {};
+    try{ localStorage.removeItem(LS_LINE_CACHE); }catch(e){}
+    try{ localStorage.removeItem(LS_POI_CACHE); }catch(e){}
+  }
+  function isQuotaExceeded(err){
+    return !!err && (err.name === 'QuotaExceededError' || err.code === 22 || err.code === 1014);
+  }
+  function safeLocalStorageSet(key, valueStr, isCritical){
+    try{
+      localStorage.setItem(key, valueStr);
+      return true;
+    }catch(err){
+      if(!isQuotaExceeded(err)){ console.error(`Could not save ${key}:`, err); return false; }
+      if(!isCritical){
+        // this write is itself one of the re-fetchable bulk caches — nothing
+        // useful to prune to save itself; just skip, it reloads as needed
+        console.error(`Could not save ${key} — storage full; skipping (reloads automatically as needed).`);
+        return false;
+      }
+      console.error(`Could not save ${key} — storage full. Clearing cached auto-detected map data to make room and retrying.`);
+      pruneBulkCachesForSpace();
+      try{
+        localStorage.setItem(key, valueStr);
+        showWarn('⚠ Storage was full — cleared cached auto-detected lines/locations (they reload automatically as you revisit areas) to make room for your change.', 6000);
+        return true;
+      }catch(err2){
+        showWarn('⚠ Could not save your change — storage is full even after clearing cached map data. Try "Clear all data" in settings, or free up space on your device (export a backup first if you want to keep your marked lines/pins).', null);
+        return false;
+      }
+    }
+  }
+  function savePins(p){ return safeLocalStorageSet(LS_PINS, JSON.stringify(p), true); }
+  function saveSegs(s){ return safeLocalStorageSet(LS_SEGS, JSON.stringify(s), true); }
+  function saveLineCache(c){ return safeLocalStorageSet(LS_LINE_CACHE, JSON.stringify(c), false); }
+  function savePoiCache(c){ return safeLocalStorageSet(LS_POI_CACHE, JSON.stringify(c), false); }
+  function saveLoadedCells(s){ return safeLocalStorageSet(LS_LOADED_CELLS, JSON.stringify([...s]), false); }
 
   const LS_TILE_CACHE_CFG = "rg_tile_cache_cfg";
   const DEFAULT_TILE_CACHE_URL = "https://sweet-bar-0621.runbotrobot.workers.dev";
@@ -1453,9 +1492,10 @@
       if(cur === targetState) return;
       if(targetState === 'neutral'){ delete segments[bestKey]; }
       else { segments[bestKey] = { state: targetState, latlngs: lineCache[bestKey] }; }
-      saveSegs(segments);
-      lineCache[bestKey] = lineCache[bestKey]; // already present; kept for clarity
+      // draw first so the stroke always visibly takes effect immediately,
+      // regardless of whether persisting it below runs into trouble
       drawSegment(bestKey, lineCache[bestKey], targetState);
+      saveSegs(segments);
     }catch(err){
       console.error('Paint mode hit an error (non-fatal):', err);
     }
@@ -1555,10 +1595,12 @@
     } else {
       segments[key] = { state: next, latlngs: latlngs };
     }
-    saveSegs(segments);
+    // draw first so the tap always visibly takes effect immediately,
+    // regardless of whether persisting it below runs into trouble
+    drawSegment(key, latlngs, next);
     lineCache[key] = latlngs;
     saveLineCache(lineCache);
-    drawSegment(key, latlngs, next);
+    saveSegs(segments);
   }
 
   function renderStoredSegments(){
