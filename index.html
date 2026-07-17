@@ -215,7 +215,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.34</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.35</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -1642,6 +1642,45 @@
     return avoidCount;
   }
 
+  // ---------- keep routes clear of nearby locations ----------
+  // Note: the free OSRM routing service this app uses has no concept of an
+  // exclusion zone — it can't be told to detour around a point. This can
+  // only pick the least-bad of whatever alternatives it happens to offer
+  // and warn honestly if none of them clear the distance, same as the
+  // avoid-line scoring above already does.
+  const MIN_LOCATION_DISTANCE_FT = 1000;
+  function haversineMeters(lat1, lng1, lat2, lng2){
+    const R = 6371000;
+    const toRad = d => d * Math.PI / 180;
+    const dLat = toRad(lat2-lat1), dLng = toRad(lng2-lng1);
+    const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLng/2)**2;
+    return 2 * R * Math.asin(Math.sqrt(a));
+  }
+  // every currently-known point location — auto-detected POIs, your own
+  // pins, and official directory records (only those whose area has
+  // actually been checked, same gating as the map display)
+  function allKnownLocationsForProximityCheck(){
+    const locs = [];
+    Object.entries(poiCache).forEach(([id,p])=>locs.push({id:'poi:'+id, lat:p.lat, lng:p.lng}));
+    pins.forEach((p,i)=>locs.push({id:'pin:'+i, lat:p.lat, lng:p.lng}));
+    officialRecordsCache.forEach(r=>{
+      if(loadedCells.has(cellKeyForLatLng(r.lat, r.lng))) locs.push({id:'official:'+r.id, lat:r.lat, lng:r.lng});
+    });
+    return locs;
+  }
+  function routeProximityViolationCount(pairs, locations, thresholdMeters){
+    const violatedIds = new Set();
+    pairs.forEach(pair=>{
+      pair.forEach(pt=>{
+        for(const loc of locations){
+          if(violatedIds.has(loc.id)) continue;
+          if(haversineMeters(pt[0], pt[1], loc.lat, loc.lng) < thresholdMeters) violatedIds.add(loc.id);
+        }
+      });
+    });
+    return violatedIds.size;
+  }
+
   // fetch (tile cache first, direct Overpass as fallback) and apply exactly
   // one grid cell's worth of data — reuses applyOverpassResults with a
   // precise cell-sized bounds, so the same reconciliation and load-tracking
@@ -1708,13 +1747,24 @@
   }
 
   async function planRoute(a,b){
-    showHint('Finding a route that avoids marked lines…');
+    showHint('Finding a route that avoids marked lines and nearby locations…');
     try{
       const routes = await fetchRoute(a,b);
+      const proximityThresholdMeters = MIN_LOCATION_DISTANCE_FT * 0.3048;
+      // best-effort only — this uses whatever locations are already known
+      // going in, which can be incomplete for an alternative that passes
+      // through ground never visited before; the real, complete check runs
+      // below once the chosen route's own areas have all been loaded
+      const knownLocationsSoFar = allKnownLocationsForProximityCheck();
       let best = null, bestScore = Infinity;
       routes.forEach(r=>{
         const pairs = coordsToLatLngPairs(r.geometry.coordinates);
-        const score = scoreRoute(pairs);
+        const avoidCount = scoreRoute(pairs);
+        const proximityCount = routeProximityViolationCount(pairs, knownLocationsSoFar, proximityThresholdMeters);
+        // marked avoid lines are an explicit safety call, so they always
+        // outweigh generic location proximity when picking an alternative —
+        // proximity only breaks ties between equally-good avoid counts
+        const score = avoidCount * 1000000 + proximityCount;
         if(score < bestScore){ bestScore = score; best = pairs; }
       });
 
@@ -1740,8 +1790,17 @@
       // addresses across town from each other), so always frame the whole
       // route rather than leaving the map wherever it happened to be
       map.fitBounds(L.latLngBounds(best.flat()), { padding: [40, 40] });
-      if(bestScore > 0){
-        showWarn(`⚠ Could not fully avoid marked lines — this route still crosses ${bestScore} avoided line${bestScore>1?'s':''}. Tap red lines below to inspect, or plan a different start/end.`, null);
+
+      // final, authoritative check — every area along this route has now
+      // been loaded, so this reflects the complete picture rather than the
+      // best-effort snapshot used to pick between alternatives above
+      const finalAvoidCount = scoreRoute(best);
+      const finalProximityCount = routeProximityViolationCount(best, allKnownLocationsForProximityCheck(), proximityThresholdMeters);
+
+      if(finalAvoidCount > 0){
+        showWarn(`⚠ Could not fully avoid marked lines — this route still crosses ${finalAvoidCount} avoided line${finalAvoidCount>1?'s':''}. Tap red lines below to inspect, or plan a different start/end.`, null);
+      } else if(finalProximityCount > 0){
+        showWarn(`⚠ This route passes within ${MIN_LOCATION_DISTANCE_FT} ft of ${finalProximityCount} location${finalProximityCount>1?'s':''}. RouteGuard can't force a detour around them (the free routing service doesn't support that) — tap pins below to inspect, or plan a different start/end.`, null);
       } else if(failedCount > 0){
         showWarn(`⚠ Showing this route, but ${failedCount} area${failedCount>1?'s':''} along it couldn't be checked against location data (connection issue) — consider replanning once you're back online.`, null);
       } else {
