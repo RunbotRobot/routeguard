@@ -220,7 +220,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.41</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.42</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -937,15 +937,26 @@
   }
 
   const TILE_GRID_SIZE = 0.02; // must match the worker's GRID_SIZE constant
+  // Cell centers are computed from an integer row/column index each time
+  // (Math.floor(...) once, then a single multiply) rather than by repeatedly
+  // adding TILE_GRID_SIZE in the loop. Repeated float addition drifts by a
+  // sub-microscopic amount per step, and that's enough for the SAME real
+  // cell to come out as a slightly different float depending on which
+  // bounds happened to reach it (a route's search corridor vs. a plain
+  // viewport, or even the same corridor at a different margin) — which then
+  // silently fails a `loadedCells.has(...)` lookup for a cell that really
+  // was already loaded, and re-fetches it from Overpass for no reason. This
+  // form always yields the bit-identical center for a given real cell,
+  // matching cellCenterForLatLng below.
   function gridCellsForBounds(b){
     const cells = [];
-    const latStart = Math.floor(b.getSouth()/TILE_GRID_SIZE)*TILE_GRID_SIZE;
-    const latEnd = Math.floor(b.getNorth()/TILE_GRID_SIZE)*TILE_GRID_SIZE;
-    const lngStart = Math.floor(b.getWest()/TILE_GRID_SIZE)*TILE_GRID_SIZE;
-    const lngEnd = Math.floor(b.getEast()/TILE_GRID_SIZE)*TILE_GRID_SIZE;
-    for(let la=latStart; la<=latEnd+1e-9; la+=TILE_GRID_SIZE){
-      for(let ln=lngStart; ln<=lngEnd+1e-9; ln+=TILE_GRID_SIZE){
-        cells.push({lat: la+TILE_GRID_SIZE/2, lng: ln+TILE_GRID_SIZE/2});
+    const latStartIdx = Math.floor(b.getSouth()/TILE_GRID_SIZE);
+    const latEndIdx = Math.floor(b.getNorth()/TILE_GRID_SIZE);
+    const lngStartIdx = Math.floor(b.getWest()/TILE_GRID_SIZE);
+    const lngEndIdx = Math.floor(b.getEast()/TILE_GRID_SIZE);
+    for(let i=latStartIdx; i<=latEndIdx; i++){
+      for(let j=lngStartIdx; j<=lngEndIdx; j++){
+        cells.push({lat: i*TILE_GRID_SIZE + TILE_GRID_SIZE/2, lng: j*TILE_GRID_SIZE + TILE_GRID_SIZE/2});
       }
     }
     return cells;
@@ -1646,22 +1657,45 @@
   mapContainerEl.addEventListener('touchcancel', paintPointerEnd);
 
   // rescale every existing line's thickness as you zoom, rather than only
-  // newly-drawn ones — cheap: just updates stroke width, doesn't recreate anything
+  // newly-drawn ones — cheap: just updates stroke width, doesn't recreate
+  // anything. The route itself is always rescaled (it's always visible and
+  // there are at most a few dozen of its segments); the bulk of ordinary
+  // cached lines is skipped entirely while its pane is hidden (see
+  // updateBulkDisplay) — rescaling potentially thousands of invisible lines
+  // on every zoom step was real, measurable work even though nothing was on
+  // screen to show for it, and was a big part of why panning/zooming still
+  // felt sluggish after "Show anyway" even with the pane hidden.
   map.on('zoomend', ()=>{
     const zoom = map.getZoom();
-    Object.keys(segPolylines).forEach(key=>{
+    routeLayerKeys.forEach(key=>{
+      if(!segPolylines[key]) return;
       const state = segments[key] ? segments[key].state : 'neutral';
-      const isRoute = routeLayerKeys.includes(key);
       const { weight, casing } = segWeightsForZoom(state, zoom);
       segPolylines[key].setStyle({ weight });
-      if(segCasingLines[key]) segCasingLines[key].setStyle({ weight: isRoute ? casing + 3 : casing });
+      if(segCasingLines[key]) segCasingLines[key].setStyle({ weight: casing + 3 });
+    });
+    if(map.getZoom() < BULK_DISPLAY_MIN_ZOOM) return;
+    Object.keys(segPolylines).forEach(key=>{
+      if(routeLayerKeys.includes(key)) return; // already handled above
+      const state = segments[key] ? segments[key].state : 'neutral';
+      const { weight, casing } = segWeightsForZoom(state, zoom);
+      segPolylines[key].setStyle({ weight });
+      if(segCasingLines[key]) segCasingLines[key].setStyle({ weight: casing });
     });
   });
 
   // same idea for pin/marker diameter — rebuild each icon at the new size
-  // rather than only sizing newly-drawn ones
+  // rather than only sizing newly-drawn ones. pinLayer (your own saved pins)
+  // is always resized — it's small and always visible. The bulk auto-
+  // detected/official pins are skipped while their pane is hidden, for the
+  // same reason as the bulk lines above.
   map.on('zoomend', ()=>{
-    [pinLayer, autoPinLayer, officialPinLayer].forEach(layer=>{
+    pinLayer.eachLayer(m=>{
+      if(!m.pinMeta) return;
+      m.setIcon(pinIcon(m.pinMeta.color, m.pinMeta.dashed));
+    });
+    if(map.getZoom() < BULK_DISPLAY_MIN_ZOOM) return;
+    [autoPinLayer, officialPinLayer].forEach(layer=>{
       layer.eachLayer(m=>{
         if(!m.pinMeta) return;
         m.setIcon(m.pinMeta.official ? officialPinIcon(m.pinMeta.color) : pinIcon(m.pinMeta.color, m.pinMeta.dashed));
@@ -1836,14 +1870,36 @@
     return results;
   }
 
+  // Beyond the hard exclusion buffer, Dijkstra otherwise has no reason to
+  // prefer a route with more clearance over one that just barely, legally
+  // skims a cluster of locations — it only minimizes distance among
+  // technically-legal edges, so the shortest legal path always wins even
+  // when a slightly longer path would keep much further away from
+  // everything. This soft buffer extends 3x past the hard threshold and
+  // makes edges progressively more "expensive" (not blocked) the closer
+  // they cling to it, so a reasonably short detour that gives real
+  // clearance gets preferred over hugging the boundary.
+  const POI_SOFT_BUFFER_MULTIPLIER = 2.5;
+  const POI_SOFT_PENALTY_STRENGTH = 9; // an edge right at the hard boundary costs up to 10x (1 + strength) its real distance
+  function proximityCostMultiplier(minDist, hardThreshold, softThreshold){
+    if(minDist >= softThreshold) return 1;
+    const closeness = Math.max(0, (softThreshold - minDist) / (softThreshold - hardThreshold));
+    return 1 + closeness * POI_SOFT_PENALTY_STRENGTH;
+  }
+
   // marks every edge that comes within the buffer of a known location or a
-  // marked avoid-line as impassable. Checked at both endpoints and the
-  // midpoint — edges between consecutive OSM nodes are typically short, so
-  // this is a good approximation of "does any part of this edge intrude"
+  // marked avoid-line as impassable, and separately scores how close it
+  // passes (see proximityCostMultiplier above) so the pathfinder can prefer
+  // more clearance among otherwise-legal routes. Checked at both endpoints
+  // and the midpoint — edges between consecutive OSM nodes are typically
+  // short, so this is a good approximation of "does any part of this edge
+  // intrude"
   function markBlockedEdges(graph, locations, avoidPoints, poiThresholdMeters, avoidThresholdMeters){
     const { nodeById, adjacency } = graph;
     const locationIndex = buildLocationIndex(locations);
     const avoidIndex = buildLocationIndex(avoidPoints);
+    const poiSoftThreshold = poiThresholdMeters * POI_SOFT_BUFFER_MULTIPLIER;
+    const avoidSoftThreshold = avoidThresholdMeters * POI_SOFT_BUFFER_MULTIPLIER;
     adjacency.forEach((edges, fromId)=>{
       const a = nodeById.get(fromId);
       if(!a) return;
@@ -1852,20 +1908,25 @@
         if(!b) return;
         const midLat = (a.lat+b.lat)/2, midLng = (a.lng+b.lng)/2;
         const checkPts = [[a.lat,a.lng],[b.lat,b.lng],[midLat,midLng]];
-        let blocked = false;
-        outerLoc: for(const loc of nearbyIndexedPoints(locationIndex, midLat, midLng)){
+        let minPoiDist = Infinity;
+        for(const loc of nearbyIndexedPoints(locationIndex, midLat, midLng)){
           for(const [plat,plng] of checkPts){
-            if(haversineMeters(plat, plng, loc.lat, loc.lng) < poiThresholdMeters){ blocked = true; break outerLoc; }
+            const d = haversineMeters(plat, plng, loc.lat, loc.lng);
+            if(d < minPoiDist) minPoiDist = d;
           }
         }
-        if(!blocked){
-          outerAvoid: for(const av of nearbyIndexedPoints(avoidIndex, midLat, midLng)){
-            for(const [plat,plng] of checkPts){
-              if(haversineMeters(plat, plng, av.lat, av.lng) < avoidThresholdMeters){ blocked = true; break outerAvoid; }
-            }
+        let minAvoidDist = Infinity;
+        for(const av of nearbyIndexedPoints(avoidIndex, midLat, midLng)){
+          for(const [plat,plng] of checkPts){
+            const d = haversineMeters(plat, plng, av.lat, av.lng);
+            if(d < minAvoidDist) minAvoidDist = d;
           }
         }
-        edge.blocked = blocked;
+        edge.blocked = (minPoiDist < poiThresholdMeters) || (minAvoidDist < avoidThresholdMeters);
+        edge.costMultiplier = edge.blocked ? 1 : Math.max(
+          proximityCostMultiplier(minPoiDist, poiThresholdMeters, poiSoftThreshold),
+          proximityCostMultiplier(minAvoidDist, avoidThresholdMeters, avoidSoftThreshold)
+        );
       });
     });
   }
@@ -1931,7 +1992,11 @@
       const edges = adjacency.get(u) || [];
       for(const edge of edges){
         if(edge.blocked || visited.has(edge.to)) continue;
-        const alt = dist.get(u) + edge.dist;
+        // weighted by proximity, not raw distance — an edge that only
+        // barely clears the buffer costs more than its real length, so a
+        // legal-but-close shortcut isn't automatically preferred over a
+        // longer path that gives real clearance (see markBlockedEdges)
+        const alt = dist.get(u) + edge.dist * (edge.costMultiplier || 1);
         if(alt < (dist.has(edge.to) ? dist.get(edge.to) : Infinity)){
           dist.set(edge.to, alt);
           prev.set(edge.to, u);
@@ -2110,6 +2175,11 @@
       attempts.forEach(a=>a.controller.abort());
     }
     applyOverpassResults(data, cellBounds);
+    // belt-and-suspenders: mark this exact cell directly rather than relying
+    // only on applyOverpassResults re-deriving cell membership from
+    // cellBounds — see the note on gridCellsForBounds above for why that
+    // re-derivation could occasionally miss
+    if(!loadedCells.has(key)){ loadedCells.add(key); saveLoadedCells(loadedCells); }
   }
 
   function cellsNeedingLoadForRoute(pairs){
