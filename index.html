@@ -220,7 +220,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.40</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.41</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -850,7 +850,7 @@
 
   function drawAutoPin(poiKey, lat, lng, category, label){
     const color = CATEGORY_COLOR[category] || CATEGORY_COLOR.other;
-    const m = L.marker([lat,lng], {icon: pinIcon(color, true)}).addTo(autoPinLayer);
+    const m = L.marker([lat,lng], {icon: pinIcon(color, true), pane: 'bulkMarkerPane'}).addTo(autoPinLayer);
     m.pinMeta = { color, dashed: true };
     m.bindPopup(`<b>${escapeHtml(label)}</b><br>${capitalize(category)} · from map data<br><button id="confirm-${poiKey}" style="margin-top:6px;font-size:12px;padding:4px 8px;border-radius:5px;border:1px solid #ccc;cursor:pointer;">Save as permanent pin</button>`);
     m.on('popupopen', ()=>{
@@ -949,6 +949,22 @@
       }
     }
     return cells;
+  }
+
+  // grid-aligned bounding box around a set of cells — unlike the raw viewport
+  // bounds passed into loadNearbyData, this always fully contains every cell
+  // in the set, so markCellsLoadedForBounds can actually mark them loaded
+  // (a viewport rectangle almost never lines up with the grid, so cells
+  // touching its edge would otherwise never pass the "fully within" check —
+  // meaning they'd never get marked loaded and would be re-fetched forever)
+  function cellsUnionBounds(cells){
+    const half = TILE_GRID_SIZE / 2;
+    let south = Infinity, north = -Infinity, west = Infinity, east = -Infinity;
+    cells.forEach(c=>{
+      south = Math.min(south, c.lat - half); north = Math.max(north, c.lat + half);
+      west = Math.min(west, c.lng - half); east = Math.max(east, c.lng + half);
+    });
+    return L.latLngBounds([south, west], [north, east]);
   }
 
   // ---------- per-area load-completeness tracking ----------
@@ -1076,6 +1092,21 @@
       return;
     }
     zoomTooFarOut = false;
+
+    // If every grid cell currently in view has already been checked against
+    // every data source, there's nothing new to fetch — re-querying Overpass
+    // for the same area on every pan/zoom (including the auto-fit zoom after
+    // generating a route) was pure redundant network time and a big part of
+    // why panning/zooming felt sluggish afterward. This trusts loadedCells
+    // the same way the custom avoidance router's own area-loading already
+    // does — once a cell's been checked, it stays trusted for the session.
+    const b = map.getBounds();
+    const missingCells = gridCellsForBounds(b).filter(c=>!loadedCells.has(cellKeyForCellCenter(c.lat,c.lng)));
+    if(missingCells.length === 0){
+      if(lastSuccessAt) setDataStatus('st-ok', okStatusText());
+      return;
+    }
+
     const now = Date.now();
     if(!force && (now - lastAttemptAt) < MIN_REFETCH_INTERVAL_MS) return;
     if(dataLoadInFlight) return;
@@ -1083,14 +1114,19 @@
     dataLoadInFlight = true;
     startLoadTicker();
 
-    const b = map.getBounds();
     const cfg = loadTileCacheCfg();
+    // Query only the missing cells, using a grid-aligned box around them
+    // rather than the raw viewport — that's what lets every fetched cell
+    // actually get marked loaded (see cellsUnionBounds above), and it also
+    // means an almost-fully-loaded view fetches a small patch instead of
+    // redoing the whole visible area.
+    const fetchBounds = cellsUnionBounds(missingCells);
 
     // path 1: your own tile cache, if configured — try this first
     if(cfg.url){
       try{
-        const data = await loadViaTileCache(cfg.url, b);
-        const {poiCount, roadEdgeCount} = applyOverpassResults(data, b);
+        const data = await loadViaTileCache(cfg.url, fetchBounds);
+        const {poiCount, roadEdgeCount} = applyOverpassResults(data, fetchBounds);
         lastSuccessAt = Date.now();
         lastLoadedBounds = b;
         lastPoiCount = poiCount;
@@ -1118,7 +1154,7 @@
     // path 2: direct Overpass, racing multiple public mirrors — the original
     // approach, always available as a fallback whether or not a tile cache
     // is configured
-    const bbox = `${b.getSouth()},${b.getWest()},${b.getNorth()},${b.getEast()}`;
+    const bbox = `${fetchBounds.getSouth()},${fetchBounds.getWest()},${fetchBounds.getNorth()},${fetchBounds.getEast()}`;
     const query = buildOverpassQuery(bbox);
 
     // try every mirror at once and take whichever answers first, instead of
@@ -1129,7 +1165,7 @@
     try{
       const data = await Promise.any(attempts.map(a => a.promise));
       attempts.forEach(a => a.controller.abort()); // cancel the losers
-      const {poiCount, roadEdgeCount} = applyOverpassResults(data, b);
+      const {poiCount, roadEdgeCount} = applyOverpassResults(data, fetchBounds);
       lastSuccessAt = Date.now();
       lastLoadedBounds = b;
       lastPoiCount = poiCount;
@@ -1138,7 +1174,7 @@
       setDataStatus('st-ok', okStatusText());
       retryCount = 0;
       if(retryTimer){ clearTimeout(retryTimer); retryTimer = null; }
-      if(cfg.url){ populateTileCacheInBackground(cfg.url, b); } // fire-and-forget
+      if(cfg.url){ populateTileCacheInBackground(cfg.url, fetchBounds); } // fire-and-forget
     }catch(aggregateErr){
       stopLoadTicker();
       if(lastSuccessAt){
@@ -1261,7 +1297,7 @@
       // could look "fully populated" when really only one source ever ran
       if(!loadedCells.has(cellKeyForLatLng(r.lat, r.lng))) return;
       const color = r.type === 'SCHOOL-AGE PROGRAM' ? CATEGORY_COLOR.school : CATEGORY_COLOR.childcare;
-      const m = L.marker([r.lat, r.lng], {icon: officialPinIcon(color)}).addTo(officialPinLayer);
+      const m = L.marker([r.lat, r.lng], {icon: officialPinIcon(color), pane: 'bulkMarkerPane'}).addTo(officialPinLayer);
       m.pinMeta = { color, official: true };
       m.bindPopup(`<b>${escapeHtml(r.name||'Unnamed provider')}</b><br>${escapeHtml(r.type||'')} · official WA state licensing data<br>${escapeHtml(r.address||'')}${r.city ? ', '+escapeHtml(r.city) : ''}<br><a href="https://www.findchildcarewa.org/PSS_Search?p=DEL Licensed" target="_blank" rel="noopener">Check current status on Child Care Check</a>`);
       officialPinMarkers[r.id] = m;
@@ -1354,7 +1390,31 @@
   // lines were lagging behind a drag gesture until release. Wider padding
   // also pre-renders more area beyond the visible edge so panning reveals
   // already-drawn lines instead of empty space.
-  const segRenderer = L.canvas({ padding: 0.6 });
+  //
+  // Bulk (non-route) lines and auto-detected pins live in their own panes,
+  // separate from the route's own pane, so the whole mass of them can be
+  // hidden with a single style change at low zoom (see updateBulkDisplay
+  // below) without touching the route, which must stay visible at every
+  // zoom. A zoomed-out route can span hundreds of cached lines and pins —
+  // rendering all of them at once is what made panning/zooming laggy after
+  // the auto-fit-to-route zoom-out.
+  map.createPane('bulkLinesPane');
+  map.getPane('bulkLinesPane').style.zIndex = 400; // same tier as Leaflet's default overlayPane
+  map.createPane('bulkMarkerPane');
+  map.getPane('bulkMarkerPane').style.zIndex = 600; // same tier as Leaflet's default markerPane
+  map.createPane('routeLinesPane');
+  map.getPane('routeLinesPane').style.zIndex = 410; // above bulk lines, so the active route always draws on top
+
+  const BULK_DISPLAY_MIN_ZOOM = MIN_ZOOM_FOR_AUTO; // same "too much to matter" threshold used for auto-loading/paint mode
+  function updateBulkDisplay(){
+    const show = map.getZoom() >= BULK_DISPLAY_MIN_ZOOM;
+    map.getPane('bulkLinesPane').style.display = show ? '' : 'none';
+    map.getPane('bulkMarkerPane').style.display = show ? '' : 'none';
+  }
+  map.on('zoomend', updateBulkDisplay);
+
+  const segRenderer = L.canvas({ padding: 0.6, pane: 'bulkLinesPane' });
+  const routeSegRenderer = L.canvas({ padding: 0.6, pane: 'routeLinesPane' });
 
   const segLayer = L.layerGroup().addTo(map);
   const segHitLayer = L.layerGroup().addTo(map); // invisible wide tap-targets, drawn above segLayer
@@ -1392,6 +1452,10 @@
     if(segPolylines[key]){ segLayer.removeLayer(segPolylines[key]); }
 
     const { weight, casing: casingWeight } = segWeightsForZoom(state, map.getZoom());
+    // route segments draw onto their own always-visible canvas (routeSegRenderer)
+    // so the proposed route stays on screen even when the bulk lines pane gets
+    // hidden at low zoom — see updateBulkDisplay above
+    const renderer = isRoute ? routeSegRenderer : segRenderer;
     // a white outline underneath guarantees the colored line reads clearly
     // even over busy basemap art (transit lines, other roads, etc.) — the
     // current proposed route instead gets a bold dark outline so it stands
@@ -1399,7 +1463,7 @@
     // route segment would otherwise be indistinguishable from any other
     // unmarked line already on the map)
     const casing = L.polyline(latlngs, {
-      renderer: segRenderer,
+      renderer,
       color: isRoute ? ROUTE_CASING_COLOR : '#fff',
       weight: isRoute ? casingWeight + 3 : casingWeight,
       opacity: isRoute ? 1 : 0.9, interactive:false
@@ -1407,7 +1471,7 @@
     segCasingLines[key] = casing;
 
     const pl = L.polyline(latlngs, {
-      renderer: segRenderer, color: segColor(state), weight, opacity: 1,
+      renderer, color: segColor(state), weight, opacity: 1,
       interactive: false // clicks are handled by the wider invisible hit-line below
     }).addTo(segLayer);
     segPolylines[key] = pl;
@@ -2924,6 +2988,7 @@ ${pts}
   renderStoredSegments();   // marked lines (safe/avoid) — always drawn regardless of cache, since this is the safety-critical data
   renderCachedLinesAndPois(); // everything else ever seen — instant, no waiting on a network fetch
   renderUnloadedOverlay();
+  updateBulkDisplay(); // match initial pane visibility to whatever zoom the map opens at
   updateStorageUsageDisplay();
   setInterval(updateStorageUsageDisplay, 8000);
 
