@@ -215,7 +215,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.29</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.30</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -1596,7 +1596,19 @@
     function addressStringFromContact(contact){
       if(!contact.address || !contact.address.length) return '';
       const a = contact.address[0];
-      return [a.addressLine && a.addressLine.join(' '), a.city, a.region, a.postalCode, a.country].filter(Boolean).join(', ');
+      // some browsers/OSes pack the *whole* formatted address (street +
+      // city/state/zip + country) into addressLine as one blob with
+      // embedded newlines — which a single-line text input then displays
+      // with no space at all where the line break was. Others split it
+      // into addressLine (street only) plus separate city/region/
+      // postalCode/country fields. Only append those separate fields if
+      // they're not already present in the line text, or you get
+      // "...NE Seattle, WA 98155 USA, Seattle, WA, 98155, USA"-style
+      // duplication.
+      const linePart = (a.addressLine || []).join(', ').replace(/\s*\n\s*/g, ', ').trim();
+      const extras = [a.city, a.region, a.postalCode, a.country].filter(Boolean);
+      const missingExtras = extras.filter(v => !linePart.includes(v));
+      return [linePart, ...missingExtras].filter(Boolean).join(', ');
     }
     async function pickContactAddressFor(input, setResolved){
       try{
