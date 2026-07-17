@@ -215,7 +215,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.30</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.31</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -298,7 +298,7 @@
           <input type="checkbox" id="autoLoadToggle" checked style="width:auto;">
         </div>
         <div style="font-size:11.5px;color:var(--muted);margin-top:4px;">
-          Schools, playgrounds, parks &amp; listed childcare load automatically as you zoom in (zoom to street level). Add pins manually for anything missing, like unlisted home daycares.
+          Schools, playgrounds, parks, listed childcare, community centres (YMCA, etc.), swimming pools &amp; libraries load automatically as you zoom in (zoom to street level). Add pins manually for anything missing, like unlisted home daycares.
         </div>
         <label class="field-label">Tile cache relay URL (optional)</label>
         <input class="field-input" id="tileCacheUrl" type="text" placeholder="https://your-worker.workers.dev" />
@@ -344,6 +344,9 @@
         <div class="legend-row"><span class="legend-pin" style="background:#c1443c"></span>School</div>
         <div class="legend-row"><span class="legend-pin" style="background:#d98c2b"></span>Playground</div>
         <div class="legend-row"><span class="legend-pin" style="background:#8a4fbf"></span>Childcare / home daycare</div>
+        <div class="legend-row"><span class="legend-pin" style="background:#1f9e9e"></span>Community centre (YMCA, etc.)</div>
+        <div class="legend-row"><span class="legend-pin" style="background:#0e9fd0"></span>Swimming pool</div>
+        <div class="legend-row"><span class="legend-pin" style="background:#8a6d3b"></span>Library</div>
         <div class="legend-row"><span class="legend-pin" style="background:#3b6fd9"></span>Park / other</div>
         <div class="legend-row" style="margin-top:4px;"><span class="legend-pin" style="background:#999;border-style:dashed;"></span>Solid ring = added by you · dashed = auto-detected</div>
         <div class="legend-row"><span class="legend-pin" style="background:#999;border:3px solid #d4a300;"></span>Gold ring = official WA state licensing data</div>
@@ -392,6 +395,9 @@
       <option value="school">School</option>
       <option value="playground">Playground</option>
       <option value="childcare">Childcare / home daycare</option>
+      <option value="community">Community centre (YMCA, etc.)</option>
+      <option value="pool">Swimming pool</option>
+      <option value="library">Library</option>
       <option value="other">Park / other</option>
     </select>
     <label>Label (optional)</label>
@@ -471,8 +477,9 @@
     }
   }
 
-  const CATEGORY_COLOR = { school:"#c1443c", playground:"#d98c2b", childcare:"#8a4fbf", other:"#3b6fd9" };
+  const CATEGORY_COLOR = { school:"#c1443c", playground:"#d98c2b", childcare:"#8a4fbf", community:"#1f9e9e", pool:"#0e9fd0", library:"#8a6d3b", other:"#3b6fd9" };
   const STATE_COLOR = { neutral:"#5b6472", safe:"#2f8f5b", avoid:"#c1443c" };
+  const ROUTE_CASING_COLOR = "#1c2230"; // bold dark outline marking the current proposed route, vs. the plain white casing on regular lines
 
   // ---------- map ----------
   const map = L.map('map', {
@@ -687,6 +694,9 @@
     if(tags.amenity === 'school') return 'school';
     if(tags.amenity === 'kindergarten' || tags.amenity === 'childcare') return 'childcare';
     if(tags.leisure === 'playground') return 'playground';
+    if(tags.amenity === 'community_centre') return 'community'; // covers YMCA and similar youth/community centers
+    if(tags.leisure === 'swimming_pool') return 'pool';
+    if(tags.amenity === 'library') return 'library';
     if(tags.leisure === 'park') return 'other';
     return null;
   }
@@ -818,6 +828,12 @@
         node["amenity"="childcare"](${bbox});
         node["leisure"="playground"](${bbox});
         way["leisure"="playground"](${bbox});
+        node["amenity"="community_centre"](${bbox});
+        way["amenity"="community_centre"](${bbox});
+        node["leisure"="swimming_pool"](${bbox});
+        way["leisure"="swimming_pool"](${bbox});
+        node["amenity"="library"](${bbox});
+        way["amenity"="library"](${bbox});
         node["leisure"="park"](${bbox});
         way["leisure"="park"](${bbox});
       )->.pois;
@@ -1216,15 +1232,22 @@
     return { weight, casing };
   }
 
-  function drawSegment(key, latlngs, state){
+  function drawSegment(key, latlngs, state, isRoute){
     if(segCasingLines[key]){ segLayer.removeLayer(segCasingLines[key]); }
     if(segPolylines[key]){ segLayer.removeLayer(segPolylines[key]); }
 
     const { weight, casing: casingWeight } = segWeightsForZoom(state, map.getZoom());
     // a white outline underneath guarantees the colored line reads clearly
-    // even over busy basemap art (transit lines, other roads, etc.)
+    // even over busy basemap art (transit lines, other roads, etc.) — the
+    // current proposed route instead gets a bold dark outline so it stands
+    // out from ordinary lines sharing the same fill color (e.g. a neutral
+    // route segment would otherwise be indistinguishable from any other
+    // unmarked line already on the map)
     const casing = L.polyline(latlngs, {
-      renderer: segRenderer, color:'#fff', weight: casingWeight, opacity:0.9, interactive:false
+      renderer: segRenderer,
+      color: isRoute ? ROUTE_CASING_COLOR : '#fff',
+      weight: isRoute ? casingWeight + 3 : casingWeight,
+      opacity: isRoute ? 1 : 0.9, interactive:false
     }).addTo(segLayer);
     segCasingLines[key] = casing;
 
@@ -1408,9 +1431,10 @@
     const zoom = map.getZoom();
     Object.keys(segPolylines).forEach(key=>{
       const state = segments[key] ? segments[key].state : 'neutral';
+      const isRoute = routeLayerKeys.includes(key);
       const { weight, casing } = segWeightsForZoom(state, zoom);
       segPolylines[key].setStyle({ weight });
-      if(segCasingLines[key]) segCasingLines[key].setStyle({ weight: casing });
+      if(segCasingLines[key]) segCasingLines[key].setStyle({ weight: isRoute ? casing + 3 : casing });
     });
   });
 
@@ -1480,6 +1504,10 @@
       // clear previous route's neutral (unmarked) segment drawings to avoid clutter,
       // but keep any that are marked safe/avoid (they persist globally anyway)
       renderRoutePairs(best);
+      // the route's start/end can be well outside the current view (e.g. two
+      // addresses across town from each other), so always frame the whole
+      // route rather than leaving the map wherever it happened to be
+      map.fitBounds(L.latLngBounds(best.flat()), { padding: [40, 40] });
       if(bestScore > 0){
         showWarn(`⚠ Could not fully avoid marked lines — this route still crosses ${bestScore} avoided line${bestScore>1?'s':''}. Tap red lines below to inspect, or plan a different start/end.`, null);
       } else {
@@ -1493,13 +1521,26 @@
   }
 
   function renderRoutePairs(pairs){
+    const newKeys = [];
     pairs.forEach(pair=>{
       const key = edgeKey(pair[0], pair[1]);
       const state = segments[key] ? segments[key].state : 'neutral';
       // store neutral segments too (as geometry cache) so future overlapping routes recognize them,
       // but don't persist neutral to localStorage — only draw them
-      drawSegment(key, pair, state);
+      drawSegment(key, pair, state, true);
+      newKeys.push(key);
     });
+    // revert any segments from a previous route that aren't part of this one
+    // back to their normal (non-bold) appearance, so the bold outline always
+    // reflects only the currently-displayed route
+    routeLayerKeys.forEach(key=>{
+      if(newKeys.includes(key)) return;
+      const existing = segPolylines[key];
+      if(!existing) return;
+      const state = segments[key] ? segments[key].state : 'neutral';
+      drawSegment(key, existing.getLatLngs(), state, false);
+    });
+    routeLayerKeys = newKeys;
   }
 
   // ---------- map click handling ----------
