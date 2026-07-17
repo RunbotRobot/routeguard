@@ -215,7 +215,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.36</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.37</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -1698,13 +1698,74 @@
       out body;`;
   }
 
-  async function fetchRoutingGraphData(bounds){
-    const bbox = `${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}`;
+  async function fetchRoutingGraphChunk(cellBounds){
+    const bbox = `${cellBounds.getSouth()},${cellBounds.getWest()},${cellBounds.getNorth()},${cellBounds.getEast()}`;
     const query = buildRoutingGraphQuery(bbox);
     const attempts = OVERPASS_ENDPOINTS.map(endpoint => fetchOverpassMirror(endpoint, query));
     const data = await Promise.any(attempts.map(a=>a.promise));
     attempts.forEach(a=>a.controller.abort());
-    return data;
+    return data.elements || [];
+  }
+
+  // coarser than TILE_GRID_SIZE (~3.5mi vs ~1.5mi per cell) so a long
+  // ultra-distance route's search area splits into tens of chunks rather
+  // than hundreds — a single Overpass query covering a 20-30 mile route's
+  // whole search area risks timing out or returning a huge, slow response
+  const ROUTING_GRID_SIZE = 0.05;
+  function routingGridCellsForBounds(b){
+    const cells = [];
+    const latStart = Math.floor(b.getSouth()/ROUTING_GRID_SIZE)*ROUTING_GRID_SIZE;
+    const latEnd = Math.floor(b.getNorth()/ROUTING_GRID_SIZE)*ROUTING_GRID_SIZE;
+    const lngStart = Math.floor(b.getWest()/ROUTING_GRID_SIZE)*ROUTING_GRID_SIZE;
+    const lngEnd = Math.floor(b.getEast()/ROUTING_GRID_SIZE)*ROUTING_GRID_SIZE;
+    for(let la=latStart; la<=latEnd+1e-9; la+=ROUTING_GRID_SIZE){
+      for(let ln=lngStart; ln<=lngEnd+1e-9; ln+=ROUTING_GRID_SIZE){
+        cells.push(L.latLngBounds([la,ln],[la+ROUTING_GRID_SIZE, ln+ROUTING_GRID_SIZE]));
+      }
+    }
+    return cells;
+  }
+
+  // fetches the routing graph in chunks instead of one giant query, with a
+  // small concurrency limit (fast enough for a long route without
+  // hammering the same free, rate-limit-sensitive Overpass mirrors we've
+  // already run into this session) — shows progress on the same bar used
+  // for area-loading, and is cancelable the same way
+  async function fetchRoutingGraphDataWithProgress(bounds){
+    const cells = routingGridCellsForBounds(bounds);
+    const progressEl = document.getElementById('routeLoadProgress');
+    const textEl = document.getElementById('routeLoadProgressText');
+    const barEl = document.getElementById('routeLoadProgressBar');
+    const cancelBtn = document.getElementById('btnCancelRouteLoad');
+    let cancelled = false;
+    cancelBtn.onclick = ()=>{ cancelled = true; };
+    progressEl.style.display = 'block';
+    const total = cells.length;
+    let done = 0;
+    const allElements = [];
+    textEl.textContent = `Fetching road network… (0/${total})`;
+    barEl.style.width = '0%';
+
+    async function worker(){
+      while(true){
+        if(cancelled) return;
+        const cell = cells.shift();
+        if(!cell) return;
+        try{
+          const elements = await fetchRoutingGraphChunk(cell);
+          allElements.push(...elements);
+        }catch(err){
+          console.error('Could not fetch a chunk of the routing graph:', err);
+        }
+        done++;
+        textEl.textContent = `Fetching road network… (${done}/${total})`;
+        barEl.style.width = `${Math.round(done/total*100)}%`;
+      }
+    }
+    const workerCount = Math.min(3, cells.length) || 1;
+    await Promise.all(Array.from({length: workerCount}, worker));
+    progressEl.style.display = 'none';
+    return { elements: allElements, cancelled };
   }
 
   // nodeById: id -> {lat,lng}. adjacency: id -> [{to, dist, blocked}] —
@@ -1733,27 +1794,62 @@
     return { nodeById, adjacency };
   }
 
+  // buckets points by the same TILE_GRID_SIZE grid used elsewhere, so
+  // markBlockedEdges only has to compare each edge against locations in its
+  // own neighborhood instead of every known location — the difference
+  // between fast and unusable once there are hundreds of locations spread
+  // across a 20-30 mile route's search area (checking every edge against
+  // every location is O(edges x locations), which stops being fast long
+  // before either number gets that large)
+  function buildLocationIndex(points){
+    const index = new Map();
+    points.forEach(p=>{
+      const c = cellCenterForLatLng(p.lat, p.lng);
+      const key = cellKeyForCellCenter(c.lat, c.lng);
+      if(!index.has(key)) index.set(key, []);
+      index.get(key).push(p);
+    });
+    return index;
+  }
+  // grid cells are far larger than the 1000ft buffer or a typical edge
+  // length, so the point's own cell plus its 8 neighbors always covers
+  // every location that could plausibly be within range
+  function nearbyIndexedPoints(index, lat, lng){
+    const c = cellCenterForLatLng(lat, lng);
+    const results = [];
+    for(let dLat=-1; dLat<=1; dLat++){
+      for(let dLng=-1; dLng<=1; dLng++){
+        const bucket = index.get(cellKeyForCellCenter(c.lat + dLat*TILE_GRID_SIZE, c.lng + dLng*TILE_GRID_SIZE));
+        if(bucket) results.push(...bucket);
+      }
+    }
+    return results;
+  }
+
   // marks every edge that comes within the buffer of a known location or a
   // marked avoid-line as impassable. Checked at both endpoints and the
   // midpoint — edges between consecutive OSM nodes are typically short, so
   // this is a good approximation of "does any part of this edge intrude"
   function markBlockedEdges(graph, locations, avoidPoints, poiThresholdMeters, avoidThresholdMeters){
     const { nodeById, adjacency } = graph;
+    const locationIndex = buildLocationIndex(locations);
+    const avoidIndex = buildLocationIndex(avoidPoints);
     adjacency.forEach((edges, fromId)=>{
       const a = nodeById.get(fromId);
       if(!a) return;
       edges.forEach(edge=>{
         const b = nodeById.get(edge.to);
         if(!b) return;
-        const checkPts = [[a.lat,a.lng],[b.lat,b.lng],[(a.lat+b.lat)/2,(a.lng+b.lng)/2]];
+        const midLat = (a.lat+b.lat)/2, midLng = (a.lng+b.lng)/2;
+        const checkPts = [[a.lat,a.lng],[b.lat,b.lng],[midLat,midLng]];
         let blocked = false;
-        outerLoc: for(const loc of locations){
+        outerLoc: for(const loc of nearbyIndexedPoints(locationIndex, midLat, midLng)){
           for(const [plat,plng] of checkPts){
             if(haversineMeters(plat, plng, loc.lat, loc.lng) < poiThresholdMeters){ blocked = true; break outerLoc; }
           }
         }
         if(!blocked){
-          outerAvoid: for(const av of avoidPoints){
+          outerAvoid: for(const av of nearbyIndexedPoints(avoidIndex, midLat, midLng)){
             for(const [plat,plng] of checkPts){
               if(haversineMeters(plat, plng, av.lat, av.lng) < avoidThresholdMeters){ blocked = true; break outerAvoid; }
             }
@@ -1858,7 +1954,11 @@
   // around obstacles near either point
   function expandedBoundsForRoute(a, b){
     const straightLineMeters = haversineMeters(a.lat, a.lng, b.lat, b.lng);
-    const marginMeters = Math.max(400, straightLineMeters * 0.35);
+    // capped rather than scaling forever with route length — detours to
+    // clear a specific location are a local, not a route-length-proportional
+    // need, and letting the margin grow unbounded on a 20-30 mile route would
+    // needlessly balloon the search area on both sides
+    const marginMeters = Math.max(400, Math.min(straightLineMeters * 0.35, 4800));
     const midLat = (a.lat+b.lat)/2;
     const latMargin = marginMeters / 111320;
     const lngMargin = marginMeters / (111320 * Math.cos(midLat * Math.PI/180));
@@ -1869,10 +1969,12 @@
     return L.latLngBounds([south,west],[north,east]);
   }
 
-  // past this straight-line distance, the routing graph would likely be too
-  // large to fetch/process smoothly on a phone — fall back to best-effort
-  // OSRM routing instead of attempting it
-  const MAX_AVOIDANCE_ROUTE_METERS = 4800; // ~3 miles
+  // past this straight-line distance, fall back to best-effort OSRM routing
+  // instead of attempting the custom router — generous enough for
+  // ultra-distance training routes (chunked fetching + a spatially-indexed
+  // blocking check are what make this workable at this scale at all), while
+  // still bounding how large a single route-planning request can get
+  const MAX_AVOIDANCE_ROUTE_METERS = 80000; // ~50 miles
 
   // { pairs: [...] } on success, { pairs: null } if the graph was built but
   // no unblocked path exists, { cancelled: true } if the user cancelled the
@@ -1895,8 +1997,9 @@
       if(result.cancelled) return { cancelled: true };
     }
 
-    const graphData = await fetchRoutingGraphData(bounds);
-    const graph = buildRoutingGraph(graphData.elements || []);
+    const graphResult = await fetchRoutingGraphDataWithProgress(bounds);
+    if(graphResult.cancelled) return { cancelled: true };
+    const graph = buildRoutingGraph(graphResult.elements);
     if(graph.nodeById.size === 0) throw new Error('no road data returned for this area');
 
     const locations = allKnownLocationsForProximityCheck();
@@ -1966,16 +2069,27 @@
     cancelBtn.onclick = ()=>{ cancelled = true; };
     progressEl.style.display = 'block';
     const total = cells.length;
+    const queue = cells.slice();
     let done = 0, failedCount = 0;
     textEl.textContent = `Checking areas along route… (0/${total})`;
     barEl.style.width = '0%';
-    for(const c of cells){
-      if(cancelled) break;
-      try{ await ensureCellLoaded(c); }catch(err){ console.error('Could not load route area', c, err); failedCount++; }
-      done++;
-      textEl.textContent = `Checking areas along route… (${done}/${total})`;
-      barEl.style.width = `${Math.round(done/total*100)}%`;
+    // small concurrency limit — most cells resolve fast from the tile
+    // cache, but a long ultra-distance route can still mean dozens of
+    // never-visited cells, and doing those fully sequentially would take
+    // far too long
+    async function worker(){
+      while(true){
+        if(cancelled) return;
+        const c = queue.shift();
+        if(!c) return;
+        try{ await ensureCellLoaded(c); }catch(err){ console.error('Could not load route area', c, err); failedCount++; }
+        done++;
+        textEl.textContent = `Checking areas along route… (${done}/${total})`;
+        barEl.style.width = `${Math.round(done/total*100)}%`;
+      }
     }
+    const workerCount = Math.min(3, queue.length) || 1;
+    await Promise.all(Array.from({length: workerCount}, worker));
     progressEl.style.display = 'none';
     return { cancelled, failedCount };
   }
