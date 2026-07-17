@@ -215,7 +215,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.35</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.36</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -232,7 +232,7 @@
       </div>
       <button id="btnCancelRouteLoad" style="margin-top:8px;background:#c1443c;color:#fff;border:none;padding:5px 12px;border-radius:14px;font-size:12px;cursor:pointer;">Cancel</button>
     </div>
-    <div id="warnbar"><span id="warnbarText"></span><button id="warnbarClose" aria-label="Dismiss">&times;</button></div>
+    <div id="warnbar"><span id="warnbarText"></span><button id="btnShowRouteAnyway" style="display:none;background:none;border:1px solid currentColor;color:inherit;border-radius:10px;font-size:11px;padding:2px 8px;cursor:pointer;flex:none;white-space:nowrap;">Show anyway</button><button id="warnbarClose" aria-label="Dismiss">&times;</button></div>
     <div id="liveStatus">
       <span class="liveDot"></span><span id="liveStatusText">Tracking…</span>
       <button id="btnCompass" class="livebtn">Enable compass</button>
@@ -1681,6 +1681,240 @@
     return violatedIds.size;
   }
 
+  // ---------- custom avoidance router ----------
+  // The free OSRM demo has no concept of an exclusion zone, so getting an
+  // actual guarantee (rather than best-effort picking among OSRM's own
+  // alternatives) means building our own routable graph from OSM data and
+  // running our own pathfinding, treating any edge within the buffer of a
+  // known location or marked avoid-line as impassable. This is entirely
+  // separate from the line-marking/display pipeline (lineCache, segments,
+  // drawSegment) — it fetches its own node+way graph and never touches that
+  // safety-critical, already-working system.
+
+  function buildRoutingGraphQuery(bbox){
+    return `[out:json][timeout:25];
+      way["highway"~"^(${ROAD_HIGHWAY_TYPES})$"]["foot"!="no"]["access"!="private"](${bbox});
+      (._;>;);
+      out body;`;
+  }
+
+  async function fetchRoutingGraphData(bounds){
+    const bbox = `${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}`;
+    const query = buildRoutingGraphQuery(bbox);
+    const attempts = OVERPASS_ENDPOINTS.map(endpoint => fetchOverpassMirror(endpoint, query));
+    const data = await Promise.any(attempts.map(a=>a.promise));
+    attempts.forEach(a=>a.controller.abort());
+    return data;
+  }
+
+  // nodeById: id -> {lat,lng}. adjacency: id -> [{to, dist, blocked}] —
+  // built from consecutive node pairs within each way, so shared node ids
+  // across different ways naturally connect the graph at intersections
+  function buildRoutingGraph(elements){
+    const nodeById = new Map();
+    const adjacency = new Map();
+    elements.forEach(el=>{
+      if(el.type === 'node') nodeById.set(el.id, { lat: el.lat, lng: el.lon });
+    });
+    elements.forEach(el=>{
+      if(el.type !== 'way' || !el.nodes) return;
+      for(let i=0;i<el.nodes.length-1;i++){
+        const aId = el.nodes[i], bId = el.nodes[i+1];
+        const a = nodeById.get(aId), b = nodeById.get(bId);
+        if(!a || !b) continue;
+        const dist = haversineMeters(a.lat, a.lng, b.lat, b.lng);
+        if(dist === 0) continue;
+        if(!adjacency.has(aId)) adjacency.set(aId, []);
+        if(!adjacency.has(bId)) adjacency.set(bId, []);
+        adjacency.get(aId).push({ to: bId, dist, blocked: false });
+        adjacency.get(bId).push({ to: aId, dist, blocked: false });
+      }
+    });
+    return { nodeById, adjacency };
+  }
+
+  // marks every edge that comes within the buffer of a known location or a
+  // marked avoid-line as impassable. Checked at both endpoints and the
+  // midpoint — edges between consecutive OSM nodes are typically short, so
+  // this is a good approximation of "does any part of this edge intrude"
+  function markBlockedEdges(graph, locations, avoidPoints, poiThresholdMeters, avoidThresholdMeters){
+    const { nodeById, adjacency } = graph;
+    adjacency.forEach((edges, fromId)=>{
+      const a = nodeById.get(fromId);
+      if(!a) return;
+      edges.forEach(edge=>{
+        const b = nodeById.get(edge.to);
+        if(!b) return;
+        const checkPts = [[a.lat,a.lng],[b.lat,b.lng],[(a.lat+b.lat)/2,(a.lng+b.lng)/2]];
+        let blocked = false;
+        outerLoc: for(const loc of locations){
+          for(const [plat,plng] of checkPts){
+            if(haversineMeters(plat, plng, loc.lat, loc.lng) < poiThresholdMeters){ blocked = true; break outerLoc; }
+          }
+        }
+        if(!blocked){
+          outerAvoid: for(const av of avoidPoints){
+            for(const [plat,plng] of checkPts){
+              if(haversineMeters(plat, plng, av.lat, av.lng) < avoidThresholdMeters){ blocked = true; break outerAvoid; }
+            }
+          }
+        }
+        edge.blocked = blocked;
+      });
+    });
+  }
+
+  function nearestGraphNode(nodeById, lat, lng){
+    let best = null, bestDist = Infinity;
+    nodeById.forEach((n, id)=>{
+      const d = haversineMeters(lat, lng, n.lat, n.lng);
+      if(d < bestDist){ bestDist = d; best = id; }
+    });
+    return best;
+  }
+
+  // compact binary min-heap for Dijkstra's priority queue — a plain array
+  // with repeated linear scans would be O(n^2) and too slow for a graph
+  // with thousands of nodes
+  function MinHeap(){ this.items = []; }
+  MinHeap.prototype.push = function(item, priority){
+    this.items.push({item, priority});
+    let i = this.items.length - 1;
+    while(i > 0){
+      const parent = (i-1) >> 1;
+      if(this.items[parent].priority <= this.items[i].priority) break;
+      [this.items[parent], this.items[i]] = [this.items[i], this.items[parent]];
+      i = parent;
+    }
+  };
+  MinHeap.prototype.pop = function(){
+    if(this.items.length === 0) return null;
+    const top = this.items[0];
+    const last = this.items.pop();
+    if(this.items.length > 0){
+      this.items[0] = last;
+      let i = 0;
+      while(true){
+        const l = 2*i+1, r = 2*i+2;
+        let smallest = i;
+        if(l < this.items.length && this.items[l].priority < this.items[smallest].priority) smallest = l;
+        if(r < this.items.length && this.items[r].priority < this.items[smallest].priority) smallest = r;
+        if(smallest === i) break;
+        [this.items[smallest], this.items[i]] = [this.items[i], this.items[smallest]];
+        i = smallest;
+      }
+    }
+    return top.item;
+  };
+  Object.defineProperty(MinHeap.prototype, 'size', { get(){ return this.items.length; } });
+
+  // Dijkstra over the graph, treating blocked edges as impassable. Returns
+  // the path as an array of node ids, or null if start/end aren't connected
+  // by any unblocked path.
+  function dijkstraPath(adjacency, startId, endId){
+    const dist = new Map([[startId, 0]]);
+    const prev = new Map();
+    const visited = new Set();
+    const heap = new MinHeap();
+    heap.push(startId, 0);
+    while(heap.size > 0){
+      const u = heap.pop();
+      if(visited.has(u)) continue;
+      visited.add(u);
+      if(u === endId) break;
+      const edges = adjacency.get(u) || [];
+      for(const edge of edges){
+        if(edge.blocked || visited.has(edge.to)) continue;
+        const alt = dist.get(u) + edge.dist;
+        if(alt < (dist.has(edge.to) ? dist.get(edge.to) : Infinity)){
+          dist.set(edge.to, alt);
+          prev.set(edge.to, u);
+          heap.push(edge.to, alt);
+        }
+      }
+    }
+    if(!dist.has(endId)) return null;
+    const path = [endId];
+    let cur = endId;
+    while(prev.has(cur)){
+      cur = prev.get(cur);
+      path.unshift(cur);
+    }
+    return path;
+  }
+
+  function nodePathToPairs(path, nodeById){
+    const pairs = [];
+    for(let i=0;i<path.length-1;i++){
+      const a = nodeById.get(path[i]), b = nodeById.get(path[i+1]);
+      if(!a || !b) continue;
+      pairs.push([[a.lat,a.lng],[b.lat,b.lng]]);
+    }
+    return pairs;
+  }
+
+  // bounding area to search for a path in — the straight line between start
+  // and end, expanded with enough margin to actually have room to route
+  // around obstacles near either point
+  function expandedBoundsForRoute(a, b){
+    const straightLineMeters = haversineMeters(a.lat, a.lng, b.lat, b.lng);
+    const marginMeters = Math.max(400, straightLineMeters * 0.35);
+    const midLat = (a.lat+b.lat)/2;
+    const latMargin = marginMeters / 111320;
+    const lngMargin = marginMeters / (111320 * Math.cos(midLat * Math.PI/180));
+    const south = Math.min(a.lat,b.lat) - latMargin;
+    const north = Math.max(a.lat,b.lat) + latMargin;
+    const west = Math.min(a.lng,b.lng) - lngMargin;
+    const east = Math.max(a.lng,b.lng) + lngMargin;
+    return L.latLngBounds([south,west],[north,east]);
+  }
+
+  // past this straight-line distance, the routing graph would likely be too
+  // large to fetch/process smoothly on a phone — fall back to best-effort
+  // OSRM routing instead of attempting it
+  const MAX_AVOIDANCE_ROUTE_METERS = 4800; // ~3 miles
+
+  // { pairs: [...] } on success, { pairs: null } if the graph was built but
+  // no unblocked path exists, { cancelled: true } if the user cancelled the
+  // area-loading step, or throws on an operational failure (network/data
+  // issue, or the route is too long to attempt this way)
+  async function findAvoidancePath(a, b){
+    const straightLineMeters = haversineMeters(a.lat, a.lng, b.lat, b.lng);
+    if(straightLineMeters > MAX_AVOIDANCE_ROUTE_METERS){
+      throw new Error('route too long for exact-avoidance routing');
+    }
+    const bounds = expandedBoundsForRoute(a, b);
+
+    // make sure every cell in the whole search area (not just the eventual
+    // path) has been checked against every data source — otherwise the
+    // router could treat an unvisited area as clear simply because we don't
+    // have data for it yet
+    const missingCells = gridCellsForBounds(bounds).filter(c=>!loadedCells.has(cellKeyForCellCenter(c.lat,c.lng)));
+    if(missingCells.length){
+      const result = await loadCellsWithProgress(missingCells);
+      if(result.cancelled) return { cancelled: true };
+    }
+
+    const graphData = await fetchRoutingGraphData(bounds);
+    const graph = buildRoutingGraph(graphData.elements || []);
+    if(graph.nodeById.size === 0) throw new Error('no road data returned for this area');
+
+    const locations = allKnownLocationsForProximityCheck();
+    const avoidPoints = Object.values(segments)
+      .filter(s=>s.state === 'avoid')
+      .map(s=>({ lat: (s.latlngs[0][0]+s.latlngs[1][0])/2, lng: (s.latlngs[0][1]+s.latlngs[1][1])/2 }));
+    const poiThresholdMeters = MIN_LOCATION_DISTANCE_FT * 0.3048;
+    markBlockedEdges(graph, locations, avoidPoints, poiThresholdMeters, 12); // 12m tolerance for matching a marked line's real-world position
+
+    const startNode = nearestGraphNode(graph.nodeById, a.lat, a.lng);
+    const endNode = nearestGraphNode(graph.nodeById, b.lat, b.lng);
+    if(startNode == null || endNode == null) throw new Error('could not connect start/end to the road network');
+
+    const path = dijkstraPath(graph.adjacency, startNode, endNode);
+    if(!path) return { pairs: null };
+    return { pairs: nodePathToPairs(path, graph.nodeById) };
+  }
+
   // fetch (tile cache first, direct Overpass as fallback) and apply exactly
   // one grid cell's worth of data — reuses applyOverpassResults with a
   // precise cell-sized bounds, so the same reconciliation and load-tracking
@@ -1746,7 +1980,12 @@
     return { cancelled, failedCount };
   }
 
-  async function planRoute(a,b){
+  // fallback for when the custom avoidance router can't be used (route too
+  // long, graph fetch failed, etc.), or when the user explicitly asks to
+  // see the closest route anyway after avoidance found nothing possible.
+  // Best-effort only: picks the least-bad of whatever alternatives the free
+  // OSRM demo happens to offer, since it has no concept of an exclusion zone.
+  async function planRouteBestEffort(a, b, note){
     showHint('Finding a route that avoids marked lines and nearby locations…');
     try{
       const routes = await fetchRoute(a,b);
@@ -1797,12 +2036,15 @@
       const finalAvoidCount = scoreRoute(best);
       const finalProximityCount = routeProximityViolationCount(best, allKnownLocationsForProximityCheck(), proximityThresholdMeters);
 
+      const prefix = note ? note + ' ' : '';
       if(finalAvoidCount > 0){
-        showWarn(`⚠ Could not fully avoid marked lines — this route still crosses ${finalAvoidCount} avoided line${finalAvoidCount>1?'s':''}. Tap red lines below to inspect, or plan a different start/end.`, null);
+        showWarn(`⚠ ${prefix}Could not fully avoid marked lines — this route still crosses ${finalAvoidCount} avoided line${finalAvoidCount>1?'s':''}. Tap red lines below to inspect, or plan a different start/end.`, null);
       } else if(finalProximityCount > 0){
-        showWarn(`⚠ This route passes within ${MIN_LOCATION_DISTANCE_FT} ft of ${finalProximityCount} location${finalProximityCount>1?'s':''}. RouteGuard can't force a detour around them (the free routing service doesn't support that) — tap pins below to inspect, or plan a different start/end.`, null);
+        showWarn(`⚠ ${prefix}This route passes within ${MIN_LOCATION_DISTANCE_FT} ft of ${finalProximityCount} location${finalProximityCount>1?'s':''}. RouteGuard can't force a detour around them (the free routing service doesn't support that) — tap pins below to inspect, or plan a different start/end.`, null);
       } else if(failedCount > 0){
-        showWarn(`⚠ Showing this route, but ${failedCount} area${failedCount>1?'s':''} along it couldn't be checked against location data (connection issue) — consider replanning once you're back online.`, null);
+        showWarn(`⚠ ${prefix}Showing this route, but ${failedCount} area${failedCount>1?'s':''} along it couldn't be checked against location data (connection issue) — consider replanning once you're back online.`, null);
+      } else if(note){
+        showWarn(`⚠ ${note}`, null);
       } else {
         showWarn('', null);
       }
@@ -1810,6 +2052,41 @@
     }catch(err){
       showHint('');
       showWarn('Could not fetch a route. Check your internet connection and try again.', 4000);
+    }
+  }
+
+  // primary entry point: try to build a route that's genuinely guaranteed
+  // to stay clear of marked avoid-lines and every known location's buffer.
+  // Falls back to best-effort OSRM routing if the custom router can't be
+  // attempted (route too long, graph fetch failed) — but if it runs
+  // successfully and finds that no such route exists, that's reported
+  // honestly rather than silently substituting a route that violates the
+  // buffer; you can still explicitly ask to see the closest route anyway.
+  async function planRoute(a,b){
+    const btnShowAnyway = document.getElementById('btnShowRouteAnyway');
+    btnShowAnyway.style.display = 'none';
+    showHint('Building a route that stays clear of marked lines and locations…');
+    try{
+      const result = await findAvoidancePath(a, b);
+      if(result.cancelled){
+        showHint('');
+        showWarn('Route planning cancelled — some areas along this route hadn\'t been checked yet.', 4000);
+        return;
+      }
+      if(!result.pairs){
+        showHint('');
+        showWarn(`⚠ No route between these points stays clear of every marked line and location within ${MIN_LOCATION_DISTANCE_FT} ft. Try a different start/end, or view the closest route anyway.`, null);
+        btnShowAnyway.style.display = 'inline-block';
+        btnShowAnyway.onclick = ()=>{ btnShowAnyway.style.display = 'none'; planRouteBestEffort(a, b); };
+        return;
+      }
+      renderRoutePairs(result.pairs);
+      map.fitBounds(L.latLngBounds(result.pairs.flat()), { padding: [40, 40] });
+      showWarn('', null);
+      showHint('');
+    }catch(err){
+      console.error('Custom avoidance routing failed, falling back to best-effort routing:', err);
+      await planRouteBestEffort(a, b, `Couldn't build an exact-avoidance route this time (${err.message||'error'}) — showing the routing service's best option instead.`);
     }
   }
 
