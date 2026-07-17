@@ -215,7 +215,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.32</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.33</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -225,6 +225,13 @@
     <div id="dataStatus" class="st-loading"><span class="sw"></span><span id="dataStatusText">Not loaded yet</span></div>
     <div id="hint"></div>
     <button id="btnCancelRoute" style="display:none;position:absolute;left:50%;top:52px;transform:translateX(-50%);z-index:1000;background:#c1443c;color:#fff;border:none;padding:6px 14px;border-radius:16px;font-size:12.5px;box-shadow:0 3px 10px rgba(0,0,0,.2);cursor:pointer;">Cancel route</button>
+    <div id="routeLoadProgress" style="display:none;position:absolute;left:50%;top:52px;transform:translateX(-50%);z-index:1001;background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 14px;box-shadow:0 3px 10px rgba(0,0,0,.25);min-width:220px;text-align:center;">
+      <div id="routeLoadProgressText" style="font-size:12.5px;margin-bottom:6px;">Checking areas along route…</div>
+      <div style="background:#eee;border-radius:6px;height:6px;overflow:hidden;">
+        <div id="routeLoadProgressBar" style="background:var(--accent);height:100%;width:0%;"></div>
+      </div>
+      <button id="btnCancelRouteLoad" style="margin-top:8px;background:#c1443c;color:#fff;border:none;padding:5px 12px;border-radius:14px;font-size:12px;cursor:pointer;">Cancel</button>
+    </div>
     <div id="warnbar"><span id="warnbarText"></span><button id="warnbarClose" aria-label="Dismiss">&times;</button></div>
     <div id="liveStatus">
       <span class="liveDot"></span><span id="liveStatusText">Tracking…</span>
@@ -431,6 +438,7 @@
   const LS_SEGS = "rg_segments";       // user-marked lines only (safe/avoid) — small, safety-critical
   const LS_LINE_CACHE = "rg_line_cache"; // every line geometry ever discovered, regardless of marking
   const LS_POI_CACHE = "rg_poi_cache";   // every auto-detected location ever discovered
+  const LS_LOADED_CELLS = "rg_loaded_cells"; // grid cells (see TILE_GRID_SIZE) fully checked against every data source
 
   function loadPins(){ try{return JSON.parse(localStorage.getItem(LS_PINS))||[];}catch(e){return [];} }
   function savePins(p){ localStorage.setItem(LS_PINS, JSON.stringify(p)); }
@@ -440,6 +448,8 @@
   function saveLineCache(c){ try{localStorage.setItem(LS_LINE_CACHE, JSON.stringify(c));}catch(e){console.error('Could not save line cache (storage may be full):', e);} }
   function loadPoiCache(){ try{return JSON.parse(localStorage.getItem(LS_POI_CACHE))||{};}catch(e){return {};} }
   function savePoiCache(c){ try{localStorage.setItem(LS_POI_CACHE, JSON.stringify(c));}catch(e){console.error('Could not save location cache (storage may be full):', e);} }
+  function loadLoadedCells(){ try{return new Set(JSON.parse(localStorage.getItem(LS_LOADED_CELLS))||[]);}catch(e){return new Set();} }
+  function saveLoadedCells(s){ try{localStorage.setItem(LS_LOADED_CELLS, JSON.stringify([...s]));}catch(e){console.error('Could not save loaded-area tracking (storage may be full):', e);} }
 
   const LS_TILE_CACHE_CFG = "rg_tile_cache_cfg";
   const DEFAULT_TILE_CACHE_URL = "https://sweet-bar-0621.runbotrobot.workers.dev";
@@ -456,6 +466,7 @@
   let segments = loadSegs(); // key -> {state:'safe'|'avoid', latlngs:[[lat,lng],[lat,lng]]}
   let lineCache = loadLineCache(); // key -> latlngs — every line ever seen, kept until a fresh fetch of that exact area proves it's gone
   let poiCache = loadPoiCache();   // OSM type+id -> {lat,lng,category,label} — every auto-detected location ever seen
+  let loadedCells = loadLoadedCells(); // set of "lat,lng" cell-center keys fully checked against OSM data — persists like the caches above
 
   // storage usage is per-origin (this app's own site data), not shared with
   // other websites or apps on the phone — each site gets its own separate
@@ -529,6 +540,13 @@
   }
 
   L.control.scale({ metric: false, imperial: true, position: 'bottomleft', maxWidth: 120 }).addTo(map);
+
+  // dedicated pane (rather than relying on add-order) so this always sits
+  // above the basemap tiles but below every line/pin, and never intercepts taps
+  map.createPane('unloadedPane');
+  map.getPane('unloadedPane').style.zIndex = 350;
+  map.getPane('unloadedPane').style.pointerEvents = 'none';
+  const unloadedOverlayLayer = L.layerGroup().addTo(map);
 
   const hint = document.getElementById('hint');
   const warnbar = document.getElementById('warnbar');
@@ -767,6 +785,7 @@
           if(autoPinMarkers[key]){ autoPinLayer.removeLayer(autoPinMarkers[key]); delete autoPinMarkers[key]; }
         }
       });
+      markCellsLoadedForBounds(fetchBounds);
     }
 
     saveLineCache(lineCache);
@@ -874,6 +893,61 @@
     }
     return cells;
   }
+
+  // ---------- per-area load-completeness tracking ----------
+  // "loaded" here means OSM data (roads + POIs) has been fetched and applied
+  // for this exact grid cell — used to gate the official state directory
+  // (which loads county-wide, independent of zoom/pan) so its pins don't
+  // show up floating over areas OSM hasn't actually checked yet.
+  function cellKeyForCellCenter(lat, lng){ return `${lat.toFixed(4)},${lng.toFixed(4)}`; }
+  function cellCenterForLatLng(lat, lng){
+    return {
+      lat: Math.floor(lat / TILE_GRID_SIZE) * TILE_GRID_SIZE + TILE_GRID_SIZE/2,
+      lng: Math.floor(lng / TILE_GRID_SIZE) * TILE_GRID_SIZE + TILE_GRID_SIZE/2
+    };
+  }
+  function cellKeyForLatLng(lat, lng){
+    const c = cellCenterForLatLng(lat, lng);
+    return cellKeyForCellCenter(c.lat, c.lng);
+  }
+  function cellFullyWithinBounds(cellLat, cellLng, bounds){
+    const half = TILE_GRID_SIZE / 2;
+    return (cellLat - half) >= bounds.getSouth() && (cellLat + half) <= bounds.getNorth()
+        && (cellLng - half) >= bounds.getWest()  && (cellLng + half) <= bounds.getEast();
+  }
+  // only a cell entirely inside the fetched bounds can be considered
+  // complete — one only partially covered might still be missing data just
+  // outside the query
+  function markCellsLoadedForBounds(bounds){
+    let changed = false;
+    gridCellsForBounds(bounds).forEach(c=>{
+      if(!cellFullyWithinBounds(c.lat, c.lng, bounds)) return;
+      const key = cellKeyForCellCenter(c.lat, c.lng);
+      if(!loadedCells.has(key)){ loadedCells.add(key); changed = true; }
+    });
+    if(changed){
+      saveLoadedCells(loadedCells);
+      renderOfficialRecords(officialRecordsCache);
+      renderUnloadedOverlay();
+    }
+  }
+
+  // dims any visible grid cell that hasn't been fully checked yet, so "blank"
+  // always means "verified clear" and never gets confused with "not looked
+  // at yet" — only meaningful at the same zoom level auto-loading itself
+  // kicks in at, since below that nothing's being checked either way
+  function renderUnloadedOverlay(){
+    unloadedOverlayLayer.clearLayers();
+    if(map.getZoom() < MIN_ZOOM_FOR_AUTO) return;
+    const half = TILE_GRID_SIZE / 2;
+    gridCellsForBounds(map.getBounds()).forEach(c=>{
+      if(loadedCells.has(cellKeyForCellCenter(c.lat, c.lng))) return;
+      L.rectangle([[c.lat-half, c.lng-half],[c.lat+half, c.lng+half]], {
+        pane: 'unloadedPane', stroke: false, fillColor: '#4a5568', fillOpacity: 0.32, interactive: false
+      }).addTo(unloadedOverlayLayer);
+    });
+  }
+  map.on('moveend zoomend', renderUnloadedOverlay);
 
   async function loadViaTileCache(cacheUrl, b){
     const cells = gridCellsForBounds(b);
@@ -1114,11 +1188,21 @@
     });
   }
 
+  // kept around so renderOfficialRecords can be safely re-run (re-filtered)
+  // whenever markCellsLoadedForBounds unlocks more area, without a refetch
+  let officialRecordsCache = [];
+
   function renderOfficialRecords(records){
+    officialRecordsCache = records;
     officialPinLayer.clearLayers();
     Object.keys(officialPinMarkers).forEach(k=>delete officialPinMarkers[k]);
     if(!officialDataToggle.checked) return;
     records.forEach(r=>{
+      // the official directory loads for the whole county at once, but OSM
+      // data only loads for areas you've actually visited — don't show a
+      // county pin floating over ground OSM hasn't checked yet, or an area
+      // could look "fully populated" when really only one source ever ran
+      if(!loadedCells.has(cellKeyForLatLng(r.lat, r.lng))) return;
       const color = r.type === 'SCHOOL-AGE PROGRAM' ? CATEGORY_COLOR.school : CATEGORY_COLOR.childcare;
       const m = L.marker([r.lat, r.lng], {icon: officialPinIcon(color)}).addTo(officialPinLayer);
       m.pinMeta = { color, official: true };
@@ -1516,6 +1600,71 @@
     return avoidCount;
   }
 
+  // fetch (tile cache first, direct Overpass as fallback) and apply exactly
+  // one grid cell's worth of data — reuses applyOverpassResults with a
+  // precise cell-sized bounds, so the same reconciliation and load-tracking
+  // logic used everywhere else applies here too
+  async function ensureCellLoaded(c){
+    const key = cellKeyForCellCenter(c.lat, c.lng);
+    if(loadedCells.has(key)) return;
+    const half = TILE_GRID_SIZE / 2;
+    const cellBounds = L.latLngBounds([c.lat-half, c.lng-half], [c.lat+half, c.lng+half]);
+    const cfg = loadTileCacheCfg();
+    let data = null;
+    if(cfg.url){
+      try{
+        const res = await fetch(`${cfg.url}/tile?lat=${c.lat}&lng=${c.lng}`);
+        if(res.ok) data = await res.json();
+      }catch(_){ /* fall through to a direct fetch below */ }
+    }
+    if(!data){
+      const cellBbox = `${c.lat-half},${c.lng-half},${c.lat+half},${c.lng+half}`;
+      const query = buildOverpassQuery(cellBbox);
+      const attempts = OVERPASS_ENDPOINTS.map(endpoint => fetchOverpassMirror(endpoint, query));
+      data = await Promise.any(attempts.map(a=>a.promise));
+      attempts.forEach(a=>a.controller.abort());
+    }
+    applyOverpassResults(data, cellBounds);
+  }
+
+  function cellsNeedingLoadForRoute(pairs){
+    const seen = new Map();
+    pairs.forEach(pair=>{
+      pair.forEach(pt=>{
+        const c = cellCenterForLatLng(pt[0], pt[1]);
+        const key = cellKeyForCellCenter(c.lat, c.lng);
+        if(!loadedCells.has(key) && !seen.has(key)) seen.set(key, c);
+      });
+    });
+    return [...seen.values()];
+  }
+
+  // sequential (not parallel) on purpose — this can be a lot of cells for a
+  // cross-town route, and the same public Overpass mirrors are already
+  // sensitive to bursts of concurrent requests
+  async function loadCellsWithProgress(cells){
+    const progressEl = document.getElementById('routeLoadProgress');
+    const textEl = document.getElementById('routeLoadProgressText');
+    const barEl = document.getElementById('routeLoadProgressBar');
+    const cancelBtn = document.getElementById('btnCancelRouteLoad');
+    let cancelled = false;
+    cancelBtn.onclick = ()=>{ cancelled = true; };
+    progressEl.style.display = 'block';
+    const total = cells.length;
+    let done = 0, failedCount = 0;
+    textEl.textContent = `Checking areas along route… (0/${total})`;
+    barEl.style.width = '0%';
+    for(const c of cells){
+      if(cancelled) break;
+      try{ await ensureCellLoaded(c); }catch(err){ console.error('Could not load route area', c, err); failedCount++; }
+      done++;
+      textEl.textContent = `Checking areas along route… (${done}/${total})`;
+      barEl.style.width = `${Math.round(done/total*100)}%`;
+    }
+    progressEl.style.display = 'none';
+    return { cancelled, failedCount };
+  }
+
   async function planRoute(a,b){
     showHint('Finding a route that avoids marked lines…');
     try{
@@ -1526,6 +1675,22 @@
         const score = scoreRoute(pairs);
         if(score < bestScore){ bestScore = score; best = pairs; }
       });
+
+      // make sure every area this route passes through has been fully
+      // checked against every data source before showing it — otherwise
+      // you could be routed straight through ground nobody's ever looked at
+      const missingCells = cellsNeedingLoadForRoute(best);
+      let failedCount = 0;
+      if(missingCells.length){
+        showHint('');
+        const result = await loadCellsWithProgress(missingCells);
+        if(result.cancelled){
+          showWarn('Route planning cancelled — some areas along this route hadn\'t been checked yet.', 4000);
+          return;
+        }
+        failedCount = result.failedCount;
+      }
+
       // clear previous route's neutral (unmarked) segment drawings to avoid clutter,
       // but keep any that are marked safe/avoid (they persist globally anyway)
       renderRoutePairs(best);
@@ -1535,6 +1700,8 @@
       map.fitBounds(L.latLngBounds(best.flat()), { padding: [40, 40] });
       if(bestScore > 0){
         showWarn(`⚠ Could not fully avoid marked lines — this route still crosses ${bestScore} avoided line${bestScore>1?'s':''}. Tap red lines below to inspect, or plan a different start/end.`, null);
+      } else if(failedCount > 0){
+        showWarn(`⚠ Showing this route, but ${failedCount} area${failedCount>1?'s':''} along it couldn't be checked against location data (connection issue) — consider replanning once you're back online.`, null);
       } else {
         showWarn('', null);
       }
@@ -2261,6 +2428,7 @@ ${pts}
   renderPins();
   renderStoredSegments();   // marked lines (safe/avoid) — always drawn regardless of cache, since this is the safety-critical data
   renderCachedLinesAndPois(); // everything else ever seen — instant, no waiting on a network fetch
+  renderUnloadedOverlay();
   updateStorageUsageDisplay();
   setInterval(updateStorageUsageDisplay, 8000);
 
