@@ -220,7 +220,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.39</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.40</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -761,6 +761,11 @@
 
   function tagsToCategory(tags){
     if(!tags) return null;
+    // catches a YMCA regardless of how it's actually tagged in OSM — real-
+    // world tagging for these varies (community_centre, fitness_centre,
+    // sports_centre, etc.), so name matching is more reliable than any
+    // single tag for this specific, explicitly-wanted category
+    if(tags.name && /\bYMCA\b/i.test(tags.name)) return 'community';
     if(tags.amenity === 'school') return 'school';
     if(tags.amenity === 'kindergarten' || tags.amenity === 'childcare') return 'childcare';
     if(tags.leisure === 'playground') return 'playground';
@@ -908,6 +913,8 @@
         way["amenity"="library"](${bbox});
         node["leisure"="park"](${bbox});
         way["leisure"="park"](${bbox});
+        node["name"~"YMCA",i](${bbox});
+        way["name"~"YMCA",i](${bbox});
       )->.pois;
       .pois out center;
       (
@@ -1888,15 +1895,22 @@
     return pairs;
   }
 
-  // clearing a 1000ft (~305m) buffer only ever needs local maneuvering room,
-  // not miles of lateral space — a margin many times the buffer itself is
-  // already generous. This was previously capped at 4800m (~3mi) and scaled
-  // with route length, which on a 20-30 mile route meant a huge search area
-  // before the router could even start looking for a path — by far the
-  // largest cost once the redundant graph fetch was removed, and also why
-  // panning/zooming got sluggish afterward (that much loaded/rendered data).
-  function avoidanceMarginMeters(straightLineMeters){
-    return Math.max(400, Math.min(straightLineMeters * 0.15, 1200));
+  // clearing a 1000ft (~305m) buffer usually only needs local maneuvering
+  // room, so starting with a margin a few times the buffer itself keeps the
+  // common case fast — but sometimes avoiding a cluster of locations
+  // genuinely does need more room (e.g. detouring a block or two north
+  // before heading east), so findAvoidancePath below retries with a wider
+  // margin rather than giving up the first time no clear path fits.
+  // Doubling the base margin each attempt (rather than picking from a list
+  // of independent caps) guarantees each retry is actually wider than the
+  // last — capping the *proportional* term at a fixed value per attempt
+  // doesn't widen anything once the route's own length already keeps that
+  // term under every cap, which is true for most ordinary (non
+  // ultra-distance) routes.
+  const AVOIDANCE_MARGIN_ATTEMPTS = 3;
+  function avoidanceMarginMeters(straightLineMeters, attempt){
+    const base = Math.max(400, Math.min(straightLineMeters * 0.15, 1200));
+    return base * Math.pow(2, attempt);
   }
 
   // bounding area to search for a path in — the straight line between start
@@ -1907,9 +1921,7 @@
   // for anything but a purely north-south or east-west route — a diagonal
   // 20 mile route would otherwise mean loading a ~20x20 mile area instead
   // of a narrow corridor along the direct line.
-  function expandedBoundsForRoute(a, b){
-    const straightLineMeters = haversineMeters(a.lat, a.lng, b.lat, b.lng);
-    const marginMeters = avoidanceMarginMeters(straightLineMeters);
+  function expandedBoundsForRoute(a, b, marginMeters){
     const midLat = (a.lat+b.lat)/2;
     const latMargin = marginMeters / 111320;
     const lngMargin = marginMeters / (111320 * Math.cos(midLat * Math.PI/180));
@@ -1924,9 +1936,8 @@
   // and b (roughly one step per margin-width), each contributing the cells
   // within margin of that point — a corridor hugging the direct path,
   // rather than expandedBoundsForRoute's full bounding rectangle
-  function corridorCellsForRoute(a, b){
+  function corridorCellsForRoute(a, b, marginMeters){
     const straightLineMeters = haversineMeters(a.lat, a.lng, b.lat, b.lng);
-    const marginMeters = avoidanceMarginMeters(straightLineMeters);
     const steps = Math.max(1, Math.ceil(straightLineMeters / marginMeters));
     const cellMap = new Map();
     for(let i=0;i<=steps;i++){
@@ -1950,49 +1961,64 @@
   // still bounding how large a single route-planning request can get
   const MAX_AVOIDANCE_ROUTE_METERS = 80000; // ~50 miles
 
-  // { pairs: [...] } on success, { pairs: null } if the graph was built but
-  // no unblocked path exists, { cancelled: true } if the user cancelled the
-  // area-loading step, or throws on an operational failure (network/data
-  // issue, or the route is too long to attempt this way)
+  // { pairs: [...] } on success, { pairs: null } if every margin attempt
+  // built a graph but found no unblocked path, { cancelled: true } if the
+  // user cancelled an area-loading step, or throws on an operational
+  // failure (network/data issue, or the route is too long to attempt this
+  // way). Retries with a wider margin before giving up — most routes clear
+  // with the first, smallest margin (fast), but some genuinely need more
+  // room to route around a cluster of locations, and a fixed margin can't
+  // tell the difference between "no clear path exists" and "the search
+  // area just wasn't wide enough to find the one that does."
   async function findAvoidancePath(a, b){
     const straightLineMeters = haversineMeters(a.lat, a.lng, b.lat, b.lng);
     if(straightLineMeters > MAX_AVOIDANCE_ROUTE_METERS){
       throw new Error('route too long for exact-avoidance routing');
     }
-    const bounds = expandedBoundsForRoute(a, b);
 
-    // make sure every cell along the corridor (not just the eventual path)
-    // has been checked against every data source — otherwise the router
-    // could treat an unvisited area as clear simply because we don't have
-    // data for it yet. Uses the corridor, not expandedBoundsForRoute's full
-    // bounding rectangle, since that rectangle is far larger than the
-    // corridor for anything but a purely north-south/east-west route.
-    const missingCells = corridorCellsForRoute(a, b).filter(c=>!loadedCells.has(cellKeyForCellCenter(c.lat,c.lng)));
-    if(missingCells.length){
-      const result = await loadCellsWithProgress(missingCells);
-      if(result.cancelled) return { cancelled: true };
+    for(let attempt=0; attempt<AVOIDANCE_MARGIN_ATTEMPTS; attempt++){
+      const marginMeters = avoidanceMarginMeters(straightLineMeters, attempt);
+      const isLastAttempt = attempt === AVOIDANCE_MARGIN_ATTEMPTS-1;
+
+      // make sure every cell along this attempt's corridor has been checked
+      // against every data source — cells already loaded by a narrower prior
+      // attempt are skipped automatically (loadedCells persists across
+      // attempts), so widening only ever fetches the newly-added fringe
+      const missingCells = corridorCellsForRoute(a, b, marginMeters).filter(c=>!loadedCells.has(cellKeyForCellCenter(c.lat,c.lng)));
+      if(missingCells.length){
+        const result = await loadCellsWithProgress(missingCells);
+        if(result.cancelled) return { cancelled: true };
+      }
+
+      // no separate fetch — lineCache already has every road segment in
+      // this area from the load-cells step just above
+      const bounds = expandedBoundsForRoute(a, b, marginMeters);
+      const graph = buildRoutingGraphFromLineCache(bounds);
+      if(graph.nodeById.size === 0){
+        if(isLastAttempt) throw new Error('no road data returned for this area');
+        continue;
+      }
+
+      const locations = allKnownLocationsForProximityCheck();
+      const avoidPoints = Object.values(segments)
+        .filter(s=>s.state === 'avoid')
+        .map(s=>({ lat: (s.latlngs[0][0]+s.latlngs[1][0])/2, lng: (s.latlngs[0][1]+s.latlngs[1][1])/2 }));
+      const poiThresholdMeters = MIN_LOCATION_DISTANCE_FT * 0.3048;
+      markBlockedEdges(graph, locations, avoidPoints, poiThresholdMeters, 12); // 12m tolerance for matching a marked line's real-world position
+
+      const startNode = nearestGraphNode(graph.nodeById, a.lat, a.lng);
+      const endNode = nearestGraphNode(graph.nodeById, b.lat, b.lng);
+      if(startNode == null || endNode == null){
+        if(isLastAttempt) throw new Error('could not connect start/end to the road network');
+        continue;
+      }
+
+      const path = dijkstraPath(graph.adjacency, startNode, endNode);
+      if(path) return { pairs: nodePathToPairs(path, graph.nodeById) };
+      // no unblocked path within this margin — widen and retry unless this
+      // was already the widest attempt
     }
-
-    // no separate fetch — lineCache already has every road segment in this
-    // area from the load-cells step just above, since that's exactly what
-    // populates it
-    const graph = buildRoutingGraphFromLineCache(bounds);
-    if(graph.nodeById.size === 0) throw new Error('no road data returned for this area');
-
-    const locations = allKnownLocationsForProximityCheck();
-    const avoidPoints = Object.values(segments)
-      .filter(s=>s.state === 'avoid')
-      .map(s=>({ lat: (s.latlngs[0][0]+s.latlngs[1][0])/2, lng: (s.latlngs[0][1]+s.latlngs[1][1])/2 }));
-    const poiThresholdMeters = MIN_LOCATION_DISTANCE_FT * 0.3048;
-    markBlockedEdges(graph, locations, avoidPoints, poiThresholdMeters, 12); // 12m tolerance for matching a marked line's real-world position
-
-    const startNode = nearestGraphNode(graph.nodeById, a.lat, a.lng);
-    const endNode = nearestGraphNode(graph.nodeById, b.lat, b.lng);
-    if(startNode == null || endNode == null) throw new Error('could not connect start/end to the road network');
-
-    const path = dijkstraPath(graph.adjacency, startNode, endNode);
-    if(!path) return { pairs: null };
-    return { pairs: nodePathToPairs(path, graph.nodeById) };
+    return { pairs: null };
   }
 
   // fetch (tile cache first, direct Overpass as fallback) and apply exactly
