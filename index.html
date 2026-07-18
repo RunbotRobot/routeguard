@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.55</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.56</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -545,17 +545,28 @@
   // later just means asking the worker again (fast, it's still there),
   // not losing anything. Only genuinely worth alarming the user over if
   // even that doesn't free enough room.
-  const EVICTION_BATCH_SIZES = [50, 150, 400, 1000];
+  // A fixed eviction schedule (e.g. "evict at most 1000 cells") was tuned
+  // without knowing how large a real, wide-ranging user's cache could get —
+  // for someone whose loadedCells runs into the thousands, evicting a flat
+  // 1000 might barely dent it, hitting the hard-failure warning below even
+  // though there's plenty more that safely *could* have been evicted. Scale
+  // with how much is actually loaded instead: start at 10% of it (or 50,
+  // whichever's bigger) and double each round, so this always eventually
+  // reaches "evict nearly everything" for a large cache rather than
+  // plateauing at a number picked for a much smaller one. Bounded by a
+  // generous attempt count, not a fixed cell count.
   let saveCachesTimer = null;
   function flushSaveCaches(){
     if(saveCachesTimer){ clearTimeout(saveCachesTimer); saveCachesTimer = null; }
     let dataOk = saveLineCache(lineCache) && saveLineNames(lineNames) && savePoiCache(poiCache);
     let evictedTotal = 0;
-    for(let i=0; !dataOk && i<EVICTION_BATCH_SIZES.length; i++){
-      const evicted = evictLeastRecentlyUsedCells(EVICTION_BATCH_SIZES[i]);
+    let batchSize = Math.max(50, Math.ceil(loadedCells.size * 0.1));
+    for(let attempt=0; !dataOk && attempt<20; attempt++){
+      const evicted = evictLeastRecentlyUsedCells(batchSize);
       if(evicted === 0) break; // nothing left worth evicting — retrying won't help
       evictedTotal += evicted;
       dataOk = saveLineCache(lineCache) && saveLineNames(lineNames) && savePoiCache(poiCache);
+      batchSize *= 2;
     }
     // loadedCells/cellRecency's own writes are small and would likely
     // succeed even when the much bigger lineCache/poiCache write above just
@@ -1890,15 +1901,22 @@
 
   // rescale every existing line's thickness as you zoom, rather than only
   // newly-drawn ones — cheap: just updates stroke width, doesn't recreate
-  // anything. The route itself is small (at most a few dozen segments) and
-  // rescaled immediately/synchronously; the much larger bulk of ordinary
-  // cached lines is chunked (see runChunked) and skipped entirely while its
-  // pane is hidden (see updateBulkDisplay).
-  let pendingLineRescale = null;
+  // anything. Both the route and the much larger bulk of ordinary cached
+  // lines are chunked (see runChunked) across animation frames rather than
+  // one synchronous pass. The route used to be rescaled synchronously on
+  // the assumption that it's always small ("a few dozen segments") — true
+  // for a short route, but a real multi-mile route through a dense street
+  // grid resolves to individual OSM node-to-node edges, which can run into
+  // the thousands. That wrong assumption was exactly why zooming with a
+  // route planned stayed slow even after the bulk-lines rescale below was
+  // already chunked: this loop was still doing all of it in one blocking
+  // pass, scaling with route length, every single zoom step.
+  let pendingRouteRescale = null, pendingLineRescale = null;
   map.on('zoomend', ()=>{
     const zoom = map.getZoom();
+    if(pendingRouteRescale) pendingRouteRescale.cancelled = true;
     const routeStyle = segWeightsForZoom(true, zoom);
-    routeLayerKeys.forEach(key=>{
+    pendingRouteRescale = runChunked(routeLayerKeys, (key)=>{
       if(!segPolylines[key]) return;
       segPolylines[key].setStyle({ weight: routeStyle.weight });
       if(segCasingLines[key]) segCasingLines[key].setStyle({ weight: routeStyle.casing });
@@ -2420,10 +2438,12 @@
   async function ensureCellLoaded(c){
     const key = cellKeyForCellCenter(c.lat, c.lng);
     if(loadedCells.has(key)) return;
+    const loadStartedAtMs = performance.now();
     const half = TILE_GRID_SIZE / 2;
     const cellBounds = L.latLngBounds([c.lat-half, c.lng-half], [c.lat+half, c.lng+half]);
     const cfg = loadTileCacheCfg();
     let data = null;
+    let source = 'tile-cache';
     if(cfg.url){
       try{
         // must exceed the worker's own internal Overpass timeout (20s, see
@@ -2443,11 +2463,21 @@
       }catch(_){ /* fall through to a direct fetch below */ }
     }
     if(!data){
+      source = 'direct-overpass';
       const cellBbox = `${c.lat-half},${c.lng-half},${c.lat+half},${c.lng+half}`;
       const query = buildOverpassQuery(cellBbox);
       const attempts = OVERPASS_ENDPOINTS.map(endpoint => fetchOverpassMirror(endpoint, query));
       data = await Promise.any(attempts.map(a=>a.promise));
       attempts.forEach(a=>a.controller.abort());
+    }
+    // Diagnostic only (debug-messages toggle) — helps tell apart a fast KV
+    // cache hit from a genuine cache-miss round-trip through the worker to
+    // Overpass (which the worker's own ~20s internal timeout can make take
+    // many seconds), the leading suspect for why one particular area in a
+    // route's corridor load can take far longer than the rest.
+    const elapsedMs = Math.round(performance.now() - loadStartedAtMs);
+    if(elapsedMs > 2000){
+      showDebugMsg(`Slow area load: ${elapsedMs}ms via ${source}${data && data._cache ? ' ('+data._cache+')' : ''} near ${c.lat.toFixed(3)},${c.lng.toFixed(3)}`, 6000);
     }
     applyOverpassResults(data, cellBounds, true); // never-before-loaded cell — nothing to reconcile
     // belt-and-suspenders: mark this exact cell directly rather than relying
