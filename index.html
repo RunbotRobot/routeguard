@@ -25,7 +25,7 @@
     --avoid:#c1443c;
     --neutral:#5b6472;
     --walkable:#f0c419;
-    --route:#4ade80;
+    --route:#1f9e4a;
     --muted:#6b7280;
   }
   *{box-sizing:border-box;}
@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.51</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.52</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -555,7 +555,7 @@
   // (same as everything else, see drawSegment) already gives the route
   // enough contrast against the basemap without a separate bold outline
   const WALKABLE_COLOR = "#f0c419";
-  const ROUTE_COLOR = "#4ade80";
+  const ROUTE_COLOR = "#1f9e4a";
 
   // ---------- map ----------
   const map = L.map('map', {
@@ -950,39 +950,39 @@
   // renderCachedLinesAndPois above which is only meant for the one-time
   // initial draw on a blank map.
   //
-  // Deferring the draw avoided wasted work for the common case (a route
-  // that stays zoomed out), but it also means everything skipped over a
-  // long loading process — potentially thousands of lines/pins for an
-  // ultra-distance route freshly loaded with an empty cache — lands in one
-  // single lump the instant you zoom back in. Doing that in one synchronous
-  // pass would trade "spread-out slowness while loading" for "one
-  // multi-minute freeze on zoom-in," which is worse, not better. Spread it
-  // across animation frames instead, each doing only as much as fits in a
-  // few milliseconds, so the browser can keep painting/responding to input
-  // between batches rather than locking up until it's all done.
+  // Scoped to (a generous padding around) the current viewport, not the
+  // entire cache. A wide corridor search for a long route can load dozens
+  // of areas — for a route spanning many miles, that's potentially tens of
+  // thousands of lines/pins, and eagerly materializing every one of them
+  // (real Leaflet objects: canvas registration, hit targets, etc.) the
+  // instant you zoom back in to look at any single part of the route was
+  // real, chunked-but-still-substantial work with nothing to show for the
+  // vast majority of it, since almost none of it is anywhere near what you
+  // actually zoomed in on. Chunking across animation frames (see
+  // runChunked) already keeps the browser responsive while it runs, but
+  // this additionally cuts down how much there is to do in the first
+  // place. Anything still out of view stays cache-only until you actually
+  // pan/zoom near it — see the moveend/zoomend hookups below.
+  let pendingBulkLineDraw = null, pendingBulkPinDraw = null;
   function drawUndrawnBulkContent(){
-    const lineKeys = Object.keys(lineCache).filter(key=>!segPolylines[key]);
-    const poiKeys = Object.keys(poiCache).filter(key=>!autoPinMarkers[key]);
-    let li = 0, pi = 0;
-    function processBatch(){
-      const budgetEnd = performance.now() + 12; // leave room in the frame for an actual repaint
-      while(li < lineKeys.length && performance.now() < budgetEnd){
-        const key = lineKeys[li++];
-        // route edges are drawn immediately by renderRoutePairs and already
-        // have a segPolylines entry by the time this runs, so anything
-        // reaching here is never part of the current route
-        drawSegment(key, lineCache[key], false);
-      }
-      while(pi < poiKeys.length && performance.now() < budgetEnd){
-        const key = poiKeys[pi++];
-        const p = poiCache[key];
-        drawAutoPin(key, p.lat, p.lng, p.category, p.label);
-      }
-      if(li < lineKeys.length || pi < poiKeys.length){
-        requestAnimationFrame(processBatch);
-      }
-    }
-    requestAnimationFrame(processBatch);
+    if(pendingBulkLineDraw) pendingBulkLineDraw.cancelled = true;
+    if(pendingBulkPinDraw) pendingBulkPinDraw.cancelled = true;
+    const viewBounds = map.getBounds().pad(1); // triples the width/height — buffer so nearby panning doesn't immediately need another pass
+    const lineKeys = Object.keys(lineCache).filter(key=>
+      !segPolylines[key] && lineCache[key].some(p=>viewBounds.contains(p)));
+    const poiKeys = Object.keys(poiCache).filter(key=>{
+      if(autoPinMarkers[key]) return false;
+      const p = poiCache[key];
+      return viewBounds.contains([p.lat, p.lng]);
+    });
+    // route edges are drawn immediately by renderRoutePairs and already
+    // have a segPolylines entry by the time this runs, so anything reaching
+    // here is never part of the current route
+    pendingBulkLineDraw = runChunked(lineKeys, key=>drawSegment(key, lineCache[key], false));
+    pendingBulkPinDraw = runChunked(poiKeys, key=>{
+      const p = poiCache[key];
+      drawAutoPin(key, p.lat, p.lng, p.category, p.label);
+    });
   }
 
 
@@ -1558,6 +1558,11 @@
     if(show && wasHidden) drawUndrawnBulkContent();
   }
   map.on('zoomend', updateBulkDisplay);
+  // drawUndrawnBulkContent is now viewport-scoped (see its own comment), so
+  // it's cheap to also run on plain panning — otherwise panning into an
+  // area that was cached (e.g. during a wide route-corridor search) but
+  // never actually drawn would stay blank until the next zoom transition
+  map.on('moveend', ()=>{ if(map.getZoom() >= BULK_DISPLAY_MIN_ZOOM) drawUndrawnBulkContent(); });
 
   const segRenderer = L.canvas({ padding: 0.6, pane: 'bulkLinesPane' });
   const routeSegRenderer = L.canvas({ padding: 0.6, pane: 'routeLinesPane' });
@@ -2246,7 +2251,19 @@
     let data = null;
     if(cfg.url){
       try{
-        const res = await fetch(`${cfg.url}/tile?lat=${c.lat}&lng=${c.lng}`);
+        // must exceed the worker's own internal Overpass timeout (20s, see
+        // fetchFromOverpass in routeguard-worker/index.js) — otherwise a cold
+        // cache miss aborts client-side before the worker even gives up.
+        // Without this, a single slow/stalled tile-cache response had no
+        // bound at all and could stall one of loadCellsWithProgress's
+        // concurrent workers for a very long time before ever falling
+        // through to the (bounded) direct-Overpass path below — exactly the
+        // kind of single straggler cell that can dominate a whole route
+        // plan's total wait.
+        const controller = new AbortController();
+        const timeoutId = setTimeout(()=>controller.abort(), 25000);
+        const res = await fetch(`${cfg.url}/tile?lat=${c.lat}&lng=${c.lng}`, {signal: controller.signal});
+        clearTimeout(timeoutId);
         if(res.ok) data = await res.json();
       }catch(_){ /* fall through to a direct fetch below */ }
     }
