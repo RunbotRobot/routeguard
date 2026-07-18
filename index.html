@@ -220,7 +220,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.43</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.44</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -795,7 +795,19 @@
           seenLineKeys.add(key);
           lineCache[key] = pair;
           const state = segments[key] ? segments[key].state : 'neutral';
-          drawSegment(key, pair, state);
+          // Creating a Leaflet polyline (and its canvas registration, hit
+          // target, etc.) is real main-thread work, not just a cheap object
+          // literal — doing that for potentially thousands of lines while
+          // route-planning loads a wide area, only to have them immediately
+          // hidden by the auto-fit-to-route zoom-out, was wasted work with
+          // nothing to show for it. Skip drawing (cache only) while zoomed
+          // out past the bulk-display threshold; drawUndrawnBulkContent
+          // catches up the moment it's actually visible. Marked (safe/avoid)
+          // segments are drawn immediately regardless — safety-relevant and
+          // comparatively few.
+          if(state !== 'neutral' || map.getZoom() >= BULK_DISPLAY_MIN_ZOOM){
+            drawSegment(key, pair, state);
+          }
         }
         return;
       }
@@ -810,7 +822,7 @@
       const label = tagsToLabel(el.tags, category);
       poiCache[poiKey] = {lat, lng, category, label};
       if(autoPinMarkers[poiKey]) return; // already drawn — keep it, don't recreate (also preserves any open popup)
-      drawAutoPin(poiKey, lat, lng, category, label);
+      if(map.getZoom() >= BULK_DISPLAY_MIN_ZOOM) drawAutoPin(poiKey, lat, lng, category, label);
     });
 
     // Reconciliation: within the area we just freshly queried, remove any
@@ -872,6 +884,24 @@
       drawSegment(key, lineCache[key], state);
     });
     Object.keys(poiCache).forEach(key=>{
+      const p = poiCache[key];
+      drawAutoPin(key, p.lat, p.lng, p.category, p.label);
+    });
+  }
+
+  // catches up anything applyOverpassResults skipped drawing while zoomed
+  // out past the bulk-display threshold (see the note there) — safe to call
+  // repeatedly since it only draws what isn't already on the map, unlike
+  // renderCachedLinesAndPois above which is only meant for the one-time
+  // initial draw on a blank map
+  function drawUndrawnBulkContent(){
+    Object.keys(lineCache).forEach(key=>{
+      if(segPolylines[key]) return;
+      const state = segments[key] ? segments[key].state : 'neutral';
+      drawSegment(key, lineCache[key], state);
+    });
+    Object.keys(poiCache).forEach(key=>{
+      if(autoPinMarkers[key]) return;
       const p = poiCache[key];
       drawAutoPin(key, p.lat, p.lng, p.category, p.label);
     });
@@ -1428,8 +1458,12 @@
   const BULK_DISPLAY_MIN_ZOOM = MIN_ZOOM_FOR_AUTO; // same "too much to matter" threshold used for auto-loading/paint mode
   function updateBulkDisplay(){
     const show = map.getZoom() >= BULK_DISPLAY_MIN_ZOOM;
+    const wasHidden = map.getPane('bulkLinesPane').style.display === 'none';
     map.getPane('bulkLinesPane').style.display = show ? '' : 'none';
     map.getPane('bulkMarkerPane').style.display = show ? '' : 'none';
+    // catch up on anything that was skipped drawing while hidden (see
+    // applyOverpassResults) now that it's about to actually be seen
+    if(show && wasHidden) drawUndrawnBulkContent();
   }
   map.on('zoomend', updateBulkDisplay);
 
@@ -1917,21 +1951,30 @@
         if(!b) return;
         const midLat = (a.lat+b.lat)/2, midLng = (a.lng+b.lng)/2;
         const checkPts = [[a.lat,a.lng],[b.lat,b.lng],[midLat,midLng]];
-        let minPoiDist = Infinity;
-        for(const loc of nearbyIndexedPoints(locationIndex, midLat, midLng)){
+        // stop scanning as soon as a hard block is found — once an edge is
+        // blocked its exact minimum distance no longer matters (costMultiplier
+        // is irrelevant for a blocked edge), and in a dense area this is the
+        // difference between checking a handful of locations per edge and
+        // checking all of them for every one of possibly thousands of edges
+        let minPoiDist = Infinity, poiBlocked = false;
+        outerLoc: for(const loc of nearbyIndexedPoints(locationIndex, midLat, midLng)){
           for(const [plat,plng] of checkPts){
             const d = haversineMeters(plat, plng, loc.lat, loc.lng);
             if(d < minPoiDist) minPoiDist = d;
+            if(d < poiThresholdMeters){ poiBlocked = true; break outerLoc; }
           }
         }
-        let minAvoidDist = Infinity;
-        for(const av of nearbyIndexedPoints(avoidIndex, midLat, midLng)){
-          for(const [plat,plng] of checkPts){
-            const d = haversineMeters(plat, plng, av.lat, av.lng);
-            if(d < minAvoidDist) minAvoidDist = d;
+        let minAvoidDist = Infinity, avoidBlocked = false;
+        if(!poiBlocked){
+          outerAvoid: for(const av of nearbyIndexedPoints(avoidIndex, midLat, midLng)){
+            for(const [plat,plng] of checkPts){
+              const d = haversineMeters(plat, plng, av.lat, av.lng);
+              if(d < minAvoidDist) minAvoidDist = d;
+              if(d < avoidThresholdMeters){ avoidBlocked = true; break outerAvoid; }
+            }
           }
         }
-        edge.blocked = (minPoiDist < poiThresholdMeters) || (minAvoidDist < avoidThresholdMeters);
+        edge.blocked = poiBlocked || avoidBlocked;
         edge.costMultiplier = edge.blocked ? 1 : Math.max(
           proximityCostMultiplier(minPoiDist, poiThresholdMeters, poiSoftThreshold),
           proximityCostMultiplier(minAvoidDist, avoidThresholdMeters, avoidSoftThreshold)
@@ -2154,7 +2197,17 @@
       const path = dijkstraPath(graph.adjacency, startNode, endNode);
       if(path) return { pairs: nodePathToPairs(path, graph.nodeById) };
       // no unblocked path within this margin — widen and retry unless this
-      // was already the widest attempt
+      // was already the widest attempt. If the nearest road node to the
+      // start or end point is itself hemmed in (every edge touching it is
+      // blocked), widening the search area can never help — you can't take
+      // a single step from there, regardless of how much room there is
+      // further out. Surface that distinctly on the last attempt rather
+      // than the generic "no route found", since it points at a completely
+      // different fix (a different start/end point, not a wider search).
+      if(isLastAttempt){
+        const isTrapped = id => !(graph.adjacency.get(id)||[]).some(e=>!e.blocked);
+        return { pairs: null, startTrapped: isTrapped(startNode), endTrapped: isTrapped(endNode) };
+      }
     }
     return { pairs: null };
   }
@@ -2335,7 +2388,21 @@
       }
       if(!result.pairs){
         showHint('');
-        showWarn(`⚠ No route between these points stays clear of every marked line and location within ${MIN_LOCATION_DISTANCE_FT} ft. Try a different start/end, or view the closest route anyway.`, null);
+        // a trapped start/end means widening the search would never have
+        // helped — every road leading away from that exact point is
+        // already within the buffer, so say so plainly instead of implying
+        // a wider search might still find something
+        let msg;
+        if(result.startTrapped && result.endTrapped){
+          msg = `⚠ Both your start and end point are within ${MIN_LOCATION_DISTANCE_FT} ft of a marked line or location on every road leading away from them — there's no way to leave either point without crossing the buffer. Try different start/end points, or view the closest route anyway.`;
+        } else if(result.startTrapped){
+          msg = `⚠ Your start point is within ${MIN_LOCATION_DISTANCE_FT} ft of a marked line or location on every road leading away from it — there's no way to leave without crossing the buffer. Try a different start point, or view the closest route anyway.`;
+        } else if(result.endTrapped){
+          msg = `⚠ Your end point is within ${MIN_LOCATION_DISTANCE_FT} ft of a marked line or location on every road leading to it — there's no way to reach it without crossing the buffer. Try a different end point, or view the closest route anyway.`;
+        } else {
+          msg = `⚠ No route between these points stays clear of every marked line and location within ${MIN_LOCATION_DISTANCE_FT} ft. Try a different start/end, or view the closest route anyway.`;
+        }
+        showWarn(msg, null);
         btnShowAnyway.style.display = 'inline-block';
         btnShowAnyway.onclick = ()=>{ btnShowAnyway.style.display = 'none'; planRouteBestEffort(a, b); };
         return;
