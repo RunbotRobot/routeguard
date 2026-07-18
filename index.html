@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.53</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.54</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -1170,12 +1170,24 @@
   // always means "verified clear" and never gets confused with "not looked
   // at yet" — only meaningful at the same zoom level auto-loading itself
   // kicks in at, since below that nothing's being checked either way
+  // Chunked (see runChunked, defined further down but hoisted) rather than
+  // one synchronous pass — right after planning a long route, only the
+  // narrow corridor actually got loaded, so zooming out to see the whole
+  // route can put hundreds to thousands of never-checked grid cells in
+  // view at once. Creating that many rectangle overlays synchronously on
+  // every single zoomend/moveend was real, scaling-with-viewport-area
+  // blocking work — worse the further out you zoom (more cells in view),
+  // better zoomed in (fewer), which matches reports of this getting
+  // noticeably laggier specifically after generating a route and zooming
+  // out to look at it.
+  let pendingUnloadedOverlay = null;
   function renderUnloadedOverlay(){
+    if(pendingUnloadedOverlay) pendingUnloadedOverlay.cancelled = true;
     unloadedOverlayLayer.clearLayers();
     if(map.getZoom() < MIN_ZOOM_FOR_AUTO) return;
     const half = TILE_GRID_SIZE / 2;
-    gridCellsForBounds(map.getBounds()).forEach(c=>{
-      if(loadedCells.has(cellKeyForCellCenter(c.lat, c.lng))) return;
+    const cells = gridCellsForBounds(map.getBounds()).filter(c=>!loadedCells.has(cellKeyForCellCenter(c.lat, c.lng)));
+    pendingUnloadedOverlay = runChunked(cells, c=>{
       L.rectangle([[c.lat-half, c.lng-half],[c.lat+half, c.lng+half]], {
         pane: 'unloadedPane', stroke: false, fillColor: '#4a5568', fillOpacity: 0.32, interactive: false
       }).addTo(unloadedOverlayLayer);
@@ -1599,6 +1611,7 @@
   const segHitLayer = L.layerGroup().addTo(map); // invisible wide tap-targets, drawn above segLayer
   const segPolylines = {}; // key -> visible polyline
   const segHitLines = {};  // key -> invisible fat hit-target polyline
+  const segHitLineIsRoute = {}; // key -> whether that hit-line currently lives on the route (always-visible) renderer
 
   const segCasingLines = {}; // key -> white outline drawn beneath the colored line, for contrast on any background
 
@@ -1648,24 +1661,43 @@
     }).addTo(segLayer);
     segPolylines[key] = pl;
 
-    if(!segHitLines[key]){
+    // The hit-line has to live on the same renderer/pane as its visible
+    // line, not always on segRenderer — segRenderer's pane (bulkLinesPane)
+    // gets hidden (display:none) while zoomed out, and a hidden pane's
+    // click targets don't receive clicks either. A route's own polyline
+    // stays visible at every zoom (routeSegRenderer/routeLinesPane never
+    // hides), but its hit-line was always created on segRenderer regardless
+    // — so tapping the route to see a street name silently did nothing
+    // whenever you were zoomed out past the bulk-display threshold, which
+    // is exactly when you're most likely to be looking at the whole route
+    // right after planning one. Only rebuilt when isRoute actually changed
+    // since the hit-line was last created for this key (rather than every
+    // call, like the casing/colored line above) — the overwhelming majority
+    // of drawSegment calls are redraws of ordinary, never-route segments,
+    // and rebuilding their hit-line (plus rebinding two listeners) on every
+    // single one of those would undo real chunked-drawing performance work
+    // for no behavioral benefit.
+    if(!segHitLines[key] || segHitLineIsRoute[key] !== isRoute){
+      if(segHitLines[key]) segHitLayer.removeLayer(segHitLines[key]);
       // a much fatter, fully transparent line makes it far easier to tap a
       // thin road on a phone screen without changing how thin it looks
       const hit = L.polyline(latlngs, {
-        renderer: segRenderer, color: '#000', weight: 26, opacity: 0, interactive: true
+        renderer, color: '#000', weight: 26, opacity: 0, interactive: true
       }).addTo(segHitLayer);
       hit.on('click', (e)=>{
         L.DomEvent.stopPropagation(e);
         showSegmentNamePopup(key, e.latlng);
       });
-      // long-press (or right-click on desktop) identifies the spot instead of
-      // cycling its color — kept separate so it never slows down quick tapping
+      // long-press (or right-click on desktop) identifies the spot instead
+      // of cycling its color — kept separate so it never slows down quick
+      // tapping
       hit.on('contextmenu', (e)=>{
         L.DomEvent.stopPropagation(e);
         if(e.originalEvent && e.originalEvent.preventDefault) e.originalEvent.preventDefault();
         showIdentifyPopup(e.latlng);
       });
       segHitLines[key] = hit;
+      segHitLineIsRoute[key] = isRoute;
     }
   }
 
@@ -3099,6 +3131,7 @@ ${pts}
       Object.keys(segPolylines).forEach(k=>delete segPolylines[k]);
       Object.keys(segCasingLines).forEach(k=>delete segCasingLines[k]);
       Object.keys(segHitLines).forEach(k=>delete segHitLines[k]);
+      Object.keys(segHitLineIsRoute).forEach(k=>delete segHitLineIsRoute[k]);
       routeLayerKeys = [];
       routeLayerKeySet = new Set();
       autoPinLayer.clearLayers();
