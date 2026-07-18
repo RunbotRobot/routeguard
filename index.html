@@ -220,7 +220,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.48</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.49</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -1033,6 +1033,20 @@
       clearTimeout(timeoutId);
       if(!res.ok) throw new Error('HTTP '+res.status);
       return res.json();
+    }).then(data=>{
+      // The query places .pois before .roads, so a server-side timeout or
+      // resource limit hit mid-query can come back as a normal 200 OK with
+      // every POI already output but the (usually much larger) roads
+      // section cut short or empty — Overpass reports this via a top-level
+      // "remark" field even though the HTTP status and JSON are otherwise
+      // fine. Silently trusting that response would cache an area as
+      // "roads: none" and mark it permanently loaded, which is exactly
+      // backwards — a road-free area should never be assumed safe by
+      // default, and once loadedCells trusts a cell it's never re-checked.
+      if(data && typeof data.remark === 'string'){
+        throw new Error('Overpass: '+data.remark);
+      }
+      return data;
     }).catch(err=>{ clearTimeout(timeoutId); throw err; });
     return { promise, controller };
   }
