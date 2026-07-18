@@ -220,7 +220,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.44</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.45</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -813,14 +813,29 @@
       }
       const category = tagsToCategory(el.tags);
       if(!category) return;
-      const lat = el.lat || (el.center && el.center.lat);
-      const lng = el.lon || (el.center && el.center.lon);
+      // A way/relation POI (a school's grounds, a park) comes back with its
+      // full boundary via "out geom" now, not just a centroid — a single
+      // center point can sit well back from the street on a large or
+      // oddly-shaped property, understating how close you actually get to
+      // its near edge. Keep the full ring for proximity checks (see
+      // distanceToLocationMeters) and only use the average point for where
+      // to place the marker.
+      let lat, lng, geometry = null;
+      if(el.lat != null && el.lon != null){
+        lat = el.lat; lng = el.lon;
+      } else if(el.geometry && el.geometry.length > 0){
+        geometry = el.geometry.map(g=>[g.lat, g.lon]);
+        lat = geometry.reduce((s,p)=>s+p[0], 0) / geometry.length;
+        lng = geometry.reduce((s,p)=>s+p[1], 0) / geometry.length;
+      } else if(el.center){
+        lat = el.center.lat; lng = el.center.lon;
+      }
       if(lat==null || lng==null) return;
 
       const poiKey = el.type + el.id;
       seenPoiKeys.add(poiKey);
       const label = tagsToLabel(el.tags, category);
-      poiCache[poiKey] = {lat, lng, category, label};
+      poiCache[poiKey] = geometry ? {lat, lng, category, label, geometry} : {lat, lng, category, label};
       if(autoPinMarkers[poiKey]) return; // already drawn — keep it, don't recreate (also preserves any open popup)
       if(map.getZoom() >= BULK_DISPLAY_MIN_ZOOM) drawAutoPin(poiKey, lat, lng, category, label);
     });
@@ -946,7 +961,7 @@
         node["name"~"YMCA",i](${bbox});
         way["name"~"YMCA",i](${bbox});
       )->.pois;
-      .pois out center;
+      .pois out geom;
       (
         way["highway"~"^(${ROAD_HIGHWAY_TYPES})$"](${bbox});
       )->.roads;
@@ -1820,12 +1835,44 @@
   // actually been checked, same gating as the map display)
   function allKnownLocationsForProximityCheck(){
     const locs = [];
-    Object.entries(poiCache).forEach(([id,p])=>locs.push({id:'poi:'+id, lat:p.lat, lng:p.lng}));
+    // carry a POI's full boundary geometry through when we have it — a
+    // school or park fetched as an OSM way can be large or oddly shaped,
+    // and checking distance to just a single point (its centroid) can
+    // understate true closeness to the near edge of the property
+    Object.entries(poiCache).forEach(([id,p])=>locs.push({id:'poi:'+id, lat:p.lat, lng:p.lng, geometry:p.geometry}));
     pins.forEach((p,i)=>locs.push({id:'pin:'+i, lat:p.lat, lng:p.lng}));
     officialRecordsCache.forEach(r=>{
       if(loadedCells.has(cellKeyForLatLng(r.lat, r.lng))) locs.push({id:'official:'+r.id, lat:r.lat, lng:r.lng});
     });
     return locs;
+  }
+  // minimum distance from a point to a location — the location's actual
+  // boundary when we have one (a fetched polygon/way), otherwise straight
+  // to its point. A local equirectangular projection is accurate enough at
+  // buffer-check scales (a few hundred meters) where earth curvature is
+  // negligible, so this is plain 2D point-to-segment math rather than a
+  // full geodesic projection.
+  function pointToSegmentMeters(plat, plng, alat, alng, blat, blng){
+    const refLat = alat;
+    const mLat = 111320, mLng = 111320 * Math.cos(refLat * Math.PI/180);
+    const px = (plng-alng)*mLng, py = (plat-alat)*mLat;
+    const bx = (blng-alng)*mLng, by = (blat-alat)*mLat;
+    const lengthSq = bx*bx + by*by;
+    if(lengthSq === 0) return haversineMeters(plat, plng, alat, alng);
+    let t = (px*bx + py*by) / lengthSq;
+    t = Math.max(0, Math.min(1, t));
+    const cx = bx*t, cy = by*t;
+    return Math.hypot(px-cx, py-cy);
+  }
+  function distanceToLocationMeters(lat, lng, loc){
+    if(!loc.geometry || loc.geometry.length < 2) return haversineMeters(lat, lng, loc.lat, loc.lng);
+    let best = Infinity;
+    for(let i=0;i<loc.geometry.length-1;i++){
+      const [alat,alng] = loc.geometry[i], [blat,blng] = loc.geometry[i+1];
+      const d = pointToSegmentMeters(lat, lng, alat, alng, blat, blng);
+      if(d < best) best = d;
+    }
+    return best;
   }
   function routeProximityViolationCount(pairs, locations, thresholdMeters){
     const violatedIds = new Set();
@@ -1833,7 +1880,7 @@
       pair.forEach(pt=>{
         for(const loc of locations){
           if(violatedIds.has(loc.id)) continue;
-          if(haversineMeters(pt[0], pt[1], loc.lat, loc.lng) < thresholdMeters) violatedIds.add(loc.id);
+          if(distanceToLocationMeters(pt[0], pt[1], loc) < thresholdMeters) violatedIds.add(loc.id);
         }
       });
     });
@@ -1959,7 +2006,7 @@
         let minPoiDist = Infinity, poiBlocked = false;
         outerLoc: for(const loc of nearbyIndexedPoints(locationIndex, midLat, midLng)){
           for(const [plat,plng] of checkPts){
-            const d = haversineMeters(plat, plng, loc.lat, loc.lng);
+            const d = distanceToLocationMeters(plat, plng, loc);
             if(d < minPoiDist) minPoiDist = d;
             if(d < poiThresholdMeters){ poiBlocked = true; break outerLoc; }
           }
@@ -3135,8 +3182,19 @@ ${pts}
   renderCachedLinesAndPois(); // everything else ever seen — instant, no waiting on a network fetch
   renderUnloadedOverlay();
   updateBulkDisplay(); // match initial pane visibility to whatever zoom the map opens at
+  // A full localStorage scan (every key's string length) is real synchronous
+  // work — for a heavy user with megabytes of cached map data this is a
+  // noticeable freeze, not a cheap ticker update. It's purely informational
+  // (a "storage used" display), so it doesn't need anywhere near real-time
+  // freshness: run it far less often, and hand it to requestIdleCallback so
+  // the browser can defer it to a moment when nothing else is happening,
+  // instead of blocking whatever the user's mid-gesture on.
+  function scheduleStorageUsageUpdate(){
+    if(window.requestIdleCallback) requestIdleCallback(updateStorageUsageDisplay, { timeout: 5000 });
+    else setTimeout(updateStorageUsageDisplay, 200);
+  }
   updateStorageUsageDisplay();
-  setInterval(updateStorageUsageDisplay, 8000);
+  setInterval(scheduleStorageUsageUpdate, 60000);
 
   // if a recording was in progress when the page was reloaded (crash, manual
   // refresh, new version), resume it instead of silently losing the run
