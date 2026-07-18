@@ -98,10 +98,6 @@
   }
   #warnbarContent{ display:flex; flex-direction:column; align-items:flex-start; gap:6px; flex:1; min-width:0; }
   #warnbarText{ user-select:text;-webkit-user-select:text;white-space:pre-wrap;word-break:break-word; }
-  #btnShowRouteAnyway{
-    background:none;border:1px solid currentColor;color:inherit;border-radius:10px;
-    font-size:11px;padding:3px 10px;cursor:pointer;white-space:nowrap;
-  }
   #warnbarClose{
     background:none;border:none;color:inherit;font-size:18px;line-height:1;cursor:pointer;
     padding:0 2px;flex:none;opacity:.65;
@@ -220,7 +216,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.49</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.50</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -240,7 +236,6 @@
     <div id="warnbar">
       <div id="warnbarContent">
         <span id="warnbarText"></span>
-        <button id="btnShowRouteAnyway" style="display:none;">Show anyway</button>
       </div>
       <button id="warnbarClose" aria-label="Dismiss">&times;</button>
     </div>
@@ -1853,46 +1848,23 @@
     });
   }
 
-  // ---------- routing (OSRM public demo server) ----------
+  // ---------- routing (our own graph — no third-party routing service) ----------
   let routeClicks = [];
   let routeLayerKeys = []; // keys drawn for the *current* route so we can clear neutral ones on replan
   const startEndLayer = L.layerGroup().addTo(map);
 
-  async function fetchRoute(a, b){
-    const url = `https://router.project-osrm.org/route/v1/foot/${a.lng},${a.lat};${b.lng},${b.lat}?overview=full&geometries=geojson&alternatives=true&steps=false`;
-    const res = await fetch(url);
-    if(!res.ok) throw new Error('routing service error');
-    const data = await res.json();
-    if(!data.routes || !data.routes.length) throw new Error('no route found');
-    return data.routes;
-  }
-
-  function coordsToLatLngPairs(coords){
-    // coords: [[lng,lat], ...] -> pairs of [lat,lng]
-    const pts = coords.map(c=>[c[1], c[0]]);
-    const pairs = [];
-    for(let i=0;i<pts.length-1;i++){
-      pairs.push([pts[i], pts[i+1]]);
-    }
-    return pairs;
-  }
-
-  function scoreRoute(pairs){
-    let avoidCount = 0;
-    pairs.forEach(pair=>{
-      const key = edgeKey(pair[0], pair[1]);
-      if(segments[key] && segments[key].state === 'avoid') avoidCount++;
-    });
-    return avoidCount;
-  }
-
   // ---------- keep routes clear of nearby locations ----------
-  // Note: the free OSRM routing service this app uses has no concept of an
-  // exclusion zone — it can't be told to detour around a point. This can
-  // only pick the least-bad of whatever alternatives it happens to offer
-  // and warn honestly if none of them clear the distance, same as the
-  // avoid-line scoring above already does.
-  const MIN_LOCATION_DISTANCE_FT = 1000;
+  // This isn't a generic "stay N feet away" radius — it's meant to
+  // approximate "don't run directly adjacent to a location's frontage,
+  // including being on the opposite side of the street from it." 100ft
+  // covers a typical residential-to-tertiary street's full property-line-
+  // to-property-line width (sidewalk + parking/travel lanes + sidewalk on
+  // the far side) with some margin, without sweeping in every street
+  // merely in the neighborhood the way a much larger radius would — in a
+  // location-dense area that turned "avoid within 1000ft of anything" into
+  // "most streets are blocked," making a real route impossible to find
+  // even though none of them actually ran alongside anything.
+  const MIN_LOCATION_DISTANCE_FT = 100;
   function haversineMeters(lat1, lng1, lat2, lng2){
     const R = 6371000;
     const toRad = d => d * Math.PI / 180;
@@ -1944,29 +1916,19 @@
     }
     return best;
   }
-  function routeProximityViolationCount(pairs, locations, thresholdMeters){
-    const violatedIds = new Set();
-    pairs.forEach(pair=>{
-      pair.forEach(pt=>{
-        for(const loc of locations){
-          if(violatedIds.has(loc.id)) continue;
-          if(distanceToLocationMeters(pt[0], pt[1], loc) < thresholdMeters) violatedIds.add(loc.id);
-        }
-      });
-    });
-    return violatedIds.size;
-  }
-
   // ---------- custom avoidance router ----------
-  // The free OSRM demo has no concept of an exclusion zone, so getting an
-  // actual guarantee (rather than best-effort picking among OSRM's own
-  // alternatives) means building our own routable graph and running our
-  // own pathfinding, treating any edge within the buffer of a known
-  // location or marked avoid-line as impassable. The graph is built
-  // read-only from lineCache (populated by the same area-loading step this
-  // needs to run anyway for the blocking check) rather than a second
-  // fetch — it never writes to lineCache/segments/drawSegment, so the
-  // already-working line-marking/display pipeline is untouched.
+  // No third-party routing service is involved anywhere in this app — a
+  // service with no idea marked lines or locations even exist can't be
+  // told to route around them, and a "best-effort, pick the least-bad
+  // alternative" approach on top of it can still hand back a route that
+  // runs right along the edge of, or across the street from, a location.
+  // This builds our own routable graph and runs our own pathfinding,
+  // treating any edge within the buffer of a known location or marked
+  // avoid-line as impassable. The graph is built read-only from lineCache
+  // (populated by the same area-loading step this needs to run anyway for
+  // the blocking check) rather than a second fetch — it never writes to
+  // lineCache/segments/drawSegment, so the already-working line-marking/
+  // display pipeline is untouched.
 
   // Builds the routing graph directly from lineCache instead of a separate
   // fetch. lineCache already holds every road segment the POI-loading step
@@ -2023,9 +1985,10 @@
     });
     return index;
   }
-  // grid cells are far larger than the 1000ft buffer or a typical edge
-  // length, so the point's own cell plus its 8 neighbors always covers
-  // every location that could plausibly be within range
+  // grid cells are far larger than the adjacency buffer (even including its
+  // soft-preference zone) or a typical edge length, so the point's own cell
+  // plus its 8 neighbors always covers every location that could plausibly
+  // be within range
   function nearbyIndexedPoints(index, lat, lng){
     const c = cellCenterForLatLng(lat, lng);
     const results = [];
@@ -2055,14 +2018,32 @@
     return 1 + closeness * POI_SOFT_PENALTY_STRENGTH;
   }
 
+  // an edge that violates adjacency but isn't hard-blocked (fallback mode
+  // only, see findAvoidancePath) is made drastically more expensive than
+  // any legitimate detour could plausibly be — Dijkstra will only ever
+  // choose it if there's truly no other way through, and among several
+  // forced-adjacency options it'll still prefer whichever touches fewer/
+  // shorter ones, since the penalty stacks with real distance rather than
+  // replacing it
+  const FALLBACK_ADJACENCY_PENALTY = 50;
+
   // marks every edge that comes within the buffer of a known location or a
-  // marked avoid-line as impassable, and separately scores how close it
-  // passes (see proximityCostMultiplier above) so the pathfinder can prefer
-  // more clearance among otherwise-legal routes. Checked at both endpoints
-  // and the midpoint — edges between consecutive OSM nodes are typically
+  // marked avoid-line, and separately scores how close it passes (see
+  // proximityCostMultiplier above) so the pathfinder can prefer more
+  // clearance among otherwise-legal routes. Checked at both endpoints and
+  // the midpoint — edges between consecutive OSM nodes are typically
   // short, so this is a good approximation of "does any part of this edge
-  // intrude"
-  function markBlockedEdges(graph, locations, avoidPoints, poiThresholdMeters, avoidThresholdMeters){
+  // intrude".
+  //
+  // strict (default true) controls whether adjacency to a POI is a hard
+  // block or a steep-but-passable cost — marked avoid-lines are always a
+  // hard block either way, since those are an explicit, deliberate safety
+  // call rather than an automatically-detected location, and softening
+  // them would mean silently routing through ground you specifically
+  // marked off-limits. findAvoidancePath uses strict=false only for its
+  // last-resort fallback pass, once every strict attempt has failed.
+  function markBlockedEdges(graph, locations, avoidPoints, poiThresholdMeters, avoidThresholdMeters, strict){
+    if(strict === undefined) strict = true;
     const { nodeById, adjacency } = graph;
     const locationIndex = buildLocationIndex(locations);
     const avoidIndex = buildLocationIndex(avoidPoints);
@@ -2076,11 +2057,6 @@
         if(!b) return;
         const midLat = (a.lat+b.lat)/2, midLng = (a.lng+b.lng)/2;
         const checkPts = [[a.lat,a.lng],[b.lat,b.lng],[midLat,midLng]];
-        // stop scanning as soon as a hard block is found — once an edge is
-        // blocked its exact minimum distance no longer matters (costMultiplier
-        // is irrelevant for a blocked edge), and in a dense area this is the
-        // difference between checking a handful of locations per edge and
-        // checking all of them for every one of possibly thousands of edges
         let minPoiDist = Infinity, poiBlocked = false;
         outerLoc: for(const loc of nearbyIndexedPoints(locationIndex, midLat, midLng)){
           for(const [plat,plng] of checkPts){
@@ -2089,21 +2065,31 @@
             if(d < poiThresholdMeters){ poiBlocked = true; break outerLoc; }
           }
         }
+        // avoid-lines are always checked, regardless of the POI result —
+        // they're never softened, so skipping this when poiBlocked is
+        // already true (like the POI/avoid short-circuit used to) isn't
+        // available anymore now that poiBlocked alone doesn't decide
+        // edge.blocked
         let minAvoidDist = Infinity, avoidBlocked = false;
-        if(!poiBlocked){
-          outerAvoid: for(const av of nearbyIndexedPoints(avoidIndex, midLat, midLng)){
-            for(const [plat,plng] of checkPts){
-              const d = haversineMeters(plat, plng, av.lat, av.lng);
-              if(d < minAvoidDist) minAvoidDist = d;
-              if(d < avoidThresholdMeters){ avoidBlocked = true; break outerAvoid; }
-            }
+        outerAvoid: for(const av of nearbyIndexedPoints(avoidIndex, midLat, midLng)){
+          for(const [plat,plng] of checkPts){
+            const d = haversineMeters(plat, plng, av.lat, av.lng);
+            if(d < minAvoidDist) minAvoidDist = d;
+            if(d < avoidThresholdMeters){ avoidBlocked = true; break outerAvoid; }
           }
         }
-        edge.blocked = poiBlocked || avoidBlocked;
-        edge.costMultiplier = edge.blocked ? 1 : Math.max(
-          proximityCostMultiplier(minPoiDist, poiThresholdMeters, poiSoftThreshold),
-          proximityCostMultiplier(minAvoidDist, avoidThresholdMeters, avoidSoftThreshold)
-        );
+        edge.poiBlocked = poiBlocked;
+        edge.blocked = avoidBlocked || (strict && poiBlocked);
+        if(edge.blocked){
+          edge.costMultiplier = 1;
+        } else if(poiBlocked){
+          edge.costMultiplier = FALLBACK_ADJACENCY_PENALTY;
+        } else {
+          edge.costMultiplier = Math.max(
+            proximityCostMultiplier(minPoiDist, poiThresholdMeters, poiSoftThreshold),
+            proximityCostMultiplier(minAvoidDist, avoidThresholdMeters, avoidSoftThreshold)
+          );
+        }
       });
     });
   }
@@ -2201,9 +2187,9 @@
     return pairs;
   }
 
-  // clearing a 1000ft (~305m) buffer usually only needs local maneuvering
-  // room, so starting with a margin a few times the buffer itself keeps the
-  // common case fast — but sometimes avoiding a cluster of locations
+  // clearing a location's adjacency buffer usually only needs local
+  // maneuvering room, so starting with a margin a few times the buffer
+  // itself keeps the common case fast — but sometimes avoiding a cluster of locations
   // genuinely does need more room (e.g. detouring a block or two north
   // before heading east), so findAvoidancePath below retries with a wider
   // margin rather than giving up the first time no clear path fits.
@@ -2244,22 +2230,25 @@
     return [...cellMap.values()];
   }
 
-  // past this straight-line distance, fall back to best-effort OSRM routing
-  // instead of attempting the custom router — generous enough for
-  // ultra-distance training routes (chunked fetching + a spatially-indexed
-  // blocking check are what make this workable at this scale at all), while
-  // still bounding how large a single route-planning request can get
+  // past this straight-line distance, this router won't even try — the
+  // route is too long for a browser-side graph search to safely attempt at
+  // all (chunked fetching + a spatially-indexed blocking check are what
+  // make this workable at ultra-distance scale in the first place, but
+  // even those have a limit)
   const MAX_AVOIDANCE_ROUTE_METERS = 80000; // ~50 miles
 
-  // { pairs: [...] } on success, { pairs: null } if every margin attempt
-  // built a graph but found no unblocked path, { cancelled: true } if the
-  // user cancelled an area-loading step, or throws on an operational
-  // failure (network/data issue, or the route is too long to attempt this
-  // way). Retries with a wider margin before giving up — most routes clear
-  // with the first, smallest margin (fast), but some genuinely need more
-  // room to route around a cluster of locations, and a fixed margin can't
-  // tell the difference between "no clear path exists" and "the search
-  // area just wasn't wide enough to find the one that does."
+  // { pairs: [...] } on success (result.isFallback + adjacencyViolationCount
+  // set if this is the last-resort own-graph fallback rather than a route
+  // that avoids every adjacency outright), { pairs: null } if even the
+  // fallback found no path at all connecting start to end, { cancelled:
+  // true } if the user cancelled an area-loading step, or throws on an
+  // operational failure (network/data issue, or the route is too long to
+  // attempt this way). Retries with a wider margin before giving up on the
+  // strict (zero-adjacency) search — most routes clear with the first,
+  // smallest margin (fast), but some genuinely need more room to route
+  // around a cluster of locations, and a fixed margin can't tell the
+  // difference between "no clear path exists" and "the search area just
+  // wasn't wide enough to find the one that does."
   async function findAvoidancePath(a, b){
     const straightLineMeters = haversineMeters(a.lat, a.lng, b.lat, b.lng);
     if(straightLineMeters > MAX_AVOIDANCE_ROUTE_METERS){
@@ -2307,7 +2296,7 @@
         .filter(s=>s.state === 'avoid')
         .map(s=>({ lat: (s.latlngs[0][0]+s.latlngs[1][0])/2, lng: (s.latlngs[0][1]+s.latlngs[1][1])/2 }));
       const poiThresholdMeters = MIN_LOCATION_DISTANCE_FT * 0.3048;
-      markBlockedEdges(graph, locations, avoidPoints, poiThresholdMeters, 12); // 12m tolerance for matching a marked line's real-world position
+      markBlockedEdges(graph, locations, avoidPoints, poiThresholdMeters, 12, true); // 12m tolerance for matching a marked line's real-world position
 
       const startNode = nearestGraphNode(graph.nodeById, a.lat, a.lng);
       const endNode = nearestGraphNode(graph.nodeById, b.lat, b.lng);
@@ -2319,16 +2308,38 @@
       const path = dijkstraPath(graph.adjacency, startNode, endNode);
       if(path) return { pairs: nodePathToPairs(path, graph.nodeById) };
       // no unblocked path within this margin — widen and retry unless this
-      // was already the widest attempt. If the nearest road node to the
-      // start or end point is itself hemmed in (every edge touching it is
-      // blocked), widening the search area can never help — you can't take
-      // a single step from there, regardless of how much room there is
-      // further out. Surface that distinctly on the last attempt rather
-      // than the generic "no route found", since it points at a completely
-      // different fix (a different start/end point, not a wider search).
+      // was already the widest attempt.
       if(isLastAttempt){
+        // If the nearest road node to the start or end point is itself
+        // hemmed in (every edge touching it is blocked), that's worth
+        // surfacing distinctly — it points at a different fix (a different
+        // start/end point) than "no path exists in between."
         const isTrapped = id => !(graph.adjacency.get(id)||[]).some(e=>!e.blocked);
-        return { pairs: null, startTrapped: isTrapped(startNode), endTrapped: isTrapped(endNode) };
+        const startTrapped = isTrapped(startNode), endTrapped = isTrapped(endNode);
+
+        // No route avoids every adjacency outright. Rather than handing
+        // this off to a third-party routing service with no idea marked
+        // lines or locations even exist, fall back to our own graph and
+        // our own data: re-run the exact same widest-attempt graph, but
+        // let adjacency-violating edges be traversed at a steep cost
+        // penalty instead of being flatly forbidden (see
+        // FALLBACK_ADJACENCY_PENALTY) — marked avoid-lines stay an
+        // absolute rule even here. This finds whichever path touches the
+        // fewest, least-bad adjacency violations, rather than a route
+        // picked with zero awareness of any of this.
+        markBlockedEdges(graph, locations, avoidPoints, poiThresholdMeters, 12, false);
+        const fallbackPath = dijkstraPath(graph.adjacency, startNode, endNode);
+        if(fallbackPath){
+          const pairs = nodePathToPairs(fallbackPath, graph.nodeById);
+          let adjacencyViolationCount = 0;
+          for(let i=0;i<fallbackPath.length-1;i++){
+            const edge = (graph.adjacency.get(fallbackPath[i])||[]).find(e=>e.to===fallbackPath[i+1]);
+            if(edge && edge.poiBlocked) adjacencyViolationCount++;
+          }
+          return { pairs, isFallback: true, adjacencyViolationCount };
+        }
+
+        return { pairs: null, startTrapped, endTrapped };
       }
     }
     return { pairs: null };
@@ -2368,18 +2379,6 @@
     if(!loadedCells.has(key)){ loadedCells.add(key); saveLoadedCells(loadedCells); }
   }
 
-  function cellsNeedingLoadForRoute(pairs){
-    const seen = new Map();
-    pairs.forEach(pair=>{
-      pair.forEach(pt=>{
-        const c = cellCenterForLatLng(pt[0], pt[1]);
-        const key = cellKeyForCellCenter(c.lat, c.lng);
-        if(!loadedCells.has(key) && !seen.has(key)) seen.set(key, c);
-      });
-    });
-    return [...seen.values()];
-  }
-
   // sequential (not parallel) on purpose — this can be a lot of cells for a
   // cross-town route, and the same public Overpass mirrors are already
   // sensitive to bursts of concurrent requests
@@ -2417,92 +2416,16 @@
     return { cancelled, failedCount };
   }
 
-  // fallback for when the custom avoidance router can't be used (route too
-  // long, graph fetch failed, etc.), or when the user explicitly asks to
-  // see the closest route anyway after avoidance found nothing possible.
-  // Best-effort only: picks the least-bad of whatever alternatives the free
-  // OSRM demo happens to offer, since it has no concept of an exclusion zone.
-  async function planRouteBestEffort(a, b, note){
-    showHint('Finding a route that avoids marked lines and nearby locations…');
-    try{
-      const routes = await fetchRoute(a,b);
-      const proximityThresholdMeters = MIN_LOCATION_DISTANCE_FT * 0.3048;
-      // best-effort only — this uses whatever locations are already known
-      // going in, which can be incomplete for an alternative that passes
-      // through ground never visited before; the real, complete check runs
-      // below once the chosen route's own areas have all been loaded
-      const knownLocationsSoFar = allKnownLocationsForProximityCheck();
-      let best = null, bestScore = Infinity;
-      routes.forEach(r=>{
-        const pairs = coordsToLatLngPairs(r.geometry.coordinates);
-        const avoidCount = scoreRoute(pairs);
-        const proximityCount = routeProximityViolationCount(pairs, knownLocationsSoFar, proximityThresholdMeters);
-        // marked avoid lines are an explicit safety call, so they always
-        // outweigh generic location proximity when picking an alternative —
-        // proximity only breaks ties between equally-good avoid counts
-        const score = avoidCount * 1000000 + proximityCount;
-        if(score < bestScore){ bestScore = score; best = pairs; }
-      });
-
-      // make sure every area this route passes through has been fully
-      // checked against every data source before showing it — otherwise
-      // you could be routed straight through ground nobody's ever looked at
-      const missingCells = cellsNeedingLoadForRoute(best);
-      let failedCount = 0;
-      if(missingCells.length){
-        showHint('');
-        const result = await loadCellsWithProgress(missingCells);
-        if(result.cancelled){
-          showWarn('Route planning cancelled — some areas along this route hadn\'t been checked yet.', 4000);
-          return;
-        }
-        failedCount = result.failedCount;
-      }
-
-      // clear previous route's neutral (unmarked) segment drawings to avoid clutter,
-      // but keep any that are marked safe/avoid (they persist globally anyway)
-      renderRoutePairs(best);
-      // the route's start/end can be well outside the current view (e.g. two
-      // addresses across town from each other), so always frame the whole
-      // route rather than leaving the map wherever it happened to be
-      map.fitBounds(L.latLngBounds(best.flat()), { padding: [40, 40] });
-
-      // final, authoritative check — every area along this route has now
-      // been loaded, so this reflects the complete picture rather than the
-      // best-effort snapshot used to pick between alternatives above
-      const finalAvoidCount = scoreRoute(best);
-      const finalProximityCount = routeProximityViolationCount(best, allKnownLocationsForProximityCheck(), proximityThresholdMeters);
-
-      const prefix = note ? note + ' ' : '';
-      if(finalAvoidCount > 0){
-        showWarn(`⚠ ${prefix}Could not fully avoid marked lines — this route still crosses ${finalAvoidCount} avoided line${finalAvoidCount>1?'s':''}. Tap red lines below to inspect, or plan a different start/end.`, null);
-      } else if(finalProximityCount > 0){
-        showWarn(`⚠ ${prefix}This route passes within ${MIN_LOCATION_DISTANCE_FT} ft of ${finalProximityCount} location${finalProximityCount>1?'s':''}. RouteGuard can't force a detour around them (the free routing service doesn't support that) — tap pins below to inspect, or plan a different start/end.`, null);
-      } else if(failedCount > 0){
-        showWarn(`⚠ ${prefix}Showing this route, but ${failedCount} area${failedCount>1?'s':''} along it couldn't be checked against location data (connection issue) — consider replanning once you're back online.`, null);
-      } else if(note){
-        showWarn(`⚠ ${note}`, null);
-      } else {
-        showWarn('', null);
-      }
-      showHint('');
-    }catch(err){
-      showHint('');
-      showWarn('Could not fetch a route. Check your internet connection and try again.', 4000);
-    }
-  }
-
-  // primary entry point: try to build a route that's genuinely guaranteed
-  // to stay clear of marked avoid-lines and every known location's buffer.
-  // Falls back to best-effort OSRM routing if the custom router can't be
-  // attempted (route too long, graph fetch failed) — but if it runs
-  // successfully and finds that no such route exists, that's reported
-  // honestly rather than silently substituting a route that violates the
-  // buffer; you can still explicitly ask to see the closest route anyway.
+  // primary (and only) entry point for route planning. findAvoidancePath
+  // itself already falls back internally, on our own graph and our own
+  // data, when no route can avoid every adjacency outright (see
+  // FALLBACK_ADJACENCY_PENALTY) — there's no third-party routing service
+  // involved anywhere in this app anymore, since a service with no idea
+  // marked lines or locations even exist can't be told to route around
+  // them, and routes it back that visibly follow the road centerline
+  // instead of a mapped sidewalk even should one exist alongside it.
   async function planRoute(a,b){
-    const btnShowAnyway = document.getElementById('btnShowRouteAnyway');
-    btnShowAnyway.style.display = 'none';
-    showHint('Building a route that stays clear of marked lines and locations…');
+    showHint('Building a route that avoids being directly adjacent to marked lines and locations…');
     try{
       const result = await findAvoidancePath(a, b);
       if(result.cancelled){
@@ -2512,32 +2435,35 @@
       }
       if(!result.pairs){
         showHint('');
-        // a trapped start/end means widening the search would never have
-        // helped — every road leading away from that exact point is
-        // already within the buffer, so say so plainly instead of implying
-        // a wider search might still find something
+        // Reaching here means even the own-graph fallback (which only
+        // treats adjacency as costly, not forbidden) found no connected
+        // path at all — a genuine data/connectivity gap, not an adjacency
+        // problem, since the fallback would ordinarily route straight
+        // through adjacency violations rather than report nothing.
         let msg;
         if(result.startTrapped && result.endTrapped){
-          msg = `⚠ Both your start and end point are within ${MIN_LOCATION_DISTANCE_FT} ft of a marked line or location on every road leading away from them — there's no way to leave either point without crossing the buffer. Try different start/end points, or view the closest route anyway.`;
+          msg = `⚠ Neither your start nor end point connects to any road data we have. Try different start/end points, or the surrounding area may need to be loaded first.`;
         } else if(result.startTrapped){
-          msg = `⚠ Your start point is within ${MIN_LOCATION_DISTANCE_FT} ft of a marked line or location on every road leading away from it — there's no way to leave without crossing the buffer. Try a different start point, or view the closest route anyway.`;
+          msg = `⚠ Your start point doesn't connect to any road data we have. Try a different start point, or the surrounding area may need to be loaded first.`;
         } else if(result.endTrapped){
-          msg = `⚠ Your end point is within ${MIN_LOCATION_DISTANCE_FT} ft of a marked line or location on every road leading to it — there's no way to reach it without crossing the buffer. Try a different end point, or view the closest route anyway.`;
+          msg = `⚠ Your end point doesn't connect to any road data we have. Try a different end point, or the surrounding area may need to be loaded first.`;
         } else {
-          msg = `⚠ No route between these points stays clear of every marked line and location within ${MIN_LOCATION_DISTANCE_FT} ft. Try a different start/end, or view the closest route anyway.`;
+          msg = `⚠ No connected route exists between these points in the road data we have. Try a different start/end, or the areas in between may need to be loaded first.`;
         }
         showWarn(msg, null);
-        btnShowAnyway.style.display = 'inline-block';
-        btnShowAnyway.onclick = ()=>{ btnShowAnyway.style.display = 'none'; planRouteBestEffort(a, b); };
         return;
       }
       renderRoutePairs(result.pairs);
       map.fitBounds(L.latLngBounds(result.pairs.flat()), { padding: [40, 40] });
-      showWarn('', null);
+      if(result.isFallback){
+        showWarn(`⚠ No route avoids being directly adjacent to every marked line and location — this one still has ${result.adjacencyViolationCount} unavoidable adjacenc${result.adjacencyViolationCount===1?'y':'ies'} (chosen to minimize how many). Tap lines below to inspect, or try a different start/end.`, null);
+      } else {
+        showWarn('', null);
+      }
       showHint('');
     }catch(err){
-      console.error('Custom avoidance routing failed, falling back to best-effort routing:', err);
-      await planRouteBestEffort(a, b, `Couldn't build an exact-avoidance route this time (${err.message||'error'}) — showing the routing service's best option instead.`);
+      showHint('');
+      showWarn(`⚠ Could not build a route (${err.message||'error'}). Check your connection, or try a shorter route.`, null);
     }
   }
 
