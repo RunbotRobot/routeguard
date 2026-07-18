@@ -24,6 +24,8 @@
     --safe:#2f8f5b;
     --avoid:#c1443c;
     --neutral:#5b6472;
+    --walkable:#f0c419;
+    --route:#4ade80;
     --muted:#6b7280;
   }
   *{box-sizing:border-box;}
@@ -216,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.50</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.51</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -336,24 +338,10 @@
       </div>
 
       <div class="section">
-        <h3>Line coloring <b style="font-weight:700;">(new — test carefully)</b></h3>
-        <label class="field-label">Touch mode</label>
-        <select class="field-input" id="paintModeSelect">
-          <option value="pan">Pan (normal map dragging)</option>
-          <option value="gray" style="background:#5b6472;color:#fff;">Paint gray — swipe to unmark</option>
-          <option value="green" style="background:#2f8f5b;color:#fff;">Paint green — swipe to mark safe</option>
-          <option value="red" style="background:#c1443c;color:#fff;">Paint red — swipe to mark avoid</option>
-        </select>
-        <div style="font-size:11px;color:var(--muted);margin-top:4px;">
-          In a paint mode, dragging your finger across lines colors each one it crosses, instead of panning the map. Switch back to "Pan" to move the map normally. Only works zoomed in close — stays as normal panning if you're too far out, so one swipe can't accidentally recolor a huge area. This is brand new — if it feels off, switch back to Pan and let me know what happened.
-        </div>
-      </div>
-
-      <div class="section">
         <h3>Legend</h3>
-        <div class="legend-row"><span class="legend-swatch" style="background:var(--neutral)"></span>Unmarked line</div>
-        <div class="legend-row"><span class="legend-swatch" style="background:var(--safe)"></span>Marked safe</div>
-        <div class="legend-row"><span class="legend-swatch" style="background:var(--avoid)"></span>Marked avoid (never routed)</div>
+        <div class="legend-row"><span class="legend-swatch" style="background:var(--walkable)"></span>Road / path — tap for name</div>
+        <div class="legend-row"><span class="legend-swatch" style="background:var(--route)"></span>Planned route</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px;margin-bottom:4px;">To mark a road to avoid, drop a pin near it instead of coloring the line — the router already treats every pin as ground to stay clear of.</div>
         <div class="legend-row"><span class="legend-pin" style="background:#c1443c"></span>School</div>
         <div class="legend-row"><span class="legend-pin" style="background:#d98c2b"></span>Playground</div>
         <div class="legend-row"><span class="legend-pin" style="background:#8a4fbf"></span>Childcare / home daycare</div>
@@ -441,26 +429,33 @@
 
   // ---------- storage ----------
   const LS_PINS = "rg_pins";
-  const LS_SEGS = "rg_segments";       // user-marked lines only (safe/avoid) — small, safety-critical
   const LS_LINE_CACHE = "rg_line_cache"; // every line geometry ever discovered, regardless of marking
+  const LS_LINE_NAMES = "rg_line_names"; // edge key -> OSM street name, for the tap-for-name popup
   const LS_POI_CACHE = "rg_poi_cache";   // every auto-detected location ever discovered
   const LS_LOADED_CELLS = "rg_loaded_cells"; // grid cells (see TILE_GRID_SIZE) fully checked against every data source
 
   function loadPins(){ try{return JSON.parse(localStorage.getItem(LS_PINS))||[];}catch(e){return [];} }
-  function loadSegs(){ try{return JSON.parse(localStorage.getItem(LS_SEGS))||{};}catch(e){return {};} }
   function loadLineCache(){ try{return JSON.parse(localStorage.getItem(LS_LINE_CACHE))||{};}catch(e){return {};} }
+  function loadLineNames(){ try{return JSON.parse(localStorage.getItem(LS_LINE_NAMES))||{};}catch(e){return {};} }
   function loadPoiCache(){ try{return JSON.parse(localStorage.getItem(LS_POI_CACHE))||{};}catch(e){return {};} }
   function loadLoadedCells(){ try{return new Set(JSON.parse(localStorage.getItem(LS_LOADED_CELLS))||[]);}catch(e){return new Set();} }
 
-  // lineCache/poiCache (every road/POI ever auto-detected, kept forever) are
-  // by far the biggest thing this app stores, and are always safely
-  // re-fetchable — so if a write of safety-critical data (marked lines,
-  // pins) hits the shared localStorage quota, free space by clearing THOSE
+  // marked-line coloring (safe/avoid) is gone — pins are now the only way to
+  // mark ground to avoid — so the old per-line marking store is dead weight;
+  // clean it up rather than leaving an orphaned key behind
+  try{ localStorage.removeItem('rg_segments'); }catch(e){}
+
+  // lineCache/lineNames/poiCache (every road/name/POI ever auto-detected,
+  // kept forever) are by far the biggest thing this app stores, and are
+  // always safely re-fetchable — so if a write of safety-critical data
+  // (pins) hits the shared localStorage quota, free space by clearing THOSE
   // first, never the other way around, then retry once.
   function pruneBulkCachesForSpace(){
     lineCache = {};
+    lineNames = {};
     poiCache = {};
     try{ localStorage.removeItem(LS_LINE_CACHE); }catch(e){}
+    try{ localStorage.removeItem(LS_LINE_NAMES); }catch(e){}
     try{ localStorage.removeItem(LS_POI_CACHE); }catch(e){}
   }
   function isQuotaExceeded(err){
@@ -485,25 +480,26 @@
         showWarn('⚠ Storage was full — cleared cached auto-detected lines/locations (they reload automatically as you revisit areas) to make room for your change.', 6000);
         return true;
       }catch(err2){
-        showWarn('⚠ Could not save your change — storage is full even after clearing cached map data. Try "Clear all data" in settings, or free up space on your device (export a backup first if you want to keep your marked lines/pins).', null);
+        showWarn('⚠ Could not save your change — storage is full even after clearing cached map data. Try "Clear all data" in settings, or free up space on your device (export a backup first if you want to keep your pins).', null);
         return false;
       }
     }
   }
   function savePins(p){ return safeLocalStorageSet(LS_PINS, JSON.stringify(p), true); }
-  function saveSegs(s){ return safeLocalStorageSet(LS_SEGS, JSON.stringify(s), true); }
   function saveLineCache(c){ return safeLocalStorageSet(LS_LINE_CACHE, JSON.stringify(c), false); }
+  function saveLineNames(n){ return safeLocalStorageSet(LS_LINE_NAMES, JSON.stringify(n), false); }
   function savePoiCache(c){ return safeLocalStorageSet(LS_POI_CACHE, JSON.stringify(c), false); }
   function saveLoadedCells(s){ return safeLocalStorageSet(LS_LOADED_CELLS, JSON.stringify([...s]), false); }
 
-  // debounces the (expensive, growing) lineCache/poiCache save so a burst of
-  // many calls in quick succession — dozens of cells loading during one
-  // route-planning corridor fetch — only actually serializes+writes once,
-  // shortly after the burst settles, rather than once per cell
+  // debounces the (expensive, growing) lineCache/lineNames/poiCache save so a
+  // burst of many calls in quick succession — dozens of cells loading during
+  // one route-planning corridor fetch — only actually serializes+writes
+  // once, shortly after the burst settles, rather than once per cell
   let saveCachesTimer = null;
   function flushSaveCaches(){
     if(saveCachesTimer){ clearTimeout(saveCachesTimer); saveCachesTimer = null; }
     saveLineCache(lineCache);
+    saveLineNames(lineNames);
     savePoiCache(poiCache);
   }
   function scheduleSaveCaches(){
@@ -528,8 +524,8 @@
   function saveTileCacheCfg(c){ localStorage.setItem(LS_TILE_CACHE_CFG, JSON.stringify(c)); }
 
   let pins = loadPins();
-  let segments = loadSegs(); // key -> {state:'safe'|'avoid', latlngs:[[lat,lng],[lat,lng]]}
   let lineCache = loadLineCache(); // key -> latlngs — every line ever seen, kept until a fresh fetch of that exact area proves it's gone
+  let lineNames = loadLineNames(); // key -> OSM street name (only set when the way had one)
   let poiCache = loadPoiCache();   // OSM type+id -> {lat,lng,category,label} — every auto-detected location ever seen
   let loadedCells = loadLoadedCells(); // set of "lat,lng" cell-center keys fully checked against OSM data — persists like the caches above
 
@@ -554,8 +550,12 @@
   }
 
   const CATEGORY_COLOR = { school:"#c1443c", playground:"#d98c2b", childcare:"#8a4fbf", community:"#1f9e9e", pool:"#0e9fd0", library:"#8a6d3b", other:"#3b6fd9" };
-  const STATE_COLOR = { neutral:"#5b6472", safe:"#2f8f5b", avoid:"#c1443c" };
-  const ROUTE_CASING_COLOR = "#1c2230"; // bold dark outline marking the current proposed route, vs. the plain white casing on regular lines
+  // no more per-line marking states — every walkable road/path is one
+  // color, and the currently planned route is another; a plain white casing
+  // (same as everything else, see drawSegment) already gives the route
+  // enough contrast against the basemap without a separate bold outline
+  const WALKABLE_COLOR = "#f0c419";
+  const ROUTE_COLOR = "#4ade80";
 
   // ---------- map ----------
   const map = L.map('map', {
@@ -813,12 +813,13 @@
       if(!el.tags) return;
       if(el.tags.highway && el.geometry && el.geometry.length > 1){
         const pts = el.geometry.map(g=>[g.lat, g.lon]);
+        const wayName = el.tags.name || null;
         for(let i=0;i<pts.length-1;i++){
           const pair = [pts[i], pts[i+1]];
           const key = edgeKey(pair[0], pair[1]);
           seenLineKeys.add(key);
           lineCache[key] = pair;
-          const state = segments[key] ? segments[key].state : 'neutral';
+          if(wayName) lineNames[key] = wayName; else if(lineNames[key]) delete lineNames[key];
           // Creating a Leaflet polyline (and its canvas registration, hit
           // target, etc.) is real main-thread work, not just a cheap object
           // literal — doing that for potentially thousands of lines while
@@ -826,11 +827,18 @@
           // hidden by the auto-fit-to-route zoom-out, was wasted work with
           // nothing to show for it. Skip drawing (cache only) while zoomed
           // out past the bulk-display threshold; drawUndrawnBulkContent
-          // catches up the moment it's actually visible. Marked (safe/avoid)
-          // segments are drawn immediately regardless — safety-relevant and
-          // comparatively few.
-          if(state !== 'neutral' || map.getZoom() >= BULK_DISPLAY_MIN_ZOOM){
-            drawSegment(key, pair, state);
+          // catches up the moment it's actually visible.
+          //
+          // A cell overlapping the currently-displayed route can re-report
+          // one of the route's own edges (the same road is legitimately
+          // inside more than one loaded cell) — redrawing it here without
+          // checking routeLayerKeySet would silently revert that stretch
+          // from the route's styling back to an ordinary road's, which is
+          // exactly what made portions of an in-progress route visibly
+          // vanish while panning.
+          const isRoute = routeLayerKeySet.has(key);
+          if(isRoute || map.getZoom() >= BULK_DISPLAY_MIN_ZOOM){
+            drawSegment(key, pair, isRoute);
           }
         }
         return;
@@ -865,20 +873,23 @@
     });
 
     // Reconciliation: within the area we just freshly queried, remove any
-    // previously-cached neutral line or auto-detected pin that this fetch
-    // didn't report — Overpass just authoritatively told us it's not there
-    // anymore. Marked lines (safe/avoid) and pins you've saved permanently
-    // are never touched by this, regardless of what a fetch does or doesn't
-    // report — those only ever change by your own action.
+    // previously-cached line or auto-detected pin that this fetch didn't
+    // report — Overpass just authoritatively told us it's not there anymore.
+    // Pins you've saved permanently are never touched by this, regardless of
+    // what a fetch does or doesn't report — those only ever change by your
+    // own action. Anything currently part of the displayed route is also
+    // exempt, no matter what a fetch reports — losing route styling mid-view
+    // reads as the route itself vanishing, not as a data refresh.
     if(fetchBounds){
       if(!skipReconciliation){
         Object.keys(lineCache).forEach(key=>{
           if(seenLineKeys.has(key)) return;
-          if(segments[key]) return; // marked — never auto-remove
+          if(routeLayerKeySet.has(key)) return;
           const latlngs = lineCache[key];
           const bothInside = latlngs.every(p => fetchBounds.contains(p));
           if(bothInside){
             delete lineCache[key];
+            delete lineNames[key];
             if(segPolylines[key]){ segLayer.removeLayer(segPolylines[key]); delete segPolylines[key]; }
             if(segCasingLines[key]){ segLayer.removeLayer(segCasingLines[key]); delete segCasingLines[key]; }
             if(segHitLines[key]){ segHitLayer.removeLayer(segHitLines[key]); delete segHitLines[key]; }
@@ -925,8 +936,7 @@
   // load, before any network request even starts — no blank map while waiting
   function renderCachedLinesAndPois(){
     Object.keys(lineCache).forEach(key=>{
-      const state = segments[key] ? segments[key].state : 'neutral';
-      drawSegment(key, lineCache[key], state);
+      drawSegment(key, lineCache[key], false); // no route exists yet at initial draw
     });
     Object.keys(poiCache).forEach(key=>{
       const p = poiCache[key];
@@ -958,8 +968,10 @@
       const budgetEnd = performance.now() + 12; // leave room in the frame for an actual repaint
       while(li < lineKeys.length && performance.now() < budgetEnd){
         const key = lineKeys[li++];
-        const state = segments[key] ? segments[key].state : 'neutral';
-        drawSegment(key, lineCache[key], state);
+        // route edges are drawn immediately by renderRoutePairs and already
+        // have a segPolylines entry by the time this runs, so anything
+        // reaching here is never part of the current route
+        drawSegment(key, lineCache[key], false);
       }
       while(pi < poiKeys.length && performance.now() < budgetEnd){
         const key = poiKeys[pi++];
@@ -1535,7 +1547,7 @@
   map.createPane('routeLinesPane');
   map.getPane('routeLinesPane').style.zIndex = 410; // above bulk lines, so the active route always draws on top
 
-  const BULK_DISPLAY_MIN_ZOOM = MIN_ZOOM_FOR_AUTO; // same "too much to matter" threshold used for auto-loading/paint mode
+  const BULK_DISPLAY_MIN_ZOOM = MIN_ZOOM_FOR_AUTO; // same "too much to matter" threshold used for auto-loading
   function updateBulkDisplay(){
     const show = map.getZoom() >= BULK_DISPLAY_MIN_ZOOM;
     const wasHidden = map.getPane('bulkLinesPane').style.display === 'none';
@@ -1557,15 +1569,13 @@
 
   const segCasingLines = {}; // key -> white outline drawn beneath the colored line, for contrast on any background
 
-  function segColor(state){ return STATE_COLOR[state] || STATE_COLOR.neutral; }
-
   // Line weight is tuned to look right around zoom 17 (close-up, running-level
   // detail). Zooming out compresses real-world distance per pixel, so a fixed
   // pixel weight makes roads look thick and bunched together — scale it down
   // as you zoom out, with a floor so lines never fully disappear.
   const SEG_REFERENCE_ZOOM = 17;
-  function segWeightsForZoom(state, zoom){
-    const base = state === 'neutral' ? 5 : 7;
+  function segWeightsForZoom(isRoute, zoom){
+    const base = isRoute ? 7 : 5;
     const scale = Math.max(0.28, Math.min(1.4, Math.pow(1.4, (zoom - SEG_REFERENCE_ZOOM) / 2)));
     const weight = Math.max(1.2, base * scale);
     const casing = weight + Math.max(1, 3 * scale);
@@ -1581,31 +1591,26 @@
     return Math.max(5, Math.round(baseSize * scale));
   }
 
-  function drawSegment(key, latlngs, state, isRoute){
+  function drawSegment(key, latlngs, isRoute){
     if(segCasingLines[key]){ segLayer.removeLayer(segCasingLines[key]); }
     if(segPolylines[key]){ segLayer.removeLayer(segPolylines[key]); }
 
-    const { weight, casing: casingWeight } = segWeightsForZoom(state, map.getZoom());
+    const { weight, casing: casingWeight } = segWeightsForZoom(isRoute, map.getZoom());
     // route segments draw onto their own always-visible canvas (routeSegRenderer)
     // so the proposed route stays on screen even when the bulk lines pane gets
     // hidden at low zoom — see updateBulkDisplay above
     const renderer = isRoute ? routeSegRenderer : segRenderer;
     // a white outline underneath guarantees the colored line reads clearly
     // even over busy basemap art (transit lines, other roads, etc.) — the
-    // current proposed route instead gets a bold dark outline so it stands
-    // out from ordinary lines sharing the same fill color (e.g. a neutral
-    // route segment would otherwise be indistinguishable from any other
-    // unmarked line already on the map)
+    // walkable/route color difference is enough to tell them apart on its
+    // own, so both get the same plain casing treatment
     const casing = L.polyline(latlngs, {
-      renderer,
-      color: isRoute ? ROUTE_CASING_COLOR : '#fff',
-      weight: isRoute ? casingWeight + 3 : casingWeight,
-      opacity: isRoute ? 1 : 0.9, interactive:false
+      renderer, color: '#fff', weight: casingWeight, opacity: 0.9, interactive:false
     }).addTo(segLayer);
     segCasingLines[key] = casing;
 
     const pl = L.polyline(latlngs, {
-      renderer, color: segColor(state), weight, opacity: 1,
+      renderer, color: isRoute ? ROUTE_COLOR : WALKABLE_COLOR, weight, opacity: 1,
       interactive: false // clicks are handled by the wider invisible hit-line below
     }).addTo(segLayer);
     segPolylines[key] = pl;
@@ -1618,8 +1623,7 @@
       }).addTo(segHitLayer);
       hit.on('click', (e)=>{
         L.DomEvent.stopPropagation(e);
-        if(paintMode !== 'pan') return; // handled by the paint-drag logic instead
-        cycleSegment(key, latlngs);
+        showSegmentNamePopup(key, e.latlng);
       });
       // long-press (or right-click on desktop) identifies the spot instead of
       // cycling its color — kept separate so it never slows down quick tapping
@@ -1669,188 +1673,95 @@
     }
   }
 
-  // ---------- paint mode: swipe across lines to color them ----------
-  let paintMode = 'pan';
-  let painting = false;
-  let paintMoveThrottle = 0;
-  const PAINT_HIT_PX = 18;
-  const PAINT_MIN_ZOOM = MIN_ZOOM_FOR_AUTO; // same threshold as auto-loading — below this, way too much
-                                             // ground is visible per pixel to risk a swipe touching lines
-                                             // far outside where you meant to color
-  const PAINT_STATE_MAP = { gray: 'neutral', green: 'safe', red: 'avoid' };
-  const PAINT_COLOR = { pan: '', gray: STATE_COLOR.neutral, green: STATE_COLOR.safe, red: STATE_COLOR.avoid };
-
-  function pointToSegmentDistPx(p, a, b){
-    const dx = b.x - a.x, dy = b.y - a.y;
-    const lengthSq = dx*dx + dy*dy;
-    if(lengthSq === 0) return Math.hypot(p.x - a.x, p.y - a.y);
-    let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / lengthSq;
-    t = Math.max(0, Math.min(1, t));
-    return Math.hypot(p.x - (a.x + t*dx), p.y - (a.y + t*dy));
-  }
-
-  function applyPaintAt(containerPoint){
-    try{
-      if(map.getZoom() < PAINT_MIN_ZOOM) return; // redundant safety check, see updateDraggingForPaintMode
-      const targetState = PAINT_STATE_MAP[paintMode];
-      if(!targetState) return; // paintMode is 'pan' — nothing to do
-      let bestKey = null, bestDist = PAINT_HIT_PX;
-      Object.keys(lineCache).forEach(key=>{
-        const latlngs = lineCache[key];
-        if(!latlngs || latlngs.length < 2) return;
-        const a = map.latLngToContainerPoint(latlngs[0]);
-        const b = map.latLngToContainerPoint(latlngs[1]);
-        const d = pointToSegmentDistPx(containerPoint, a, b);
-        if(d < bestDist){ bestDist = d; bestKey = key; }
-      });
-      if(!bestKey) return;
-      const cur = segments[bestKey] ? segments[bestKey].state : 'neutral';
-      if(cur === targetState) return;
-      if(targetState === 'neutral'){ delete segments[bestKey]; }
-      else { segments[bestKey] = { state: targetState, latlngs: lineCache[bestKey] }; }
-      // draw first so the stroke always visibly takes effect immediately,
-      // regardless of whether persisting it below runs into trouble
-      drawSegment(bestKey, lineCache[bestKey], targetState);
-      saveSegs(segments);
-    }catch(err){
-      console.error('Paint mode hit an error (non-fatal):', err);
-    }
-  }
-
-  // Only actually disable map dragging when a color mode is selected AND
-  // you're zoomed in close enough for painting to be safe. Otherwise dragging
-  // stays on, so you're never stuck unable to pan.
-  function updateDraggingForPaintMode(){
-    const zoomOk = map.getZoom() >= PAINT_MIN_ZOOM;
-    if(paintMode !== 'pan' && zoomOk){
-      map.dragging.disable();
+  // tapping a road shows its name straight from the cached OSM tag when we
+  // have one — instant, no network round-trip. Unnamed ways (alleys,
+  // unclassified tracks) fall back to the same reverse-geocode lookup as a
+  // long-press, since that's often still able to describe the spot even
+  // without a street name on file.
+  function showSegmentNamePopup(key, latlng){
+    const name = lineNames[key];
+    if(name){
+      L.popup({maxWidth: 220})
+        .setLatLng(latlng)
+        .setContent(`<div style="font-size:12.5px;"><b>${escapeHtml(name)}</b></div>`)
+        .openOn(map);
     } else {
-      map.dragging.enable();
-    }
-    if(paintMode !== 'pan' && !zoomOk){
-      showWarn('Zoom in closer to use paint mode — staying zoomed out risks accidentally coloring a huge area in one swipe.', 4000);
+      showIdentifyPopup(latlng);
     }
   }
 
-  const paintModeSelect = document.getElementById('paintModeSelect');
-  paintModeSelect.addEventListener('change', ()=>{
-    paintMode = paintModeSelect.value;
-    paintModeSelect.style.background = PAINT_COLOR[paintMode] || '';
-    paintModeSelect.style.color = paintMode === 'pan' ? '' : '#fff';
-    updateDraggingForPaintMode();
-  });
-  map.on('zoomend', updateDraggingForPaintMode);
-
-  // Direct DOM listeners on the map container, not Leaflet's synthetic map
-  // events — those route through the same internal relay as the drag handler,
-  // and with dragging disabled that relay apparently doesn't forward touch
-  // gestures as mouse events at all (confirmed: dragging correctly stopped,
-  // but paint never fired either). This bypasses that entirely.
-  const mapContainerEl = map.getContainer();
-
-  function eventToContainerPoint(evt){
-    const touch = evt.touches && evt.touches[0];
-    const clientX = touch ? touch.clientX : evt.clientX;
-    const clientY = touch ? touch.clientY : evt.clientY;
-    const rect = mapContainerEl.getBoundingClientRect();
-    return L.point(clientX - rect.left, clientY - rect.top);
+  // Runs a batch of per-item work spread across animation frames instead of
+  // one synchronous pass, same pattern as drawUndrawnBulkContent — for a
+  // wide loaded area (thousands of cached lines/pins), doing this inline in
+  // a zoomend handler was exactly why zooming in/out froze panning input for
+  // several seconds: one giant main-thread loop calling .setStyle()/
+  // .setIcon() on every item that's ever been drawn, whether or not it's
+  // anywhere near the current viewport. Returns a token whose .cancelled
+  // flag can be set to stop a stale batch early (see callers below).
+  function runChunked(items, perItem, budgetMs){
+    const token = { cancelled: false };
+    let i = 0;
+    function step(){
+      if(token.cancelled) return;
+      const end = performance.now() + (budgetMs || 12);
+      while(i < items.length && performance.now() < end){
+        perItem(items[i++]);
+      }
+      if(i < items.length) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+    return token;
   }
-  function paintPointerDown(evt){
-    if(paintMode === 'pan' || map.getZoom() < PAINT_MIN_ZOOM) return;
-    painting = true;
-    applyPaintAt(eventToContainerPoint(evt));
-    if(evt.cancelable) evt.preventDefault();
-  }
-  function paintPointerMove(evt){
-    if(!painting || paintMode === 'pan') return;
-    const now = Date.now();
-    if(now - paintMoveThrottle < 40) return; // throttle — swiping can fire many events per second
-    paintMoveThrottle = now;
-    applyPaintAt(eventToContainerPoint(evt));
-    if(evt.cancelable) evt.preventDefault();
-  }
-  function paintPointerEnd(){ painting = false; }
-
-  mapContainerEl.addEventListener('mousedown', paintPointerDown);
-  mapContainerEl.addEventListener('mousemove', paintPointerMove);
-  mapContainerEl.addEventListener('mouseup', paintPointerEnd);
-  mapContainerEl.addEventListener('touchstart', paintPointerDown, {passive:false});
-  mapContainerEl.addEventListener('touchmove', paintPointerMove, {passive:false});
-  mapContainerEl.addEventListener('touchend', paintPointerEnd);
-  mapContainerEl.addEventListener('touchcancel', paintPointerEnd);
 
   // rescale every existing line's thickness as you zoom, rather than only
   // newly-drawn ones — cheap: just updates stroke width, doesn't recreate
-  // anything. The route itself is always rescaled (it's always visible and
-  // there are at most a few dozen of its segments); the bulk of ordinary
-  // cached lines is skipped entirely while its pane is hidden (see
-  // updateBulkDisplay) — rescaling potentially thousands of invisible lines
-  // on every zoom step was real, measurable work even though nothing was on
-  // screen to show for it, and was a big part of why panning/zooming still
-  // felt sluggish after "Show anyway" even with the pane hidden.
+  // anything. The route itself is small (at most a few dozen segments) and
+  // rescaled immediately/synchronously; the much larger bulk of ordinary
+  // cached lines is chunked (see runChunked) and skipped entirely while its
+  // pane is hidden (see updateBulkDisplay).
+  let pendingLineRescale = null;
   map.on('zoomend', ()=>{
     const zoom = map.getZoom();
+    const routeStyle = segWeightsForZoom(true, zoom);
     routeLayerKeys.forEach(key=>{
       if(!segPolylines[key]) return;
-      const state = segments[key] ? segments[key].state : 'neutral';
-      const { weight, casing } = segWeightsForZoom(state, zoom);
-      segPolylines[key].setStyle({ weight });
-      if(segCasingLines[key]) segCasingLines[key].setStyle({ weight: casing + 3 });
+      segPolylines[key].setStyle({ weight: routeStyle.weight });
+      if(segCasingLines[key]) segCasingLines[key].setStyle({ weight: routeStyle.casing });
     });
-    if(map.getZoom() < BULK_DISPLAY_MIN_ZOOM) return;
-    Object.keys(segPolylines).forEach(key=>{
-      if(routeLayerKeys.includes(key)) return; // already handled above
-      const state = segments[key] ? segments[key].state : 'neutral';
-      const { weight, casing } = segWeightsForZoom(state, zoom);
-      segPolylines[key].setStyle({ weight });
-      if(segCasingLines[key]) segCasingLines[key].setStyle({ weight: casing });
+    if(pendingLineRescale) pendingLineRescale.cancelled = true;
+    if(zoom < BULK_DISPLAY_MIN_ZOOM) return;
+    const bulkStyle = segWeightsForZoom(false, zoom);
+    const bulkKeys = Object.keys(segPolylines).filter(key=>!routeLayerKeySet.has(key));
+    pendingLineRescale = runChunked(bulkKeys, (key)=>{
+      segPolylines[key].setStyle({ weight: bulkStyle.weight });
+      if(segCasingLines[key]) segCasingLines[key].setStyle({ weight: bulkStyle.casing });
     });
   });
 
   // same idea for pin/marker diameter — rebuild each icon at the new size
   // rather than only sizing newly-drawn ones. pinLayer (your own saved pins)
-  // is always resized — it's small and always visible. The bulk auto-
-  // detected/official pins are skipped while their pane is hidden, for the
-  // same reason as the bulk lines above.
+  // is always resized immediately — it's small and always visible. The bulk
+  // auto-detected/official pins are chunked and skipped while their pane is
+  // hidden, for the same reason as the bulk lines above.
+  let pendingPinRescale = null;
   map.on('zoomend', ()=>{
     pinLayer.eachLayer(m=>{
       if(!m.pinMeta) return;
       m.setIcon(pinIcon(m.pinMeta.color, m.pinMeta.dashed));
     });
+    if(pendingPinRescale) pendingPinRescale.cancelled = true;
     if(map.getZoom() < BULK_DISPLAY_MIN_ZOOM) return;
-    [autoPinLayer, officialPinLayer].forEach(layer=>{
-      layer.eachLayer(m=>{
-        if(!m.pinMeta) return;
-        m.setIcon(m.pinMeta.official ? officialPinIcon(m.pinMeta.color) : pinIcon(m.pinMeta.color, m.pinMeta.dashed));
-      });
+    const bulkMarkers = [];
+    [autoPinLayer, officialPinLayer].forEach(layer=>layer.eachLayer(m=>{ if(m.pinMeta) bulkMarkers.push(m); }));
+    pendingPinRescale = runChunked(bulkMarkers, (m)=>{
+      m.setIcon(m.pinMeta.official ? officialPinIcon(m.pinMeta.color) : pinIcon(m.pinMeta.color, m.pinMeta.dashed));
     });
   });
 
-  function cycleSegment(key, latlngs){
-    const cur = segments[key] ? segments[key].state : 'neutral';
-    const next = cur === 'neutral' ? 'safe' : cur === 'safe' ? 'avoid' : 'neutral';
-    if(next === 'neutral'){
-      delete segments[key];
-    } else {
-      segments[key] = { state: next, latlngs: latlngs };
-    }
-    // draw first so the tap always visibly takes effect immediately,
-    // regardless of whether persisting it below runs into trouble
-    drawSegment(key, latlngs, next);
-    lineCache[key] = latlngs;
-    saveLineCache(lineCache);
-    saveSegs(segments);
-  }
-
-  function renderStoredSegments(){
-    Object.keys(segments).forEach(k=>{
-      drawSegment(k, segments[k].latlngs, segments[k].state);
-    });
-  }
-
   // ---------- routing (our own graph — no third-party routing service) ----------
   let routeClicks = [];
-  let routeLayerKeys = []; // keys drawn for the *current* route so we can clear neutral ones on replan
+  let routeLayerKeys = []; // keys drawn for the *current* route so we can revert old ones on replan
+  let routeLayerKeySet = new Set(); // same, as a Set — cheap membership checks from applyOverpassResults etc.
   const startEndLayer = L.layerGroup().addTo(map);
 
   // ---------- keep routes clear of nearby locations ----------
@@ -1918,17 +1829,16 @@
   }
   // ---------- custom avoidance router ----------
   // No third-party routing service is involved anywhere in this app — a
-  // service with no idea marked lines or locations even exist can't be
-  // told to route around them, and a "best-effort, pick the least-bad
-  // alternative" approach on top of it can still hand back a route that
-  // runs right along the edge of, or across the street from, a location.
-  // This builds our own routable graph and runs our own pathfinding,
-  // treating any edge within the buffer of a known location or marked
-  // avoid-line as impassable. The graph is built read-only from lineCache
-  // (populated by the same area-loading step this needs to run anyway for
-  // the blocking check) rather than a second fetch — it never writes to
-  // lineCache/segments/drawSegment, so the already-working line-marking/
-  // display pipeline is untouched.
+  // service with no idea marked locations even exist can't be told to
+  // route around them, and a "best-effort, pick the least-bad alternative"
+  // approach on top of it can still hand back a route that runs right along
+  // the edge of, or across the street from, a location. This builds our own
+  // routable graph and runs our own pathfinding, treating any edge within
+  // the buffer of a known location (every pin, manual or auto-detected) as
+  // impassable. The graph is built read-only from lineCache (populated by
+  // the same area-loading step this needs to run anyway for the blocking
+  // check) rather than a second fetch — it never writes to lineCache/
+  // drawSegment, so the already-working display pipeline is untouched.
 
   // Builds the routing graph directly from lineCache instead of a separate
   // fetch. lineCache already holds every road segment the POI-loading step
@@ -2027,28 +1937,24 @@
   // replacing it
   const FALLBACK_ADJACENCY_PENALTY = 50;
 
-  // marks every edge that comes within the buffer of a known location or a
-  // marked avoid-line, and separately scores how close it passes (see
-  // proximityCostMultiplier above) so the pathfinder can prefer more
-  // clearance among otherwise-legal routes. Checked at both endpoints and
-  // the midpoint — edges between consecutive OSM nodes are typically
+  // marks every edge that comes within the buffer of a known location
+  // (every pin, manual or auto-detected, is one — there's no separate
+  // marked-line concept anymore), and separately scores how close it
+  // passes (see proximityCostMultiplier above) so the pathfinder can prefer
+  // more clearance among otherwise-legal routes. Checked at both endpoints
+  // and the midpoint — edges between consecutive OSM nodes are typically
   // short, so this is a good approximation of "does any part of this edge
   // intrude".
   //
-  // strict (default true) controls whether adjacency to a POI is a hard
-  // block or a steep-but-passable cost — marked avoid-lines are always a
-  // hard block either way, since those are an explicit, deliberate safety
-  // call rather than an automatically-detected location, and softening
-  // them would mean silently routing through ground you specifically
-  // marked off-limits. findAvoidancePath uses strict=false only for its
-  // last-resort fallback pass, once every strict attempt has failed.
-  function markBlockedEdges(graph, locations, avoidPoints, poiThresholdMeters, avoidThresholdMeters, strict){
+  // strict (default true) controls whether adjacency to a location is a
+  // hard block or a steep-but-passable cost. findAvoidancePath uses
+  // strict=false only for its last-resort fallback pass, once every strict
+  // attempt has failed.
+  function markBlockedEdges(graph, locations, poiThresholdMeters, strict){
     if(strict === undefined) strict = true;
     const { nodeById, adjacency } = graph;
     const locationIndex = buildLocationIndex(locations);
-    const avoidIndex = buildLocationIndex(avoidPoints);
     const poiSoftThreshold = poiThresholdMeters * POI_SOFT_BUFFER_MULTIPLIER;
-    const avoidSoftThreshold = avoidThresholdMeters * POI_SOFT_BUFFER_MULTIPLIER;
     adjacency.forEach((edges, fromId)=>{
       const a = nodeById.get(fromId);
       if(!a) return;
@@ -2065,30 +1971,14 @@
             if(d < poiThresholdMeters){ poiBlocked = true; break outerLoc; }
           }
         }
-        // avoid-lines are always checked, regardless of the POI result —
-        // they're never softened, so skipping this when poiBlocked is
-        // already true (like the POI/avoid short-circuit used to) isn't
-        // available anymore now that poiBlocked alone doesn't decide
-        // edge.blocked
-        let minAvoidDist = Infinity, avoidBlocked = false;
-        outerAvoid: for(const av of nearbyIndexedPoints(avoidIndex, midLat, midLng)){
-          for(const [plat,plng] of checkPts){
-            const d = haversineMeters(plat, plng, av.lat, av.lng);
-            if(d < minAvoidDist) minAvoidDist = d;
-            if(d < avoidThresholdMeters){ avoidBlocked = true; break outerAvoid; }
-          }
-        }
         edge.poiBlocked = poiBlocked;
-        edge.blocked = avoidBlocked || (strict && poiBlocked);
+        edge.blocked = strict && poiBlocked;
         if(edge.blocked){
           edge.costMultiplier = 1;
         } else if(poiBlocked){
           edge.costMultiplier = FALLBACK_ADJACENCY_PENALTY;
         } else {
-          edge.costMultiplier = Math.max(
-            proximityCostMultiplier(minPoiDist, poiThresholdMeters, poiSoftThreshold),
-            proximityCostMultiplier(minAvoidDist, avoidThresholdMeters, avoidSoftThreshold)
-          );
+          edge.costMultiplier = proximityCostMultiplier(minPoiDist, poiThresholdMeters, poiSoftThreshold);
         }
       });
     });
@@ -2292,11 +2182,8 @@
       }
 
       const locations = allKnownLocationsForProximityCheck();
-      const avoidPoints = Object.values(segments)
-        .filter(s=>s.state === 'avoid')
-        .map(s=>({ lat: (s.latlngs[0][0]+s.latlngs[1][0])/2, lng: (s.latlngs[0][1]+s.latlngs[1][1])/2 }));
       const poiThresholdMeters = MIN_LOCATION_DISTANCE_FT * 0.3048;
-      markBlockedEdges(graph, locations, avoidPoints, poiThresholdMeters, 12, true); // 12m tolerance for matching a marked line's real-world position
+      markBlockedEdges(graph, locations, poiThresholdMeters, true);
 
       const startNode = nearestGraphNode(graph.nodeById, a.lat, a.lng);
       const endNode = nearestGraphNode(graph.nodeById, b.lat, b.lng);
@@ -2319,15 +2206,14 @@
 
         // No route avoids every adjacency outright. Rather than handing
         // this off to a third-party routing service with no idea marked
-        // lines or locations even exist, fall back to our own graph and
-        // our own data: re-run the exact same widest-attempt graph, but
-        // let adjacency-violating edges be traversed at a steep cost
-        // penalty instead of being flatly forbidden (see
-        // FALLBACK_ADJACENCY_PENALTY) — marked avoid-lines stay an
-        // absolute rule even here. This finds whichever path touches the
-        // fewest, least-bad adjacency violations, rather than a route
-        // picked with zero awareness of any of this.
-        markBlockedEdges(graph, locations, avoidPoints, poiThresholdMeters, 12, false);
+        // locations even exist, fall back to our own graph and our own
+        // data: re-run the exact same widest-attempt graph, but let
+        // adjacency-violating edges be traversed at a steep cost penalty
+        // instead of being flatly forbidden (see FALLBACK_ADJACENCY_PENALTY).
+        // This finds whichever path touches the fewest, least-bad adjacency
+        // violations, rather than a route picked with zero awareness of any
+        // of this.
+        markBlockedEdges(graph, locations, poiThresholdMeters, false);
         const fallbackPath = dijkstraPath(graph.adjacency, startNode, endNode);
         if(fallbackPath){
           const pairs = nodePathToPairs(fallbackPath, graph.nodeById);
@@ -2421,11 +2307,11 @@
   // data, when no route can avoid every adjacency outright (see
   // FALLBACK_ADJACENCY_PENALTY) — there's no third-party routing service
   // involved anywhere in this app anymore, since a service with no idea
-  // marked lines or locations even exist can't be told to route around
-  // them, and routes it back that visibly follow the road centerline
-  // instead of a mapped sidewalk even should one exist alongside it.
+  // marked locations even exist can't be told to route around them, and
+  // routes it back that visibly follow the road centerline instead of a
+  // mapped sidewalk even should one exist alongside it.
   async function planRoute(a,b){
-    showHint('Building a route that avoids being directly adjacent to marked lines and locations…');
+    showHint('Building a route that avoids being directly adjacent to known locations…');
     try{
       const result = await findAvoidancePath(a, b);
       if(result.cancelled){
@@ -2456,7 +2342,7 @@
       renderRoutePairs(result.pairs);
       map.fitBounds(L.latLngBounds(result.pairs.flat()), { padding: [40, 40] });
       if(result.isFallback){
-        showWarn(`⚠ No route avoids being directly adjacent to every marked line and location — this one still has ${result.adjacencyViolationCount} unavoidable adjacenc${result.adjacencyViolationCount===1?'y':'ies'} (chosen to minimize how many). Tap lines below to inspect, or try a different start/end.`, null);
+        showWarn(`⚠ No route avoids being directly adjacent to every known location — this one still has ${result.adjacencyViolationCount} unavoidable adjacenc${result.adjacencyViolationCount===1?'y':'ies'} (chosen to minimize how many). Tap pins below to inspect, or try a different start/end.`, null);
       } else {
         showWarn('', null);
       }
@@ -2468,24 +2354,21 @@
   }
 
   function renderRoutePairs(pairs){
-    const newKeys = [];
-    pairs.forEach(pair=>{
-      const key = edgeKey(pair[0], pair[1]);
-      const state = segments[key] ? segments[key].state : 'neutral';
-      // store neutral segments too (as geometry cache) so future overlapping routes recognize them,
-      // but don't persist neutral to localStorage — only draw them
-      drawSegment(key, pair, state, true);
-      newKeys.push(key);
+    const newKeys = pairs.map(pair=>edgeKey(pair[0], pair[1]));
+    // set this before drawing so any concurrent applyOverpassResults call
+    // (a background cell load finishing mid-view) already sees the new
+    // route membership rather than a stale one
+    routeLayerKeySet = new Set(newKeys);
+    pairs.forEach((pair, i)=>{
+      drawSegment(newKeys[i], pair, true);
     });
     // revert any segments from a previous route that aren't part of this one
-    // back to their normal (non-bold) appearance, so the bold outline always
-    // reflects only the currently-displayed route
+    // back to their normal (non-route) appearance
     routeLayerKeys.forEach(key=>{
-      if(newKeys.includes(key)) return;
+      if(routeLayerKeySet.has(key)) return;
       const existing = segPolylines[key];
       if(!existing) return;
-      const state = segments[key] ? segments[key].state : 'neutral';
-      drawSegment(key, existing.getLatLngs(), state, false);
+      drawSegment(key, existing.getLatLngs(), false);
     });
     routeLayerKeys = newKeys;
   }
@@ -3084,7 +2967,7 @@ ${pts}
 
   // ---------- export / import / clear ----------
   document.getElementById('btnExport').onclick = ()=>{
-    const data = { pins, segments, lineCache, poiCache, exportedAt: new Date().toISOString(), version: 'routeguard-1' };
+    const data = { pins, lineCache, lineNames, poiCache, exportedAt: new Date().toISOString(), version: 'routeguard-1' };
     const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -3116,22 +2999,16 @@ ${pts}
             if(!dup){ pins.push({lat:p.lat, lng:p.lng, category:p.category||'other', label:p.label||''}); addedPins++; }
           });
         }
-        // marked lines: merge, never overwrite a line already marked locally
-        if(data.segments && typeof data.segments === 'object'){
-          Object.keys(data.segments).forEach(key=>{
-            if(segments[key]) return;
-            const entry = data.segments[key];
-            if(entry && entry.state && Array.isArray(entry.latlngs)){
-              segments[key] = entry;
-              lineCache[key] = entry.latlngs;
-              addedLines++;
-            }
-          });
-        }
         // full line geometry cache
         if(data.lineCache && typeof data.lineCache === 'object'){
           Object.keys(data.lineCache).forEach(key=>{
             if(!lineCache[key]){ lineCache[key] = data.lineCache[key]; addedLines++; }
+          });
+        }
+        // street names for that geometry (older backups won't have this — harmless if absent)
+        if(data.lineNames && typeof data.lineNames === 'object'){
+          Object.keys(data.lineNames).forEach(key=>{
+            if(!lineNames[key]) lineNames[key] = data.lineNames[key];
           });
         }
         // auto-detected POI cache
@@ -3141,9 +3018,8 @@ ${pts}
           });
         }
 
-        savePins(pins); saveSegs(segments); saveLineCache(lineCache); savePoiCache(poiCache);
+        savePins(pins); saveLineCache(lineCache); saveLineNames(lineNames); savePoiCache(poiCache);
         renderPins();
-        renderStoredSegments();
         renderCachedLinesAndPois();
         showWarn(`Imported: ${addedPins} pin${addedPins===1?'':'s'}, ${addedLines} line${addedLines===1?'':'s'}, ${addedPois} location${addedPois===1?'':'s'} added. Existing data was kept, not replaced.`, 6000);
       }catch(err){
@@ -3156,8 +3032,8 @@ ${pts}
 
   document.getElementById('btnClear').onclick = ()=>{
     if(document.getElementById('btnClear').dataset.confirm === '1'){
-      pins = []; segments = {}; lineCache = {}; poiCache = {};
-      savePins(pins); saveSegs(segments); saveLineCache(lineCache); savePoiCache(poiCache);
+      pins = []; lineCache = {}; lineNames = {}; poiCache = {};
+      savePins(pins); saveLineCache(lineCache); saveLineNames(lineNames); savePoiCache(poiCache);
       // loadedCells records "this area has already been checked" — leaving
       // it in place after wiping the actual location/line data would let
       // the auto-load skip re-fetching (see loadNearbyData) and report the
@@ -3175,6 +3051,8 @@ ${pts}
       Object.keys(segPolylines).forEach(k=>delete segPolylines[k]);
       Object.keys(segCasingLines).forEach(k=>delete segCasingLines[k]);
       Object.keys(segHitLines).forEach(k=>delete segHitLines[k]);
+      routeLayerKeys = [];
+      routeLayerKeySet = new Set();
       autoPinLayer.clearLayers();
       Object.keys(autoPinMarkers).forEach(k=>delete autoPinMarkers[k]);
       lastLoadedBounds = null;
@@ -3196,8 +3074,7 @@ ${pts}
 
   // ---------- init ----------
   renderPins();
-  renderStoredSegments();   // marked lines (safe/avoid) — always drawn regardless of cache, since this is the safety-critical data
-  renderCachedLinesAndPois(); // everything else ever seen — instant, no waiting on a network fetch
+  renderCachedLinesAndPois(); // everything ever seen — instant, no waiting on a network fetch
   renderUnloadedOverlay();
   updateBulkDisplay(); // match initial pane visibility to whatever zoom the map opens at
   // A full localStorage scan (every key's string length) is real synchronous
