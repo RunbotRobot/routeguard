@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.52</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.53</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -494,13 +494,38 @@
   // debounces the (expensive, growing) lineCache/lineNames/poiCache save so a
   // burst of many calls in quick succession — dozens of cells loading during
   // one route-planning corridor fetch — only actually serializes+writes
-  // once, shortly after the burst settles, rather than once per cell
+  // once, shortly after the burst settles, rather than once per cell.
+  //
+  // loadedCells is saved in this SAME flush, not separately — a cell being
+  // marked "fully checked" has to succeed or fail together with the data it
+  // supposedly checked. Previously loadedCells was persisted immediately
+  // and synchronously per cell (see markCellsLoadedForBounds/
+  // ensureCellLoaded) while the much bigger lineCache/poiCache write here
+  // was debounced and could silently fail if it happened to push the
+  // origin over its localStorage quota (isCritical=false skips the write
+  // rather than erroring loudly, since it's normally just re-fetchable
+  // cache) — meaning a big fresh area (an ultra-distance route through
+  // never-visited territory) could end up "verified checked" in permanent
+  // storage with none of the actual road/location data behind it ever
+  // making it to disk. A refresh after that would trust the empty result
+  // as a real all-clear and never re-check. Saving them together and
+  // warning loudly on any failure closes that gap.
   let saveCachesTimer = null;
   function flushSaveCaches(){
     if(saveCachesTimer){ clearTimeout(saveCachesTimer); saveCachesTimer = null; }
-    saveLineCache(lineCache);
-    saveLineNames(lineNames);
-    savePoiCache(poiCache);
+    const lineOk = saveLineCache(lineCache);
+    const namesOk = saveLineNames(lineNames);
+    const poiOk = savePoiCache(poiCache);
+    // loadedCells's own write is small and would likely succeed even when
+    // the much bigger lineCache/poiCache write above just failed on quota —
+    // only actually attempt (and let it succeed at) persisting loadedCells
+    // once the data it's supposed to represent is confirmed saved too,
+    // otherwise this wouldn't close the gap described above, just move it
+    const dataOk = lineOk && namesOk && poiOk;
+    const cellsOk = dataOk && saveLoadedCells(loadedCells);
+    if(!dataOk || !cellsOk){
+      showWarn('⚠ Storage is full — some newly-checked areas could not be saved and will need to be re-verified after your next refresh. Free up space on your device, or use "Clear all data" in settings.', null);
+    }
   }
   function scheduleSaveCaches(){
     if(saveCachesTimer) clearTimeout(saveCachesTimer);
@@ -1131,8 +1156,11 @@
       const key = cellKeyForCellCenter(c.lat, c.lng);
       if(!loadedCells.has(key)){ loadedCells.add(key); changed = true; }
     });
+    // persistence intentionally isn't here — the caller (applyOverpassResults)
+    // always follows this with scheduleSaveCaches(), which saves loadedCells
+    // together with lineCache/poiCache so the two can't drift apart (see
+    // flushSaveCaches)
     if(changed){
-      saveLoadedCells(loadedCells);
       renderOfficialRecords(officialRecordsCache);
       renderUnloadedOverlay();
     }
@@ -2278,8 +2306,11 @@
     // belt-and-suspenders: mark this exact cell directly rather than relying
     // only on applyOverpassResults re-deriving cell membership from
     // cellBounds — see the note on gridCellsForBounds above for why that
-    // re-derivation could occasionally miss
-    if(!loadedCells.has(key)){ loadedCells.add(key); saveLoadedCells(loadedCells); }
+    // re-derivation could occasionally miss. Persistence isn't triggered
+    // here — applyOverpassResults (just above) already scheduled a save
+    // that covers this cell too, see flushSaveCaches for why loadedCells is
+    // saved together with lineCache/poiCache rather than independently.
+    loadedCells.add(key);
   }
 
   // sequential (not parallel) on purpose — this can be a lot of cells for a
