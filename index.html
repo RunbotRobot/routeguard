@@ -220,7 +220,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.47</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.48</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -500,6 +500,26 @@
   function saveLineCache(c){ return safeLocalStorageSet(LS_LINE_CACHE, JSON.stringify(c), false); }
   function savePoiCache(c){ return safeLocalStorageSet(LS_POI_CACHE, JSON.stringify(c), false); }
   function saveLoadedCells(s){ return safeLocalStorageSet(LS_LOADED_CELLS, JSON.stringify([...s]), false); }
+
+  // debounces the (expensive, growing) lineCache/poiCache save so a burst of
+  // many calls in quick succession — dozens of cells loading during one
+  // route-planning corridor fetch — only actually serializes+writes once,
+  // shortly after the burst settles, rather than once per cell
+  let saveCachesTimer = null;
+  function flushSaveCaches(){
+    if(saveCachesTimer){ clearTimeout(saveCachesTimer); saveCachesTimer = null; }
+    saveLineCache(lineCache);
+    savePoiCache(poiCache);
+  }
+  function scheduleSaveCaches(){
+    if(saveCachesTimer) clearTimeout(saveCachesTimer);
+    saveCachesTimer = setTimeout(flushSaveCaches, 1000);
+  }
+  // flush immediately if the page is being backgrounded/closed mid-burst,
+  // so at most ~1s of loaded-but-not-yet-persisted data is ever at risk —
+  // acceptable given this is re-fetchable map data, not user-entered data
+  window.addEventListener('pagehide', flushSaveCaches);
+  window.addEventListener('visibilitychange', ()=>{ if(document.visibilityState === 'hidden') flushSaveCaches(); });
 
   const LS_TILE_CACHE_CFG = "rg_tile_cache_cfg";
   const DEFAULT_TILE_CACHE_URL = "https://sweet-bar-0621.runbotrobot.workers.dev";
@@ -781,7 +801,16 @@
 
   const autoPinMarkers = {}; // OSM type+id -> marker, persists across fetches like lines already do
 
-  function applyOverpassResults(data, fetchBounds){
+  // skipReconciliation: every real caller already filters to cells NOT yet
+  // in loadedCells before fetching (see loadNearbyData/ensureCellLoaded),
+  // so by construction there's nothing previously cached in fetchBounds to
+  // reconcile away — the scan below would always find zero stale entries
+  // in practice. Scanning the ENTIRE lineCache/poiCache on every single
+  // cell during a wide route-corridor load (dozens of cells) is a real,
+  // scaling cost with no payoff for the overwhelmingly common case; callers
+  // that already know their fetch is guaranteed-fresh territory pass true
+  // to skip it outright.
+  function applyOverpassResults(data, fetchBounds, skipReconciliation){
     const seenLineKeys = new Set();
     const seenPoiKeys = new Set();
 
@@ -847,31 +876,37 @@
     // are never touched by this, regardless of what a fetch does or doesn't
     // report — those only ever change by your own action.
     if(fetchBounds){
-      Object.keys(lineCache).forEach(key=>{
-        if(seenLineKeys.has(key)) return;
-        if(segments[key]) return; // marked — never auto-remove
-        const latlngs = lineCache[key];
-        const bothInside = latlngs.every(p => fetchBounds.contains(p));
-        if(bothInside){
-          delete lineCache[key];
-          if(segPolylines[key]){ segLayer.removeLayer(segPolylines[key]); delete segPolylines[key]; }
-          if(segCasingLines[key]){ segLayer.removeLayer(segCasingLines[key]); delete segCasingLines[key]; }
-          if(segHitLines[key]){ segHitLayer.removeLayer(segHitLines[key]); delete segHitLines[key]; }
-        }
-      });
-      Object.keys(poiCache).forEach(key=>{
-        if(seenPoiKeys.has(key)) return;
-        const p = poiCache[key];
-        if(fetchBounds.contains([p.lat, p.lng])){
-          delete poiCache[key];
-          if(autoPinMarkers[key]){ autoPinLayer.removeLayer(autoPinMarkers[key]); delete autoPinMarkers[key]; }
-        }
-      });
+      if(!skipReconciliation){
+        Object.keys(lineCache).forEach(key=>{
+          if(seenLineKeys.has(key)) return;
+          if(segments[key]) return; // marked — never auto-remove
+          const latlngs = lineCache[key];
+          const bothInside = latlngs.every(p => fetchBounds.contains(p));
+          if(bothInside){
+            delete lineCache[key];
+            if(segPolylines[key]){ segLayer.removeLayer(segPolylines[key]); delete segPolylines[key]; }
+            if(segCasingLines[key]){ segLayer.removeLayer(segCasingLines[key]); delete segCasingLines[key]; }
+            if(segHitLines[key]){ segHitLayer.removeLayer(segHitLines[key]); delete segHitLines[key]; }
+          }
+        });
+        Object.keys(poiCache).forEach(key=>{
+          if(seenPoiKeys.has(key)) return;
+          const p = poiCache[key];
+          if(fetchBounds.contains([p.lat, p.lng])){
+            delete poiCache[key];
+            if(autoPinMarkers[key]){ autoPinLayer.removeLayer(autoPinMarkers[key]); delete autoPinMarkers[key]; }
+          }
+        });
+      }
       markCellsLoadedForBounds(fetchBounds);
     }
 
-    saveLineCache(lineCache);
-    savePoiCache(poiCache);
+    // JSON.stringify-ing the whole (growing) cache and writing it to
+    // localStorage on every single call adds up fast during a wide
+    // route-corridor load — dozens of calls, each re-serializing a bigger
+    // cache than the last. Debounced: the actual write happens once
+    // shortly after the burst settles, not once per cell.
+    scheduleSaveCaches();
     return { poiCount: Object.keys(poiCache).length, roadEdgeCount: Object.keys(lineCache).length };
   }
 
@@ -1212,7 +1247,7 @@
     if(cfg.url){
       try{
         const data = await loadViaTileCache(cfg.url, fetchBounds);
-        const {poiCount, roadEdgeCount} = applyOverpassResults(data, fetchBounds);
+        const {poiCount, roadEdgeCount} = applyOverpassResults(data, fetchBounds, true); // fetchBounds is built from missingCells only — guaranteed fresh, nothing to reconcile
         lastSuccessAt = Date.now();
         lastLoadedBounds = b;
         lastPoiCount = poiCount;
@@ -1251,7 +1286,7 @@
     try{
       const data = await Promise.any(attempts.map(a => a.promise));
       attempts.forEach(a => a.controller.abort()); // cancel the losers
-      const {poiCount, roadEdgeCount} = applyOverpassResults(data, fetchBounds);
+      const {poiCount, roadEdgeCount} = applyOverpassResults(data, fetchBounds, true); // fetchBounds is built from missingCells only — guaranteed fresh, nothing to reconcile
       lastSuccessAt = Date.now();
       lastLoadedBounds = b;
       lastPoiCount = poiCount;
@@ -2287,8 +2322,10 @@
 
   // fetch (tile cache first, direct Overpass as fallback) and apply exactly
   // one grid cell's worth of data — reuses applyOverpassResults with a
-  // precise cell-sized bounds, so the same reconciliation and load-tracking
-  // logic used everywhere else applies here too
+  // precise cell-sized bounds, so the same load-tracking logic used
+  // everywhere else applies here too. Reconciliation is skipped: the
+  // loadedCells check just below guarantees this cell has never been
+  // fetched before, so there's nothing previously cached in it to reconcile.
   async function ensureCellLoaded(c){
     const key = cellKeyForCellCenter(c.lat, c.lng);
     if(loadedCells.has(key)) return;
@@ -2309,7 +2346,7 @@
       data = await Promise.any(attempts.map(a=>a.promise));
       attempts.forEach(a=>a.controller.abort());
     }
-    applyOverpassResults(data, cellBounds);
+    applyOverpassResults(data, cellBounds, true); // never-before-loaded cell — nothing to reconcile
     // belt-and-suspenders: mark this exact cell directly rather than relying
     // only on applyOverpassResults re-deriving cell membership from
     // cellBounds — see the note on gridCellsForBounds above for why that
@@ -3204,6 +3241,7 @@ ${pts}
       renderUnloadedOverlay();
       renderOfficialRecords(officialRecordsCache);
       loadNearbyData(true);
+      showWarn('All data cleared.', 3000);
       document.getElementById('btnClear').textContent = 'Clear all data';
       document.getElementById('btnClear').dataset.confirm = '0';
     } else {
