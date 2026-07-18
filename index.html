@@ -220,7 +220,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.45</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.46</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -908,18 +908,39 @@
   // out past the bulk-display threshold (see the note there) — safe to call
   // repeatedly since it only draws what isn't already on the map, unlike
   // renderCachedLinesAndPois above which is only meant for the one-time
-  // initial draw on a blank map
+  // initial draw on a blank map.
+  //
+  // Deferring the draw avoided wasted work for the common case (a route
+  // that stays zoomed out), but it also means everything skipped over a
+  // long loading process — potentially thousands of lines/pins for an
+  // ultra-distance route freshly loaded with an empty cache — lands in one
+  // single lump the instant you zoom back in. Doing that in one synchronous
+  // pass would trade "spread-out slowness while loading" for "one
+  // multi-minute freeze on zoom-in," which is worse, not better. Spread it
+  // across animation frames instead, each doing only as much as fits in a
+  // few milliseconds, so the browser can keep painting/responding to input
+  // between batches rather than locking up until it's all done.
   function drawUndrawnBulkContent(){
-    Object.keys(lineCache).forEach(key=>{
-      if(segPolylines[key]) return;
-      const state = segments[key] ? segments[key].state : 'neutral';
-      drawSegment(key, lineCache[key], state);
-    });
-    Object.keys(poiCache).forEach(key=>{
-      if(autoPinMarkers[key]) return;
-      const p = poiCache[key];
-      drawAutoPin(key, p.lat, p.lng, p.category, p.label);
-    });
+    const lineKeys = Object.keys(lineCache).filter(key=>!segPolylines[key]);
+    const poiKeys = Object.keys(poiCache).filter(key=>!autoPinMarkers[key]);
+    let li = 0, pi = 0;
+    function processBatch(){
+      const budgetEnd = performance.now() + 12; // leave room in the frame for an actual repaint
+      while(li < lineKeys.length && performance.now() < budgetEnd){
+        const key = lineKeys[li++];
+        const state = segments[key] ? segments[key].state : 'neutral';
+        drawSegment(key, lineCache[key], state);
+      }
+      while(pi < poiKeys.length && performance.now() < budgetEnd){
+        const key = poiKeys[pi++];
+        const p = poiCache[key];
+        drawAutoPin(key, p.lat, p.lng, p.category, p.label);
+      }
+      if(li < lineKeys.length || pi < poiKeys.length){
+        requestAnimationFrame(processBatch);
+      }
+    }
+    requestAnimationFrame(processBatch);
   }
 
 
@@ -3155,6 +3176,17 @@ ${pts}
     if(document.getElementById('btnClear').dataset.confirm === '1'){
       pins = []; segments = {}; lineCache = {}; poiCache = {};
       savePins(pins); saveSegs(segments); saveLineCache(lineCache); savePoiCache(poiCache);
+      // loadedCells records "this area has already been checked" — leaving
+      // it in place after wiping the actual location/line data would let
+      // the auto-load skip re-fetching (see loadNearbyData) and report the
+      // area as verified-clear without ever actually checking it again.
+      // That's exactly backwards for a safety-critical cache: a clear
+      // should force a genuine re-check, not produce a false all-clear.
+      loadedCells.clear();
+      saveLoadedCells(loadedCells);
+      lastSuccessAt = null;
+      lastPoiCount = null;
+      lastRoadCount = null;
       renderPins();
       segLayer.clearLayers();
       segHitLayer.clearLayers();
@@ -3164,6 +3196,9 @@ ${pts}
       autoPinLayer.clearLayers();
       Object.keys(autoPinMarkers).forEach(k=>delete autoPinMarkers[k]);
       lastLoadedBounds = null;
+      renderUnloadedOverlay();
+      renderOfficialRecords(officialRecordsCache);
+      loadNearbyData(true);
       document.getElementById('btnClear').textContent = 'Clear all data';
       document.getElementById('btnClear').dataset.confirm = '0';
     } else {
