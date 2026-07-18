@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.54</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.55</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -379,10 +379,20 @@
       <div class="section">
         <h3>Data</h3>
         <div id="storageUsage" style="font-size:11.5px;color:var(--muted);margin-bottom:8px;">Storage: calculating…</div>
+        <div style="font-size:11px;color:var(--muted);margin-bottom:8px;">
+          On-device storage is just a fast cache — the oldest, least-visited areas are automatically dropped to make room as needed, and reload from the tile cache worker (or Overpass directly) next time you're there. Nothing is lost permanently.
+        </div>
         <button class="small-btn" id="btnExport" style="width:100%;margin-bottom:6px;">Export pins + lines (JSON)</button>
         <button class="small-btn" id="btnImport" style="width:100%;margin-bottom:6px;">Import from backup file</button>
         <input type="file" id="importFileInput" accept="application/json,.json" style="display:none;">
         <button class="small-btn danger-text" id="btnClear" style="width:100%;">Clear all data</button>
+        <div class="legend-row" style="justify-content:space-between;margin-top:10px;">
+          <span>Show developer/debug messages</span>
+          <input type="checkbox" id="debugMsgsToggle" style="width:auto;">
+        </div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px;">
+          Routine background activity (like local cache housekeeping) stays silent by default. Turn this on while testing to see it happen.
+        </div>
       </div>
     </div>
   </div>
@@ -433,12 +443,16 @@
   const LS_LINE_NAMES = "rg_line_names"; // edge key -> OSM street name, for the tap-for-name popup
   const LS_POI_CACHE = "rg_poi_cache";   // every auto-detected location ever discovered
   const LS_LOADED_CELLS = "rg_loaded_cells"; // grid cells (see TILE_GRID_SIZE) fully checked against every data source
+  const LS_CELL_RECENCY = "rg_cell_recency"; // grid cell -> last-used timestamp, for LRU eviction when storage fills up
+  const LS_DEBUG_MSGS = "rg_debug_msgs"; // whether routine/diagnostic messages (cache eviction, etc.) are shown
 
   function loadPins(){ try{return JSON.parse(localStorage.getItem(LS_PINS))||[];}catch(e){return [];} }
   function loadLineCache(){ try{return JSON.parse(localStorage.getItem(LS_LINE_CACHE))||{};}catch(e){return {};} }
   function loadLineNames(){ try{return JSON.parse(localStorage.getItem(LS_LINE_NAMES))||{};}catch(e){return {};} }
   function loadPoiCache(){ try{return JSON.parse(localStorage.getItem(LS_POI_CACHE))||{};}catch(e){return {};} }
   function loadLoadedCells(){ try{return new Set(JSON.parse(localStorage.getItem(LS_LOADED_CELLS))||[]);}catch(e){return new Set();} }
+  function loadCellRecency(){ try{return JSON.parse(localStorage.getItem(LS_CELL_RECENCY))||{};}catch(e){return {};} }
+  function loadDebugMsgsEnabled(){ try{return localStorage.getItem(LS_DEBUG_MSGS) === '1';}catch(e){return false;} }
 
   // marked-line coloring (safe/avoid) is gone — pins are now the only way to
   // mark ground to avoid — so the old per-line marking store is dead weight;
@@ -449,14 +463,29 @@
   // kept forever) are by far the biggest thing this app stores, and are
   // always safely re-fetchable — so if a write of safety-critical data
   // (pins) hits the shared localStorage quota, free space by clearing THOSE
-  // first, never the other way around, then retry once.
+  // first, never the other way around, then retry once. This is the
+  // nuclear option (wipes everything) — used only for the rare case of a
+  // tiny critical write (pins) failing; the much more common case, the
+  // bulk caches themselves growing too big, is handled by
+  // evictLeastRecentlyUsedCells instead (partial, LRU-based, see below).
   function pruneBulkCachesForSpace(){
     lineCache = {};
     lineNames = {};
     poiCache = {};
+    cellRecency = {};
     try{ localStorage.removeItem(LS_LINE_CACHE); }catch(e){}
     try{ localStorage.removeItem(LS_LINE_NAMES); }catch(e){}
     try{ localStorage.removeItem(LS_POI_CACHE); }catch(e){}
+    try{ localStorage.removeItem(LS_CELL_RECENCY); }catch(e){}
+  }
+  // Routine/diagnostic messages (cache eviction happening, etc.) — off by
+  // default so a wide-ranging user whose local cache fills up and
+  // self-manages regularly (see below) doesn't get nagged about completely
+  // normal, expected behavior. Turn on "Show developer/debug messages" in
+  // settings to see these while testing.
+  let debugMsgsEnabled = loadDebugMsgsEnabled();
+  function showDebugMsg(msg, ms){
+    if(debugMsgsEnabled) showWarn(msg, ms);
   }
   function isQuotaExceeded(err){
     return !!err && (err.name === 'QuotaExceededError' || err.code === 22 || err.code === 1014);
@@ -490,41 +519,55 @@
   function saveLineNames(n){ return safeLocalStorageSet(LS_LINE_NAMES, JSON.stringify(n), false); }
   function savePoiCache(c){ return safeLocalStorageSet(LS_POI_CACHE, JSON.stringify(c), false); }
   function saveLoadedCells(s){ return safeLocalStorageSet(LS_LOADED_CELLS, JSON.stringify([...s]), false); }
+  function saveCellRecency(r){ return safeLocalStorageSet(LS_CELL_RECENCY, JSON.stringify(r), false); }
 
   // debounces the (expensive, growing) lineCache/lineNames/poiCache save so a
   // burst of many calls in quick succession — dozens of cells loading during
   // one route-planning corridor fetch — only actually serializes+writes
   // once, shortly after the burst settles, rather than once per cell.
   //
-  // loadedCells is saved in this SAME flush, not separately — a cell being
-  // marked "fully checked" has to succeed or fail together with the data it
-  // supposedly checked. Previously loadedCells was persisted immediately
-  // and synchronously per cell (see markCellsLoadedForBounds/
-  // ensureCellLoaded) while the much bigger lineCache/poiCache write here
-  // was debounced and could silently fail if it happened to push the
-  // origin over its localStorage quota (isCritical=false skips the write
-  // rather than erroring loudly, since it's normally just re-fetchable
-  // cache) — meaning a big fresh area (an ultra-distance route through
-  // never-visited territory) could end up "verified checked" in permanent
-  // storage with none of the actual road/location data behind it ever
-  // making it to disk. A refresh after that would trust the empty result
-  // as a real all-clear and never re-check. Saving them together and
-  // warning loudly on any failure closes that gap.
+  // loadedCells/cellRecency are saved in this SAME flush, not separately —
+  // a cell being marked "fully checked" has to succeed or fail together
+  // with the data it supposedly checked, otherwise a refresh could trust
+  // "already checked" for an area whose actual road/location data never
+  // made it to disk — a false all-clear for a safety-critical cache.
+  //
+  // Local storage (5-10MB, shared with everything else this origin ever
+  // stores) is nowhere near big enough to hold a permanent record of
+  // everywhere a wide-ranging user (a 50-mile running radius, further still
+  // by car) has ever checked — nor does it need to: the tile-cache worker
+  // already keeps its own durable copy of everything (KV storage, no
+  // comparable size pressure, ~60-day staleness before it bothers Overpass
+  // again), so local storage only needs to behave like a fast cache of
+  // recently-relevant areas, not the permanent record. If a save hits the
+  // quota, evict the least-recently-used cached areas (see
+  // evictLeastRecentlyUsedCells) and retry — revisiting an evicted area
+  // later just means asking the worker again (fast, it's still there),
+  // not losing anything. Only genuinely worth alarming the user over if
+  // even that doesn't free enough room.
+  const EVICTION_BATCH_SIZES = [50, 150, 400, 1000];
   let saveCachesTimer = null;
   function flushSaveCaches(){
     if(saveCachesTimer){ clearTimeout(saveCachesTimer); saveCachesTimer = null; }
-    const lineOk = saveLineCache(lineCache);
-    const namesOk = saveLineNames(lineNames);
-    const poiOk = savePoiCache(poiCache);
-    // loadedCells's own write is small and would likely succeed even when
-    // the much bigger lineCache/poiCache write above just failed on quota —
-    // only actually attempt (and let it succeed at) persisting loadedCells
-    // once the data it's supposed to represent is confirmed saved too,
-    // otherwise this wouldn't close the gap described above, just move it
-    const dataOk = lineOk && namesOk && poiOk;
+    let dataOk = saveLineCache(lineCache) && saveLineNames(lineNames) && savePoiCache(poiCache);
+    let evictedTotal = 0;
+    for(let i=0; !dataOk && i<EVICTION_BATCH_SIZES.length; i++){
+      const evicted = evictLeastRecentlyUsedCells(EVICTION_BATCH_SIZES[i]);
+      if(evicted === 0) break; // nothing left worth evicting — retrying won't help
+      evictedTotal += evicted;
+      dataOk = saveLineCache(lineCache) && saveLineNames(lineNames) && savePoiCache(poiCache);
+    }
+    // loadedCells/cellRecency's own writes are small and would likely
+    // succeed even when the much bigger lineCache/poiCache write above just
+    // failed — only actually attempt (and let them succeed at) persisting
+    // once the data they describe is confirmed saved too
     const cellsOk = dataOk && saveLoadedCells(loadedCells);
-    if(!dataOk || !cellsOk){
-      showWarn('⚠ Storage is full — some newly-checked areas could not be saved and will need to be re-verified after your next refresh. Free up space on your device, or use "Clear all data" in settings.', null);
+    const recencyOk = dataOk && saveCellRecency(cellRecency);
+    if(evictedTotal > 0 && dataOk){
+      showDebugMsg(`Freed local storage: dropped ${evictedTotal} least-recently-used cached area${evictedTotal===1?'':'s'} (still available from the worker cache if you revisit).`, 5000);
+    }
+    if(!dataOk || !cellsOk || !recencyOk){
+      showWarn('⚠ Could not save even after freeing up cached space on your device — some newly-checked areas may need to be re-verified after your next refresh.', null);
     }
   }
   function scheduleSaveCaches(){
@@ -553,6 +596,7 @@
   let lineNames = loadLineNames(); // key -> OSM street name (only set when the way had one)
   let poiCache = loadPoiCache();   // OSM type+id -> {lat,lng,category,label} — every auto-detected location ever seen
   let loadedCells = loadLoadedCells(); // set of "lat,lng" cell-center keys fully checked against OSM data — persists like the caches above
+  let cellRecency = loadCellRecency(); // cell key -> last-used timestamp (ms), for LRU eviction when local storage fills up
 
   // storage usage is per-origin (this app's own site data), not shared with
   // other websites or apps on the phone — each site gets its own separate
@@ -1154,6 +1198,7 @@
     gridCellsForBounds(bounds).forEach(c=>{
       if(!cellFullyWithinBounds(c.lat, c.lng, bounds)) return;
       const key = cellKeyForCellCenter(c.lat, c.lng);
+      cellRecency[key] = Date.now(); // freshly loaded (or re-confirmed) counts as freshly used
       if(!loadedCells.has(key)){ loadedCells.add(key); changed = true; }
     });
     // persistence intentionally isn't here — the caller (applyOverpassResults)
@@ -1194,6 +1239,23 @@
     });
   }
   map.on('moveend zoomend', renderUnloadedOverlay);
+
+  // Being in view counts as "using" a cell even if nothing needed loading —
+  // otherwise a cell you revisit often but that was first loaded long ago
+  // would look just as "stale" to the LRU eviction above as one you loaded
+  // once and never came back to, since markCellsLoadedForBounds only runs
+  // for cells that were actually missing.
+  function bumpRecencyForViewport(){
+    if(map.getZoom() < MIN_ZOOM_FOR_AUTO) return;
+    const now = Date.now();
+    let changed = false;
+    gridCellsForBounds(map.getBounds()).forEach(c=>{
+      const key = cellKeyForCellCenter(c.lat, c.lng);
+      if(loadedCells.has(key)){ cellRecency[key] = now; changed = true; }
+    });
+    if(changed) scheduleSaveCaches();
+  }
+  map.on('moveend zoomend', bumpRecencyForViewport);
 
   async function loadViaTileCache(cacheUrl, b){
     const cells = gridCellsForBounds(b);
@@ -1755,6 +1817,54 @@
     }
   }
 
+  // Evicts the `targetCount` least-recently-used LOADED cells (by
+  // cellRecency, oldest first) to free up local storage — called by
+  // flushSaveCaches when a save hits the quota. Never touches a cell
+  // currently part of the displayed route, regardless of recency: losing
+  // that mid-view would look identical to the route silently vanishing bug
+  // fixed earlier. Evicting a cell just means forgetting it LOCALLY —
+  // nothing is lost permanently, since the worker cache (or, failing that,
+  // Overpass) still has the real data and gets asked again the next time
+  // this area is actually needed. Returns how many cells were evicted (0 if
+  // there was nothing left worth evicting, e.g. everything remaining is
+  // route-protected).
+  function evictLeastRecentlyUsedCells(targetCount){
+    const routeCells = new Set();
+    routeLayerKeySet.forEach(key=>{
+      key.split('|').forEach(p=>{
+        const [lat,lng] = p.split(',').map(Number);
+        routeCells.add(cellKeyForLatLng(lat,lng));
+      });
+    });
+    const candidates = Object.keys(cellRecency)
+      .filter(k=>loadedCells.has(k) && !routeCells.has(k))
+      .sort((a,b)=>(cellRecency[a]||0)-(cellRecency[b]||0));
+    const toEvict = candidates.slice(0, targetCount);
+    if(toEvict.length === 0) return 0;
+    const evictSet = new Set(toEvict);
+
+    Object.keys(lineCache).forEach(key=>{
+      const latlngs = lineCache[key];
+      const midLat = (latlngs[0][0]+latlngs[1][0])/2, midLng = (latlngs[0][1]+latlngs[1][1])/2;
+      if(!evictSet.has(cellKeyForLatLng(midLat,midLng))) return;
+      delete lineCache[key];
+      delete lineNames[key];
+      if(segPolylines[key]){ segLayer.removeLayer(segPolylines[key]); delete segPolylines[key]; }
+      if(segCasingLines[key]){ segLayer.removeLayer(segCasingLines[key]); delete segCasingLines[key]; }
+      if(segHitLines[key]){ segHitLayer.removeLayer(segHitLines[key]); delete segHitLines[key]; }
+      delete segHitLineIsRoute[key];
+    });
+    Object.keys(poiCache).forEach(key=>{
+      const p = poiCache[key];
+      if(!evictSet.has(cellKeyForLatLng(p.lat,p.lng))) return;
+      delete poiCache[key];
+      if(autoPinMarkers[key]){ autoPinLayer.removeLayer(autoPinMarkers[key]); delete autoPinMarkers[key]; }
+    });
+    toEvict.forEach(k=>{ loadedCells.delete(k); delete cellRecency[k]; });
+    renderUnloadedOverlay();
+    return toEvict.length;
+  }
+
   // Runs a batch of per-item work spread across animation frames instead of
   // one synchronous pass, same pattern as drawUndrawnBulkContent — for a
   // wide loaded area (thousands of cached lines/pins), doing this inline in
@@ -1924,6 +2034,11 @@
   // pull in every previously-cached road from the user's entire history
   // that happens to fall in that huge rectangle — not just this corridor.
   function buildRoutingGraphFromLineCache(cellKeys){
+    // route planning is a strong "this area matters right now" signal —
+    // bump recency so cells actively in use for the current route are the
+    // last thing evicted if local storage fills up mid-session
+    const now = Date.now();
+    cellKeys.forEach(k=>{ if(loadedCells.has(k)) cellRecency[k] = now; });
     const nodeById = new Map();
     const adjacency = new Map();
     const nodeKeyFor = pt => roundCoord(pt[0])+','+roundCoord(pt[1]);
@@ -3045,6 +3160,13 @@ ${pts}
 
   document.getElementById('btnSatellite').onclick = ()=> setSatelliteMode(!satelliteMode);
 
+  const debugMsgsToggle = document.getElementById('debugMsgsToggle');
+  debugMsgsToggle.checked = debugMsgsEnabled;
+  debugMsgsToggle.onchange = ()=>{
+    debugMsgsEnabled = debugMsgsToggle.checked;
+    try{ localStorage.setItem(LS_DEBUG_MSGS, debugMsgsEnabled ? '1' : '0'); }catch(e){}
+  };
+
   // ---------- export / import / clear ----------
   document.getElementById('btnExport').onclick = ()=>{
     const data = { pins, lineCache, lineNames, poiCache, exportedAt: new Date().toISOString(), version: 'routeguard-1' };
@@ -3112,8 +3234,8 @@ ${pts}
 
   document.getElementById('btnClear').onclick = ()=>{
     if(document.getElementById('btnClear').dataset.confirm === '1'){
-      pins = []; lineCache = {}; lineNames = {}; poiCache = {};
-      savePins(pins); saveLineCache(lineCache); saveLineNames(lineNames); savePoiCache(poiCache);
+      pins = []; lineCache = {}; lineNames = {}; poiCache = {}; cellRecency = {};
+      savePins(pins); saveLineCache(lineCache); saveLineNames(lineNames); savePoiCache(poiCache); saveCellRecency(cellRecency);
       // loadedCells records "this area has already been checked" — leaving
       // it in place after wiping the actual location/line data would let
       // the auto-load skip re-fetching (see loadNearbyData) and report the
