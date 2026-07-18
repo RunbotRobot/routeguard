@@ -220,7 +220,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.46</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.47</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -1929,13 +1929,21 @@
   // this file, ~1m precision) is enough to recognize shared intersections
   // without needing actual node IDs — this is the same "coordinate as node
   // identity" trick the rest of the app already relies on.
-  function buildRoutingGraphFromLineCache(bounds){
+  // cellKeys is the Set of corridor grid-cell keys this attempt actually
+  // loaded (see findAvoidancePath) — filtering by cell membership rather
+  // than a single bounding rectangle matters a lot for a diagonal route: a
+  // rectangle enclosing a diagonal corridor spans just as much area as the
+  // corridor's own bounding box (there's no way to draw an axis-aligned
+  // rectangle around a diagonal strip that's actually narrow), so it would
+  // pull in every previously-cached road from the user's entire history
+  // that happens to fall in that huge rectangle — not just this corridor.
+  function buildRoutingGraphFromLineCache(cellKeys){
     const nodeById = new Map();
     const adjacency = new Map();
     const nodeKeyFor = pt => roundCoord(pt[0])+','+roundCoord(pt[1]);
     Object.values(lineCache).forEach(pair=>{
       const [p1, p2] = pair;
-      if(!bounds.contains(p1) && !bounds.contains(p2)) return;
+      if(!cellKeys.has(cellKeyForLatLng(p1[0], p1[1])) && !cellKeys.has(cellKeyForLatLng(p2[0], p2[1]))) return;
       const k1 = nodeKeyFor(p1), k2 = nodeKeyFor(p2);
       const dist = haversineMeters(p1[0], p1[1], p2[0], p2[1]);
       if(dist === 0) return;
@@ -2162,29 +2170,13 @@
     return base * Math.pow(2, attempt);
   }
 
-  // bounding area to search for a path in — the straight line between start
-  // and end, expanded with margin. Only used for the (free, in-memory)
-  // graph-build filter, where being a bit generous costs nothing; the
-  // network-costly load step uses corridorCellsForRoute below instead,
-  // since this simple bbox is the full rectangle between the two points
-  // for anything but a purely north-south or east-west route — a diagonal
-  // 20 mile route would otherwise mean loading a ~20x20 mile area instead
-  // of a narrow corridor along the direct line.
-  function expandedBoundsForRoute(a, b, marginMeters){
-    const midLat = (a.lat+b.lat)/2;
-    const latMargin = marginMeters / 111320;
-    const lngMargin = marginMeters / (111320 * Math.cos(midLat * Math.PI/180));
-    const south = Math.min(a.lat,b.lat) - latMargin;
-    const north = Math.max(a.lat,b.lat) + latMargin;
-    const west = Math.min(a.lng,b.lng) - lngMargin;
-    const east = Math.max(a.lng,b.lng) + lngMargin;
-    return L.latLngBounds([south,west],[north,east]);
-  }
-
   // grid cells to actually load: stepped along the straight line between a
   // and b (roughly one step per margin-width), each contributing the cells
   // within margin of that point — a corridor hugging the direct path,
-  // rather than expandedBoundsForRoute's full bounding rectangle
+  // rather than the full bounding rectangle between the two points (which
+  // for a diagonal route can be dramatically bigger than the corridor, and
+  // matters even more for the in-memory graph-build filter than for this
+  // network-load step — see findAvoidancePath)
   function corridorCellsForRoute(a, b, marginMeters){
     const straightLineMeters = haversineMeters(a.lat, a.lng, b.lat, b.lng);
     const steps = Math.max(1, Math.ceil(straightLineMeters / marginMeters));
@@ -2233,16 +2225,29 @@
       // against every data source — cells already loaded by a narrower prior
       // attempt are skipped automatically (loadedCells persists across
       // attempts), so widening only ever fetches the newly-added fringe
-      const missingCells = corridorCellsForRoute(a, b, marginMeters).filter(c=>!loadedCells.has(cellKeyForCellCenter(c.lat,c.lng)));
+      const corridorCells = corridorCellsForRoute(a, b, marginMeters);
+      const missingCells = corridorCells.filter(c=>!loadedCells.has(cellKeyForCellCenter(c.lat,c.lng)));
       if(missingCells.length){
         const result = await loadCellsWithProgress(missingCells);
         if(result.cancelled) return { cancelled: true };
       }
 
       // no separate fetch — lineCache already has every road segment in
-      // this area from the load-cells step just above
-      const bounds = expandedBoundsForRoute(a, b, marginMeters);
-      const graph = buildRoutingGraphFromLineCache(bounds);
+      // this area from the load-cells step just above. Filtering by the
+      // same corridor cells used for that load step (rather than a single
+      // bounding rectangle between start and end) keeps the graph scoped
+      // to what this attempt actually needs — unlike the network-load
+      // step, this filter pulls from the user's ENTIRE historical
+      // lineCache, and a bounding rectangle around a diagonal corridor is
+      // no narrower than the corridor's own overall extent (there's no way
+      // to draw an axis-aligned box around a diagonal strip that's
+      // actually tight). For anyone who's used the app across a wide area
+      // over time, that could sweep years of unrelated cached road data
+      // into a single in-memory graph at the widest margin — real memory
+      // pressure that was almost certainly why the widest attempt crashed
+      // the tab outright rather than just running slowly.
+      const corridorCellKeys = new Set(corridorCells.map(c=>cellKeyForCellCenter(c.lat,c.lng)));
+      const graph = buildRoutingGraphFromLineCache(corridorCellKeys);
       if(graph.nodeById.size === 0){
         if(isLastAttempt) throw new Error('no road data returned for this area');
         continue;
