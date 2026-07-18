@@ -220,7 +220,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.42</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.43</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -1114,7 +1114,16 @@
     const b = map.getBounds();
     const missingCells = gridCellsForBounds(b).filter(c=>!loadedCells.has(cellKeyForCellCenter(c.lat,c.lng)));
     if(missingCells.length === 0){
-      if(lastSuccessAt) setDataStatus('st-ok', okStatusText());
+      // everything in view was already checked, possibly in an earlier
+      // session (loadedCells persists) — still counts as loaded, so the
+      // status badge needs to move off its initial "Not loaded yet"
+      // placeholder even though no fetch ran this time
+      if(!lastSuccessAt){
+        lastSuccessAt = Date.now();
+        lastPoiCount = Object.keys(poiCache).length;
+        lastRoadCount = Object.keys(lineCache).length;
+      }
+      setDataStatus('st-ok', okStatusText());
       return;
     }
 
