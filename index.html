@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.71</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.72</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -2480,16 +2480,26 @@
     // direction — but the proximity check below only depends on the pair of
     // endpoints (same midpoint, same three check points, same answer either
     // way), so computing it separately for both directions was pure waste.
-    // Confirmed via the debug log on a real route: over 14 seconds for one
-    // call, the single biggest piece of a reported freeze. Cache the result
-    // per unordered node pair instead of recomputing it a second time.
+    // Cache the result per unordered node pair instead of recomputing it a
+    // second time.
     const computed = new Map();
-    adjacency.forEach((edges, fromId)=>{
-      const a = nodeById.get(fromId);
-      if(!a) return;
-      edges.forEach(edge=>{
+    // Flattened so the per-edge work below can be spread across animation
+    // frames (runChunked) instead of one uninterrupted pass. Each edge's
+    // check is fully independent of every other edge's — unlike Dijkstra,
+    // which has to process nodes in a specific priority order and can't be
+    // safely paused mid-run, this has no such ordering constraint, so
+    // chunking it changes nothing about the result, only when the browser
+    // gets a chance to actually respond to a tap or a drag while computing
+    // it. This was the single largest synchronous block left after the
+    // direction-dedup fix above — confirmed by a real report of panning
+    // staying frozen for exactly this step's duration, every time.
+    const edgeRefs = [];
+    adjacency.forEach((edges, fromId)=>{ edges.forEach(edge=>edgeRefs.push({ fromId, edge })); });
+    return new Promise(resolve=>{
+      runChunked(edgeRefs, ({fromId, edge})=>{
+        const a = nodeById.get(fromId);
         const b = nodeById.get(edge.to);
-        if(!b) return;
+        if(!a || !b) return;
         const pairKey = fromId < edge.to ? fromId+'|'+edge.to : edge.to+'|'+fromId;
         let result = computed.get(pairKey);
         if(!result){
@@ -2515,7 +2525,7 @@
         } else {
           edge.costMultiplier = proximityCostMultiplier(result.minPoiDist, poiThresholdMeters, poiSoftThreshold);
         }
-      });
+      }, 12, resolve);
     });
   }
 
@@ -2739,7 +2749,7 @@
       const locations = allKnownLocationsForProximityCheck();
       const poiThresholdMeters = MIN_LOCATION_DISTANCE_FT * 0.3048;
       const blockStartMs = performance.now();
-      markBlockedEdges(graph, locations, poiThresholdMeters, true);
+      await markBlockedEdges(graph, locations, poiThresholdMeters, true);
       const blockMs = Math.round(performance.now() - blockStartMs);
       if(blockMs > 500){
         showDebugMsg(`Slow blocked-edge check: ${blockMs}ms over ${locations.length} known locations (attempt ${attempt+1}/${AVOIDANCE_MARGIN_ATTEMPTS})`, 6000);
@@ -2778,7 +2788,7 @@
         // This finds whichever path touches the fewest, least-bad adjacency
         // violations, rather than a route picked with zero awareness of any
         // of this.
-        markBlockedEdges(graph, locations, poiThresholdMeters, false);
+        await markBlockedEdges(graph, locations, poiThresholdMeters, false);
         const fallbackPath = dijkstraPath(graph.adjacency, startNode, endNode);
         if(fallbackPath){
           const pairs = nodePathToPairs(fallbackPath, graph.nodeById);
