@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.58</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.59</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -477,6 +477,7 @@
     try{ localStorage.removeItem(LS_LINE_NAMES); }catch(e){}
     try{ localStorage.removeItem(LS_POI_CACHE); }catch(e){}
     try{ localStorage.removeItem(LS_CELL_RECENCY); }catch(e){}
+    dropOfficialCacheForSpace();
   }
   // Routine/diagnostic messages (cache eviction happening, etc.) — off by
   // default so a wide-ranging user whose local cache fills up and
@@ -559,6 +560,20 @@
   function flushSaveCaches(){
     if(saveCachesTimer){ clearTimeout(saveCachesTimer); saveCachesTimer = null; }
     let dataOk = saveLineCache(lineCache) && saveLineNames(lineNames) && savePoiCache(poiCache);
+    // the official state-directory cache (see "official WA state directory"
+    // below) is a single county-wide blob that lives outside the per-cell
+    // loadedCells/cellRecency system this function otherwise manages, so the
+    // LRU eviction loop below can't touch it — but it still counts against
+    // the same shared per-origin quota. It's also the cheapest thing here to
+    // lose: one re-fetch from the worker, versus loadedCells/lineCache which
+    // represent real Overpass round trips. Drop it first, before spending
+    // eviction attempts on data that's actually expensive to rebuild.
+    let droppedOfficialCache = false;
+    if(!dataOk){
+      dropOfficialCacheForSpace();
+      droppedOfficialCache = true;
+      dataOk = saveLineCache(lineCache) && saveLineNames(lineNames) && savePoiCache(poiCache);
+    }
     let evictedTotal = 0;
     let batchSize = Math.max(50, Math.ceil(loadedCells.size * 0.1));
     for(let attempt=0; !dataOk && attempt<20; attempt++){
@@ -574,6 +589,9 @@
     // once the data they describe is confirmed saved too
     const cellsOk = dataOk && saveLoadedCells(loadedCells);
     const recencyOk = dataOk && saveCellRecency(cellRecency);
+    if(droppedOfficialCache && dataOk){
+      showDebugMsg('Freed local storage: dropped the cached official childcare/school directory (re-fetches automatically, next time you open Settings or within a month).', 5000);
+    }
     if(evictedTotal > 0 && dataOk){
       showDebugMsg(`Freed local storage: dropped ${evictedTotal} least-recently-used cached area${evictedTotal===1?'':'s'} (still available from the worker cache if you revisit).`, 5000);
     }
@@ -1530,7 +1548,17 @@
   const LS_OFFICIAL_CACHE = "rg_official_cache";
   const OFFICIAL_REFRESH_MS = 30 * 24 * 60 * 60 * 1000; // ~monthly, as requested
   function loadOfficialCache(){ try{return JSON.parse(localStorage.getItem(LS_OFFICIAL_CACHE))||null;}catch(e){return null;} }
-  function saveOfficialCache(c){ try{localStorage.setItem(LS_OFFICIAL_CACHE, JSON.stringify(c));}catch(e){console.error('Could not save official directory cache:', e);} }
+  function saveOfficialCache(c){ return safeLocalStorageSet(LS_OFFICIAL_CACHE, JSON.stringify(c), false); }
+  // called from flushSaveCaches (freeing space for the per-cell caches) and
+  // pruneBulkCachesForSpace (the nuclear option for a critical write) — see
+  // both for why this cache specifically goes first. Safe to drop any time:
+  // loadOfficialChildcareData() re-fetches it from the worker whenever it's
+  // missing, at most a ~20s fetch, not a rebuild of anything irreplaceable.
+  function dropOfficialCacheForSpace(){
+    try{ localStorage.removeItem(LS_OFFICIAL_CACHE); }catch(e){}
+    officialRecordsCache = [];
+    renderOfficialRecords(officialRecordsCache);
+  }
 
   const officialPinLayer = L.layerGroup().addTo(map);
   const officialPinMarkers = {};
@@ -3404,6 +3432,7 @@ ${pts}
       // should force a genuine re-check, not produce a false all-clear.
       loadedCells.clear();
       saveLoadedCells(loadedCells);
+      dropOfficialCacheForSpace();
       lastSuccessAt = null;
       lastPoiCount = null;
       lastRoadCount = null;
@@ -3420,7 +3449,6 @@ ${pts}
       Object.keys(autoPinMarkers).forEach(k=>delete autoPinMarkers[k]);
       lastLoadedBounds = null;
       renderUnloadedOverlay();
-      renderOfficialRecords(officialRecordsCache);
       loadNearbyData(true);
       showWarn('All data cleared.', 3000);
       document.getElementById('btnClear').textContent = 'Clear all data';
