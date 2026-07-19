@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.73</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.74</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -637,9 +637,19 @@
       // whether this save succeeds. The only real consequence is that a
       // refresh will re-fetch the un-mirrored areas from the worker (fast)
       // instead of loading them instantly from this device — not a re-check
-      // from scratch, and nothing is lost. Worded and timed accordingly:
-      // informational, not an alarm requiring action.
-      showWarn('Local storage on this device couldn\'t fully keep a local copy of everything just checked — this route or area was larger than what fits. Nothing is lost: it\'s all safely stored on RouteGuard\'s permanent server cache. A refresh will just re-fetch a few spots from there (fast) instead of loading them instantly.', 8000);
+      // from scratch, and nothing is lost.
+      //
+      // Originally a real (always-shown) warning — downgraded to the same
+      // debug tier as the eviction messages just above once real usage
+      // showed it firing on essentially every pan/zoom while scouting a
+      // wide area with a full local cache (expected: a 30-mile scouting
+      // session generates new cells about as fast as old ones can be
+      // evicted to make room). That's routine, harmless housekeeping for a
+      // wide-ranging user, not something worth interrupting every couple
+      // of gestures to reassure them about — exactly the "normal/expected,
+      // not a genuine problem" category the debug-messages toggle exists
+      // for.
+      showDebugMsg('Local storage on this device couldn\'t fully keep a local copy of everything just checked — this route or area was larger than what fits. Nothing is lost: it\'s all safely stored on RouteGuard\'s permanent server cache. A refresh will just re-fetch a few spots from there (fast) instead of loading them instantly.', 8000);
     }
   }
   // Diagnostic only. flushSaveCaches itself measures fast (1.3-1.4s) every
