@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.59</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.60</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -596,7 +596,21 @@
       showDebugMsg(`Freed local storage: dropped ${evictedTotal} least-recently-used cached area${evictedTotal===1?'':'s'} (still available from the worker cache if you revisit).`, 5000);
     }
     if(!dataOk || !cellsOk || !recencyOk){
-      showWarn('⚠ Could not save even after freeing up cached space on your device — some newly-checked areas may need to be re-verified after your next refresh.', null);
+      // By this point every evictable cell (everything except the cells the
+      // currently-drawn route itself occupies, which eviction always
+      // protects — see evictLeastRecentlyUsedCells) has already been tried.
+      // If it still doesn't fit, that means the route/area just checked is
+      // itself bigger than this device's local storage — not that anything
+      // is actually at risk: the worker's KV cache already has a permanent
+      // copy of every road/location involved (that's true regardless of
+      // whether the local mirror below succeeds), and everything currently
+      // on screen is already drawn from in-memory data, unaffected by
+      // whether this save succeeds. The only real consequence is that a
+      // refresh will re-fetch the un-mirrored areas from the worker (fast)
+      // instead of loading them instantly from this device — not a re-check
+      // from scratch, and nothing is lost. Worded and timed accordingly:
+      // informational, not an alarm requiring action.
+      showWarn('Local storage on this device couldn\'t fully keep a local copy of everything just checked — this route or area was larger than what fits. Nothing is lost: it\'s all safely stored on RouteGuard\'s permanent server cache. A refresh will just re-fetch a few spots from there (fast) instead of loading them instantly.', 8000);
     }
   }
   function scheduleSaveCaches(){
