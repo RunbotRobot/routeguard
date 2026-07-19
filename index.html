@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.61</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.62</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -2621,13 +2621,28 @@
     // Diagnostic only (debug-messages toggle) — helps tell apart a fast KV
     // cache hit from a genuine cache-miss round-trip through the worker to
     // Overpass (which the worker's own ~20s internal timeout can make take
-    // many seconds), the leading suspect for why one particular area in a
+    // many seconds), one leading suspect for why one particular area in a
     // route's corridor load can take far longer than the rest.
-    const elapsedMs = Math.round(performance.now() - loadStartedAtMs);
-    if(elapsedMs > 2000){
-      showDebugMsg(`Slow area load: ${elapsedMs}ms via ${source}${data && data._cache ? ' ('+data._cache+')' : ''} near ${c.lat.toFixed(3)},${c.lng.toFixed(3)}`, 6000);
+    const fetchElapsedMs = Math.round(performance.now() - loadStartedAtMs);
+    if(fetchElapsedMs > 2000){
+      showDebugMsg(`Slow area load: ${fetchElapsedMs}ms fetch via ${source}${data && data._cache ? ' ('+data._cache+')' : ''} near ${c.lat.toFixed(3)},${c.lng.toFixed(3)}`, 6000);
     }
+    // Separately timed: applyOverpassResults isn't just caching data, it can
+    // also synchronously build+draw a real Leaflet polyline and hit-line for
+    // every single line segment in the response (see its own comment) when
+    // zoomed in past the bulk-display threshold — for an unusually
+    // element-dense cell (a lot of Seattle's downtown core, for instance)
+    // that's real main-thread work that the fetch timing above wouldn't
+    // capture at all, since it happens entirely after the fetch already
+    // finished. Was a blind spot: a cell whose *fetch* was fast but whose
+    // *apply* was slow would show no debug message whatsoever.
+    const applyStartedAtMs = performance.now();
     applyOverpassResults(data, cellBounds, true); // never-before-loaded cell — nothing to reconcile
+    const applyElapsedMs = Math.round(performance.now() - applyStartedAtMs);
+    if(applyElapsedMs > 1000){
+      const elementCount = (data && data.elements) ? data.elements.length : '?';
+      showDebugMsg(`Slow area apply: ${applyElapsedMs}ms processing ${elementCount} elements near ${c.lat.toFixed(3)},${c.lng.toFixed(3)} (zoom ${map.getZoom()})`, 6000);
+    }
     // belt-and-suspenders: mark this exact cell directly rather than relying
     // only on applyOverpassResults re-deriving cell membership from
     // cellBounds — see the note on gridCellsForBounds above for why that
