@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.65</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.66</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -393,6 +393,14 @@
         <div style="font-size:11px;color:var(--muted);margin-top:4px;">
           Routine background activity (like local cache housekeeping) stays silent by default. Turn this on while testing to see it happen.
         </div>
+        <div class="legend-row" style="justify-content:space-between;margin-top:10px;">
+          <span>Debug log</span>
+          <button class="small-btn" id="btnClearDebugLog" style="width:auto;padding:4px 10px;">Clear</button>
+        </div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px;margin-bottom:6px;">
+          Every message (debug or not) gets recorded here with a timestamp, in order, even if the banner above only ever shows one at a time — tap inside, select all, and copy to share the whole sequence at once.
+        </div>
+        <textarea id="debugLogTextarea" readonly placeholder="Empty — messages will appear here as they happen." style="width:100%;height:140px;box-sizing:border-box;font-family:monospace;font-size:11px;padding:8px;border:1px solid var(--line);border-radius:8px;resize:vertical;"></textarea>
       </div>
     </div>
   </div>
@@ -486,7 +494,11 @@
   // settings to see these while testing.
   let debugMsgsEnabled = loadDebugMsgsEnabled();
   function showDebugMsg(msg, ms){
-    if(debugMsgsEnabled) showWarn(msg, ms);
+    // Always recorded in the debug log regardless of the toggle, so
+    // turning it off just means not being interrupted by live banner
+    // popups — it never means losing the trail. Only the transient banner
+    // itself is gated.
+    if(debugMsgsEnabled) showWarn(msg, ms); else appendDebugLog(msg);
   }
   function isQuotaExceeded(err){
     return !!err && (err.name === 'QuotaExceededError' || err.code === 22 || err.code === 1014);
@@ -729,7 +741,51 @@
   const warnbarText = document.getElementById('warnbarText');
   const warnbarClose = document.getElementById('warnbarClose');
   function showHint(msg){ hint.textContent = msg; hint.style.display = msg ? 'block' : 'none'; }
+
+  // The banner below can only ever show ONE message at a time — every new
+  // call replaces whatever's currently there, with no queue. During a
+  // single route generation, several diagnostic messages (or a diagnostic
+  // followed by an unrelated real warning, like local storage filling up
+  // right at the end of the same operation) can easily fire in quick
+  // succession, and only the last one to fire is ever actually seen —
+  // every earlier one is silently overwritten before there's any chance to
+  // read it. That's a real gap for a phone user with no console to fall
+  // back on: several rounds of debug-message diagnostics could have been
+  // firing correctly the whole time and simply never survived long enough
+  // to be seen. This keeps a running, persistent record of every message
+  // (debug or real) instead, timestamped with the gap since the previous
+  // entry — exactly what's needed to spot a long stall between two log
+  // lines even if nothing logged anything DURING the stall itself. Bounded
+  // to the most recent 500 entries so a long session doesn't grow this
+  // without limit; kept in memory only, not persisted, since it's a
+  // this-session debugging aid, not something worth spending any of the
+  // same local storage budget the rest of this app works hard to protect.
+  const debugLogTextarea = document.getElementById('debugLogTextarea');
+  const btnClearDebugLog = document.getElementById('btnClearDebugLog');
+  let debugLogEntries = [];
+  let lastDebugLogAtMs = null;
+  function appendDebugLog(msg){
+    const now = performance.now();
+    const gapLabel = lastDebugLogAtMs == null ? '' : ` (+${Math.round(now - lastDebugLogAtMs)}ms)`;
+    lastDebugLogAtMs = now;
+    const ts = new Date().toLocaleTimeString('en-US', {hour12:false});
+    debugLogEntries.push(`[${ts}]${gapLabel} ${msg}`);
+    if(debugLogEntries.length > 500) debugLogEntries.shift();
+    if(debugLogTextarea){
+      debugLogTextarea.value = debugLogEntries.join('\n');
+      debugLogTextarea.scrollTop = debugLogTextarea.scrollHeight;
+    }
+  }
+  if(btnClearDebugLog){
+    btnClearDebugLog.onclick = ()=>{
+      debugLogEntries = [];
+      lastDebugLogAtMs = null;
+      if(debugLogTextarea) debugLogTextarea.value = '';
+    };
+  }
+
   function showWarn(msg, ms){
+    if(msg) appendDebugLog(msg);
     clearTimeout(showWarn._t);
     warnbarText.textContent = msg;
     warnbar.style.display = msg ? 'flex' : 'none';
