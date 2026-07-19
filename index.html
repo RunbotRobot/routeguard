@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.57</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.58</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -289,11 +289,11 @@
           <input type="checkbox" id="showLocationToggle" checked style="width:auto;">
         </div>
         <div class="legend-row" style="justify-content:space-between;margin-top:6px;">
-          <span>Rotate map to face me <b>(temporarily disabled)</b></span>
-          <input type="checkbox" id="rotateMapToggle" style="width:auto;" disabled>
+          <span>Rotate map to face me <b>(rebuilt — test carefully)</b></span>
+          <input type="checkbox" id="rotateMapToggle" style="width:auto;">
         </div>
         <div style="font-size:11.5px;color:var(--muted);margin-top:4px;">
-          Shows in every mode, not just while recording a run. Map rotation is new — if pins or lines ever look like they've shifted from where they should be, turn this off immediately; everything reverts to normal north-up.
+          Off by default. Automatically snaps back to normal north-up the instant you touch the map for any reason (pan, tap a road, drop a pin, switch to Pin/Route mode) — tapping "Recenter" is what turns it back on, same as it already does for following your position. If pins, lines, or tapped road names ever look wrong, turn this off immediately; everything reverts to normal north-up and stays that way.
         </div>
         <div id="headingBadge" style="font-size:11.5px;color:var(--muted);margin-top:6px;display:none;">Facing —</div>
       </div>
@@ -652,7 +652,6 @@
     fadeAnimation: false,
     markerZoomAnimation: false
   }).setView([39.83, -98.58], 4); // center of US fallback
-  const mapRotationSupported = false; // rotation plugin removed after it destabilized the map in real-world testing
 
   const streetLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19,
@@ -725,6 +724,16 @@
       showHint(routeClicks.length === 1 ? 'Now tap your end point.' : 'Tap a start point, then an end point.');
     }
     if(m==='browse'){ btnBrowse.classList.add('active'); showHint(''); }
+    // accurate tap-to-place matters more than the rotation visual in Pin/
+    // Route mode specifically — force plain north-up for as long as either
+    // is active (see the rotation section further down for the full
+    // reasoning). Sets the same persistent rotationSuspended flag a manual
+    // touch does, not just today's mode check, so leaving Pin/Route mode
+    // doesn't silently snap rotation back on by itself — Recenter is the
+    // one consistent way anything that suspended rotation gets un-suspended,
+    // same as it already is for a manual drag.
+    if(m !== 'browse') rotationSuspended = true;
+    updateMapRotationVisual();
   }
   btnPin.onclick = ()=>setMode('pin');
   btnRoute.onclick = ()=>setMode('route');
@@ -2956,14 +2965,104 @@
     return `Facing ${dirs[i]} (${Math.round(deg)}°)`;
   }
 
-  // Map rotation was removed: the plugin patches core parts of Leaflet just
-  // by being loaded, and it destabilized the map (including location and
-  // nearby-data loading) during real-world testing. The toggle stays in the
-  // UI but is disabled with an explanation until this is rebuilt more safely.
+  // ---------- map rotation (heading-up) ----------
+  // The previous attempt used a third-party plugin (leaflet-rotate) that,
+  // per its own docs, patches core parts of Leaflet just by being loaded —
+  // not only while actively rotating. That's the leading suspect for a
+  // real incident where the position marker and nearby-data loading both
+  // broke at once, for no apparent shared cause, and pulling the plugin
+  // entirely (not just disabling the feature) fixed both immediately.
+  // Never proven with certainty — one live incident, no dev repro — but
+  // strong enough to rule out reaching for another such plugin without a
+  // way to test it under real combined conditions (live GPS + panning +
+  // zooming + mode-switching together) first, which this sandbox still
+  // can't do.
+  //
+  // This rebuild is hand-rolled and deliberately narrow: it rotates ONLY
+  // Leaflet's own map pane (a CSS transform on the element Leaflet already
+  // moves for panning — composed with, not replacing, whatever translate
+  // Leaflet has currently set there) — never the outer map container,
+  // which is where Leaflet reads click/drag coordinates from and where the
+  // zoom/attribution controls live as untouched siblings. That keeps every
+  // one of Leaflet's own internals (hit-testing, drag math, projections)
+  // completely unaware that rotation exists — nothing about them is
+  // patched, touched, or relied upon behaving differently.
+  //
+  // The one thing that approach can't fix on its own: while the pane is
+  // visually rotated, a raw tap's screen position no longer matches what
+  // Leaflet (still thinking in unrotated terms) would compute for it —
+  // both for converting a click to a lat/lng AND, worse, for deciding
+  // which canvas-drawn road you tapped in the first place, which happens
+  // inside Leaflet's own hit-testing before any app code sees the event at
+  // all. Correcting the first is straightforward (rotate the point back
+  // before asking Leaflet what it means); correcting the second would mean
+  // patching Leaflet's internal click dispatch — exactly the kind of
+  // change the removal above warns against. Rather than do that, rotation
+  // suspends itself — snapping straight back to normal north-up — the
+  // instant you touch the map for any reason at all (drag, tap a road,
+  // drop a pin, switch to Pin/Route mode), via a listener on the very
+  // first pointer-down, before Leaflet processes anything about that
+  // touch. Practically: rotation is a purely passive "glance at it while
+  // running" visual, never active during an actual interaction — so
+  // everything downstream of a tap (which road, which pin, where a new pin
+  // lands) always happens against a plain, fully-correct, unrotated map.
+  // Explicitly re-enabling it (tapping "Recenter") is the only way it
+  // turns back on, mirroring how position-follow itself already behaves.
+  const LS_ROTATE_MAP = "rg_rotate_map";
+  let rotationEnabled = (function(){ try{ return localStorage.getItem(LS_ROTATE_MAP) === '1'; }catch(e){ return false; } })();
+  let rotationSuspended = false; // true whenever accurate unrotated hit-testing matters right now
+  let currentRotationDeg = 0;    // the rotation actually applied to the pane right now
+  const mapPaneEl = map.getPane('mapPane');
+
+  function rotationShouldBeActive(){
+    return rotationEnabled && !rotationSuspended && followMode && mode === 'browse' && showingLocation;
+  }
+
+  // Leaflet overwrites the pane's transform on every pan/zoom/drag update
+  // (that's how it moves the map at all) — this composes our rotation back
+  // on top of whatever Leaflet just set, using Leaflet's own tracked pane
+  // offset (map._getMapPanePos(), a narrow, stable, read-only reliance on
+  // one internal — not a patch) rather than parsing the transform string.
+  // transform-origin is recomputed to the viewport's own center every
+  // time too, converted into the pane's coordinate space, so rotation
+  // always pivots around what's visually in the middle of the screen
+  // instead of drifting off-center as you pan.
+  function reapplyRotationTransform(){
+    const pos = map._getMapPanePos ? map._getMapPanePos() : L.DomUtil.getPosition(mapPaneEl);
+    if(!pos) return;
+    mapPaneEl.style.transform = `translate3d(${pos.x}px,${pos.y}px,0) rotate(${currentRotationDeg}deg)`;
+    const center = map.getSize().divideBy(2);
+    mapPaneEl.style.transformOrigin = `${center.x - pos.x}px ${center.y - pos.y}px`;
+  }
+  map.on('move zoom', reapplyRotationTransform);
+
+  function updateMapRotationVisual(){
+    const targetDeg = rotationShouldBeActive() ? -lastHeadingDeg : 0;
+    if(targetDeg === currentRotationDeg) return;
+    currentRotationDeg = targetDeg;
+    reapplyRotationTransform();
+  }
+
+  // any pointer touching the map at all suspends rotation immediately,
+  // before Leaflet (or this app's own click handlers) processes the
+  // gesture — see the big comment above for why this is what makes the
+  // whole approach safe without needing to patch Leaflet's hit-testing
+  const mapContainerElForRotation = map.getContainer();
+  function suspendRotationForInteraction(){
+    if(rotationSuspended) return;
+    rotationSuspended = true;
+    updateMapRotationVisual();
+  }
+  mapContainerElForRotation.addEventListener('mousedown', suspendRotationForInteraction, true);
+  mapContainerElForRotation.addEventListener('touchstart', suspendRotationForInteraction, true);
+
   const rotateMapToggle = document.getElementById('rotateMapToggle');
-  rotateMapToggle.disabled = true;
-  rotateMapToggle.checked = false;
-  rotateMapToggle.parentElement.title = 'Temporarily removed — it caused real reliability problems and is being rebuilt more carefully';
+  rotateMapToggle.checked = rotationEnabled;
+  rotateMapToggle.onchange = ()=>{
+    rotationEnabled = rotateMapToggle.checked;
+    try{ localStorage.setItem(LS_ROTATE_MAP, rotationEnabled ? '1' : '0'); }catch(e){}
+    if(!rotationEnabled){ rotationSuspended = false; updateMapRotationVisual(); }
+  };
 
   function setHeading(deg){
     lastHeadingDeg = deg;
@@ -2971,7 +3070,12 @@
       const el = liveMarker.getElement();
       if(el) coneEl = el.querySelector('#liveCone');
     }
-    if(coneEl) coneEl.style.transform = `rotate(${deg}deg)`;
+    updateMapRotationVisual();
+    // while the map itself is rotating to face this heading, the cone
+    // stays fixed pointing straight up — the map's own orientation is what
+    // conveys direction now. North-up (rotation inactive) is the normal
+    // case: the cone rotates to point the way you're facing instead.
+    if(coneEl) coneEl.style.transform = `rotate(${rotationShouldBeActive() ? 0 : deg}deg)`;
     headingBadge.textContent = headingLabel(deg);
   }
 
@@ -3089,6 +3193,7 @@
     headingBadge.style.display = 'none';
     if(liveMarker){ map.removeLayer(liveMarker); liveMarker = null; coneEl = null; }
     if(liveAccuracyCircle){ map.removeLayer(liveAccuracyCircle); liveAccuracyCircle = null; }
+    updateMapRotationVisual(); // showingLocation just went false — snaps rotation back to north-up if it was active
   }
 
   showLocationToggle.onchange = ()=>{
@@ -3099,7 +3204,13 @@
   map.on('dragstart', ()=>{ if(showingLocation) followMode = false; });
   btnRecenter.onclick = ()=>{
     followMode = true;
+    // explicitly re-centering is the one thing that turns rotation back on
+    // (see the rotation section above) — everything else that could have
+    // suspended it (a manual drag/tap, or Pin/Route mode) is exactly what
+    // this button is for leaving behind
+    rotationSuspended = false;
     if(lastKnownLatLng) map.setView(lastKnownLatLng, map.getZoom());
+    updateMapRotationVisual();
   };
 
   // --- recording (GPX capture), independent of mode and of the location toggle above ---
