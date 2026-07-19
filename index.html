@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.64</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.65</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -2715,7 +2715,26 @@
         if(cancelled) return;
         const c = queue.shift();
         if(!c) return;
-        try{ await ensureCellLoaded(c); }catch(err){ console.error('Could not load route area', c, err); failedCount++; }
+        // Every timing diagnostic added so far (fetch time, apply time) only
+        // fires once ensureCellLoaded actually returns data — none of them
+        // can see a cell that hangs and then ultimately FAILS (every tile-
+        // cache/Overpass attempt rejecting, e.g. via Promise.any's
+        // AggregateError), since that throws before reaching any of that
+        // code. That was a real blind spot: a report of a long freeze with
+        // literally no debug message from three separate rounds of
+        // instrumentation is at least as consistent with "this cell never
+        // succeeded at all" as with "it succeeded but slowly." This one
+        // isn't gated behind the debug-messages toggle — an area that
+        // couldn't be checked at all is worth surfacing regardless.
+        const cellStartMs = performance.now();
+        try{
+          await ensureCellLoaded(c);
+        }catch(err){
+          const failedMs = Math.round(performance.now() - cellStartMs);
+          console.error('Could not load route area', c, err);
+          failedCount++;
+          showWarn(`⚠ Could not check an area near ${c.lat.toFixed(3)},${c.lng.toFixed(3)} after ${failedMs}ms (${err && err.message ? err.message : 'unknown error'}) — that stretch may need to be re-verified before you rely on this route there.`, 8000);
+        }
         done++;
         textEl.textContent = `Checking areas along route… (${done}/${total})`;
         barEl.style.width = `${Math.round(done/total*100)}%`;
