@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.62</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.63</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -2521,7 +2521,27 @@
       // pressure that was almost certainly why the widest attempt crashed
       // the tab outright rather than just running slowly.
       const corridorCellKeys = new Set(corridorCells.map(c=>cellKeyForCellCenter(c.lat,c.lng)));
+      // Diagnostic only (debug-messages toggle). loadCellsWithProgress above
+      // has its own progress UI and yields between cells (async), so panning
+      // stays responsive during it — but everything from here down is a
+      // single synchronous stretch with no yield points at all, on the main
+      // thread, for however long it takes. buildRoutingGraphFromLineCache in
+      // particular scans the user's ENTIRE historical lineCache every single
+      // call (see its own comment) — for a wide-ranging user that could be
+      // tens of thousands of entries, and it runs again on every
+      // margin-widening attempt. A freeze here would show no debug message
+      // from either of the load-cells diagnostics (this isn't a fetch or an
+      // apply, it never touches ensureCellLoaded at all) and would leave
+      // the progress overlay's last-painted "(x/y)" text frozen on screen
+      // — exactly matching a report of the freeze appearing to land on
+      // whatever cell happened to be displayed last, inconsistently, rather
+      // than one specific slow area.
+      const graphStartMs = performance.now();
       const graph = buildRoutingGraphFromLineCache(corridorCellKeys);
+      const graphMs = Math.round(performance.now() - graphStartMs);
+      if(graphMs > 500){
+        showDebugMsg(`Slow graph build: ${graphMs}ms over ${Object.keys(lineCache).length} total cached lines (attempt ${attempt+1}/${AVOIDANCE_MARGIN_ATTEMPTS}, ${graph.nodeById.size} nodes in corridor)`, 6000);
+      }
       if(graph.nodeById.size === 0){
         if(isLastAttempt) throw new Error('no road data returned for this area');
         continue;
@@ -2529,7 +2549,12 @@
 
       const locations = allKnownLocationsForProximityCheck();
       const poiThresholdMeters = MIN_LOCATION_DISTANCE_FT * 0.3048;
+      const blockStartMs = performance.now();
       markBlockedEdges(graph, locations, poiThresholdMeters, true);
+      const blockMs = Math.round(performance.now() - blockStartMs);
+      if(blockMs > 500){
+        showDebugMsg(`Slow blocked-edge check: ${blockMs}ms over ${locations.length} known locations (attempt ${attempt+1}/${AVOIDANCE_MARGIN_ATTEMPTS})`, 6000);
+      }
 
       const startNode = nearestGraphNode(graph.nodeById, a.lat, a.lng);
       const endNode = nearestGraphNode(graph.nodeById, b.lat, b.lng);
@@ -2538,7 +2563,12 @@
         continue;
       }
 
+      const dijkstraStartMs = performance.now();
       const path = dijkstraPath(graph.adjacency, startNode, endNode);
+      const dijkstraMs = Math.round(performance.now() - dijkstraStartMs);
+      if(dijkstraMs > 500){
+        showDebugMsg(`Slow pathfinding: ${dijkstraMs}ms over ${graph.adjacency.size} graph nodes (attempt ${attempt+1}/${AVOIDANCE_MARGIN_ATTEMPTS})`, 6000);
+      }
       if(path) return { pairs: nodePathToPairs(path, graph.nodeById) };
       // no unblocked path within this margin — widen and retry unless this
       // was already the widest attempt.
