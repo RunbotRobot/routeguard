@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.60</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.61</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -1710,6 +1710,25 @@
   map.getPane('bulkMarkerPane').style.zIndex = 600; // same tier as Leaflet's default markerPane
   map.createPane('routeLinesPane');
   map.getPane('routeLinesPane').style.zIndex = 410; // above bulk lines, so the active route always draws on top
+  // Tap-target hit-lines (see drawSegment) used to live on whichever visual
+  // pane matched their segment (bulkLinesPane or routeLinesPane) so a
+  // route's hit-line wouldn't get hidden along with the bulk pane at low
+  // zoom. But each Leaflet canvas pane is a single full-viewport element,
+  // stacked by zIndex — once routeLinesPane's canvas exists (any route
+  // drawn, anywhere), it sits on top of bulkLinesPane's canvas across the
+  // ENTIRE map, and a native click always targets the topmost element at
+  // that pixel. So every tap anywhere on the map hit routeLinesPane's canvas
+  // first; if there was no route shape at that exact point Leaflet correctly
+  // found nothing and did nothing further — but the click never reached
+  // bulkLinesPane's canvas underneath at all, silently breaking tap-for-name
+  // on every ordinary road the instant any route existed. Giving all
+  // hit-lines their own single dedicated pane (never hidden, so route taps
+  // still always work) removes the cross-pane competition entirely — one
+  // canvas, one hit-test, no stacking to lose to. Whether a *non-route*
+  // hit-line should still respond while its visual line is hidden at low
+  // zoom is now handled inside the click handler itself (see drawSegment).
+  map.createPane('segHitPane');
+  map.getPane('segHitPane').style.zIndex = 420;
 
   const BULK_DISPLAY_MIN_ZOOM = MIN_ZOOM_FOR_AUTO; // same "too much to matter" threshold used for auto-loading
   function updateBulkDisplay(){
@@ -1730,12 +1749,13 @@
 
   const segRenderer = L.canvas({ padding: 0.6, pane: 'bulkLinesPane' });
   const routeSegRenderer = L.canvas({ padding: 0.6, pane: 'routeLinesPane' });
+  const segHitRenderer = L.canvas({ padding: 0.6, pane: 'segHitPane' });
 
   const segLayer = L.layerGroup().addTo(map);
   const segHitLayer = L.layerGroup().addTo(map); // invisible wide tap-targets, drawn above segLayer
   const segPolylines = {}; // key -> visible polyline
   const segHitLines = {};  // key -> invisible fat hit-target polyline
-  const segHitLineIsRoute = {}; // key -> whether that hit-line currently lives on the route (always-visible) renderer
+  const segHitLineIsRoute = {}; // key -> whether that segment currently counts as the route (gates tap-for-name for non-route segments when the bulk pane is hidden — see drawSegment)
 
   const segCasingLines = {}; // key -> white outline drawn beneath the colored line, for contrast on any background
 
@@ -1785,31 +1805,29 @@
     }).addTo(segLayer);
     segPolylines[key] = pl;
 
-    // The hit-line has to live on the same renderer/pane as its visible
-    // line, not always on segRenderer — segRenderer's pane (bulkLinesPane)
-    // gets hidden (display:none) while zoomed out, and a hidden pane's
-    // click targets don't receive clicks either. A route's own polyline
-    // stays visible at every zoom (routeSegRenderer/routeLinesPane never
-    // hides), but its hit-line was always created on segRenderer regardless
-    // — so tapping the route to see a street name silently did nothing
-    // whenever you were zoomed out past the bulk-display threshold, which
-    // is exactly when you're most likely to be looking at the whole route
-    // right after planning one. Only rebuilt when isRoute actually changed
-    // since the hit-line was last created for this key (rather than every
-    // call, like the casing/colored line above) — the overwhelming majority
-    // of drawSegment calls are redraws of ordinary, never-route segments,
-    // and rebuilding their hit-line (plus rebinding two listeners) on every
-    // single one of those would undo real chunked-drawing performance work
-    // for no behavioral benefit.
-    if(!segHitLines[key] || segHitLineIsRoute[key] !== isRoute){
-      if(segHitLines[key]) segHitLayer.removeLayer(segHitLines[key]);
+    // Every hit-line lives on segHitRenderer/segHitPane, a single dedicated
+    // pane that's never hidden — not on the segment's own visual
+    // renderer/pane (see segHitPane's creation comment above for why that
+    // used to silently break tap-for-name on every ordinary road the
+    // instant a route existed). Created once per key and left alone after
+    // that; only segHitLineIsRoute[key] gets refreshed on every call, since
+    // that's a plain flag read at click-time, not something that requires
+    // touching the DOM/canvas at all.
+    if(!segHitLines[key]){
       // a much fatter, fully transparent line makes it far easier to tap a
       // thin road on a phone screen without changing how thin it looks
       const hit = L.polyline(latlngs, {
-        renderer, color: '#000', weight: 26, opacity: 0, interactive: true
+        renderer: segHitRenderer, color: '#000', weight: 26, opacity: 0, interactive: true
       }).addTo(segHitLayer);
       hit.on('click', (e)=>{
         L.DomEvent.stopPropagation(e);
+        // a non-route segment's visual line is hidden below
+        // BULK_DISPLAY_MIN_ZOOM (see updateBulkDisplay) — its hit-line stays
+        // on this always-on pane regardless, so without this check tapping
+        // empty ground where an unseen line happens to run would still pop
+        // up a name. A route's own line is never hidden, so it has no such
+        // gate.
+        if(!segHitLineIsRoute[key] && map.getZoom() < BULK_DISPLAY_MIN_ZOOM) return;
         showSegmentNamePopup(key, e.latlng);
       });
       // long-press (or right-click on desktop) identifies the spot instead
@@ -1818,11 +1836,12 @@
       hit.on('contextmenu', (e)=>{
         L.DomEvent.stopPropagation(e);
         if(e.originalEvent && e.originalEvent.preventDefault) e.originalEvent.preventDefault();
+        if(!segHitLineIsRoute[key] && map.getZoom() < BULK_DISPLAY_MIN_ZOOM) return;
         showIdentifyPopup(e.latlng);
       });
       segHitLines[key] = hit;
-      segHitLineIsRoute[key] = isRoute;
     }
+    segHitLineIsRoute[key] = isRoute;
   }
 
   // ---------- identify a location (long-press) ----------
@@ -1867,13 +1886,79 @@
   // unclassified tracks) fall back to the same reverse-geocode lookup as a
   // long-press, since that's often still able to describe the spot even
   // without a street name on file.
+  // A tap landing near where this segment ends is likely an intersection,
+  // not a random mid-block point — check whether some OTHER, differently-
+  // named segment also has an endpoint right there, entirely from data
+  // already in memory (no network call). Lets a plain tap-for-name upgrade
+  // to "Street A & Street B" — pasteable straight into Google Maps to get
+  // to the right general area — for exactly the case that matters (you're
+  // standing at a junction wondering what it's called), without needing to
+  // load anything new like building footprints or addresses.
+  const INTERSECTION_SNAP_METERS = 20;
+  function crossStreetNameFor(key, latlng){
+    const latlngs = lineCache[key];
+    const thisName = lineNames[key];
+    if(!latlngs || !thisName) return null;
+    const d0 = haversineMeters(latlng.lat, latlng.lng, latlngs[0][0], latlngs[0][1]);
+    const d1 = haversineMeters(latlng.lat, latlng.lng, latlngs[1][0], latlngs[1][1]);
+    const endpoint = d0 <= d1 ? latlngs[0] : latlngs[1];
+    if(Math.min(d0, d1) > INTERSECTION_SNAP_METERS) return null; // tapped mid-block, not near a junction
+    for(const k in lineCache){
+      if(k === key) continue;
+      const nm = lineNames[k];
+      if(!nm || nm === thisName) continue;
+      const ll = lineCache[k];
+      if(haversineMeters(endpoint[0], endpoint[1], ll[0][0], ll[0][1]) <= INTERSECTION_SNAP_METERS ||
+         haversineMeters(endpoint[0], endpoint[1], ll[1][0], ll[1][1]) <= INTERSECTION_SNAP_METERS){
+        return `${thisName} & ${nm}`;
+      }
+    }
+    return null;
+  }
+
+  // City/state/zip aren't in our own line data at all (OSM tags street
+  // names on ways, not addresses) — this is the one piece that genuinely
+  // needs a network round-trip. Cached per grid cell so re-tapping around
+  // the same neighborhood doesn't repeat the lookup, out of courtesy to
+  // Nominatim's free, no-key, rate-limited service (same one showIdentifyPopup
+  // already relies on for the long-press "identify" feature).
+  const cityStateZipCache = {};
+  async function cityStateZipFor(lat, lng){
+    const cellKey = cellKeyForLatLng(lat, lng);
+    if(cellKey in cityStateZipCache) return cityStateZipCache[cellKey];
+    try{
+      const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}&zoom=16&addressdetails=1`);
+      if(!res.ok) throw new Error('lookup failed');
+      const data = await res.json();
+      const a = data.address || {};
+      const city = a.city || a.town || a.village || a.hamlet || null;
+      const state = (a['ISO3166-2-lvl4'] || '').split('-')[1] || a.state || null;
+      const zip = a.postcode || null;
+      const label = city ? `${city}${state ? ', '+state : ''}${zip ? ' '+zip : ''}` : null;
+      cityStateZipCache[cellKey] = label;
+      return label;
+    }catch(err){
+      cityStateZipCache[cellKey] = null;
+      return null;
+    }
+  }
+
   function showSegmentNamePopup(key, latlng){
     const name = lineNames[key];
     if(name){
-      L.popup({maxWidth: 220})
+      const crossName = crossStreetNameFor(key, latlng);
+      const label = crossName || name;
+      const popup = L.popup({maxWidth: 240})
         .setLatLng(latlng)
-        .setContent(`<div style="font-size:12.5px;"><b>${escapeHtml(name)}</b></div>`)
+        .setContent(`<div style="font-size:12.5px;"><b>${escapeHtml(label)}</b></div>`)
         .openOn(map);
+      cityStateZipFor(latlng.lat, latlng.lng).then(csz=>{
+        if(!csz) return;
+        // the popup may have been closed (or replaced by a later tap) by the
+        // time this resolves — only touch it if it's still the open one
+        if(!map.hasLayer(popup)) return;
+        popup.setContent(`<div style="font-size:12.5px;"><b>${escapeHtml(label)}</b><br>${escapeHtml(csz)}</div>`);
+      });
     } else {
       showIdentifyPopup(latlng);
     }
