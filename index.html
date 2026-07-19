@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.63</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.64</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -2778,24 +2778,47 @@
     }
   }
 
+  let pendingRouteRender = null;
   function renderRoutePairs(pairs){
     const newKeys = pairs.map(pair=>edgeKey(pair[0], pair[1]));
     // set this before drawing so any concurrent applyOverpassResults call
     // (a background cell load finishing mid-view) already sees the new
-    // route membership rather than a stale one
+    // route membership rather than a stale one — this part stays
+    // synchronous and cheap (just a Set of strings); it's the actual
+    // drawing below that scales with route length and needs chunking
     routeLayerKeySet = new Set(newKeys);
-    pairs.forEach((pair, i)=>{
-      drawSegment(newKeys[i], pair, true);
-    });
+    const previousKeys = routeLayerKeys;
+    routeLayerKeys = newKeys;
+
+    // Same wrong "a route is always small" assumption that already made
+    // the zoom-rescale loop freeze the map on a long route (see
+    // runChunked's other callers above) — a real multi-mile route through
+    // a dense street grid resolves to individual OSM node-to-node edges,
+    // which can run into the thousands. drawSegment does real work per
+    // call (a casing polyline, a colored polyline, and — for a
+    // never-before-seen key — a hit-line with two event listeners), so
+    // drawing that many in one synchronous pass, right after route
+    // computation finishes, blocked the main thread for however long that
+    // took. That's a *third* spot this exact assumption broke, and the
+    // most likely explanation for a freeze that showed up in none of the
+    // load/routing diagnostics: none of them cover anything that happens
+    // after findAvoidancePath returns.
+    if(pairs.length > 500){
+      showDebugMsg(`Drawing route: ${pairs.length} segments (chunked across frames, was one synchronous pass before this)`, 6000);
+    }
+    if(pendingRouteRender) pendingRouteRender.cancelled = true;
+    const drawItems = pairs.map((pair,i)=>({ key: newKeys[i], latlngs: pair, isRoute: true }));
     // revert any segments from a previous route that aren't part of this one
     // back to their normal (non-route) appearance
-    routeLayerKeys.forEach(key=>{
+    previousKeys.forEach(key=>{
       if(routeLayerKeySet.has(key)) return;
       const existing = segPolylines[key];
       if(!existing) return;
-      drawSegment(key, existing.getLatLngs(), false);
+      drawItems.push({ key, latlngs: existing.getLatLngs(), isRoute: false });
     });
-    routeLayerKeys = newKeys;
+    pendingRouteRender = runChunked(drawItems, item=>{
+      drawSegment(item.key, item.latlngs, item.isRoute);
+    }, 12);
   }
 
   // ---------- map click handling ----------
