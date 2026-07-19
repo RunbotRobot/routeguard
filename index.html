@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.72</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.73</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -2202,7 +2202,7 @@
   // .setIcon() on every item that's ever been drawn, whether or not it's
   // anywhere near the current viewport. Returns a token whose .cancelled
   // flag can be set to stop a stale batch early (see callers below).
-  function runChunked(items, perItem, budgetMs, onComplete){
+  function runChunked(items, perItem, budgetMs, onComplete, onProgress){
     const token = { cancelled: false };
     let i = 0;
     function step(){
@@ -2211,6 +2211,7 @@
       while(i < items.length && performance.now() < end){
         perItem(items[i++]);
       }
+      if(onProgress) onProgress(i, items.length);
       if(i < items.length){
         requestAnimationFrame(step);
       } else if(onComplete){
@@ -2470,7 +2471,7 @@
   // hard block or a steep-but-passable cost. findAvoidancePath uses
   // strict=false only for its last-resort fallback pass, once every strict
   // attempt has failed.
-  function markBlockedEdges(graph, locations, poiThresholdMeters, strict){
+  function markBlockedEdges(graph, locations, poiThresholdMeters, strict, onProgress){
     if(strict === undefined) strict = true;
     const { nodeById, adjacency } = graph;
     const locationIndex = buildLocationIndex(locations);
@@ -2525,7 +2526,7 @@
         } else {
           edge.costMultiplier = proximityCostMultiplier(result.minPoiDist, poiThresholdMeters, poiSoftThreshold);
         }
-      }, 12, resolve);
+      }, 12, resolve, onProgress);
     });
   }
 
@@ -2672,6 +2673,47 @@
   // even those have a limit)
   const MAX_AVOIDANCE_ROUTE_METERS = 80000; // ~50 miles
 
+  // Reuses the same progress overlay loadCellsWithProgress shows for area
+  // loading, so there's one consistent "still working" indicator for the
+  // whole route-planning flow rather than it looking finished (or frozen)
+  // during the gap between the area-loading bar disappearing and the route
+  // actually being drawn. Delayed onset (only appears if this is still
+  // running after ~800ms) so a fast route — most of them — never flashes
+  // it. No cancel button here, unlike the loading step: interrupting a
+  // partially-finished blocked-edge check would hand Dijkstra a graph
+  // where some edges never got checked at all, which could route straight
+  // through a location's buffer that just hadn't been reached yet — a
+  // decidedly worse failure mode than a route sometimes taking a little
+  // longer to plan than you'd like.
+  async function markBlockedEdgesWithProgress(graph, locations, poiThresholdMeters, strict){
+    const progressEl = document.getElementById('routeLoadProgress');
+    const textEl = document.getElementById('routeLoadProgressText');
+    const barEl = document.getElementById('routeLoadProgressBar');
+    const cancelBtn = document.getElementById('btnCancelRouteLoad');
+    let shown = false;
+    const showTimer = setTimeout(()=>{
+      shown = true;
+      cancelBtn.style.display = 'none';
+      barEl.style.width = '0%';
+      textEl.textContent = 'Checking for nearby locations…';
+      progressEl.style.display = 'block';
+    }, 800);
+    try{
+      await markBlockedEdges(graph, locations, poiThresholdMeters, strict, (done, total)=>{
+        if(!shown) return;
+        const pct = Math.round(done/total*100);
+        textEl.textContent = `Checking for nearby locations… (${pct}%)`;
+        barEl.style.width = `${pct}%`;
+      });
+    } finally {
+      clearTimeout(showTimer);
+      if(shown){
+        progressEl.style.display = 'none';
+        cancelBtn.style.display = ''; // restore for the next loadCellsWithProgress call, if any
+      }
+    }
+  }
+
   // { pairs: [...] } on success (result.isFallback + adjacencyViolationCount
   // set if this is the last-resort own-graph fallback rather than a route
   // that avoids every adjacency outright), { pairs: null } if even the
@@ -2749,7 +2791,7 @@
       const locations = allKnownLocationsForProximityCheck();
       const poiThresholdMeters = MIN_LOCATION_DISTANCE_FT * 0.3048;
       const blockStartMs = performance.now();
-      await markBlockedEdges(graph, locations, poiThresholdMeters, true);
+      await markBlockedEdgesWithProgress(graph, locations, poiThresholdMeters, true);
       const blockMs = Math.round(performance.now() - blockStartMs);
       if(blockMs > 500){
         showDebugMsg(`Slow blocked-edge check: ${blockMs}ms over ${locations.length} known locations (attempt ${attempt+1}/${AVOIDANCE_MARGIN_ATTEMPTS})`, 6000);
@@ -2788,7 +2830,7 @@
         // This finds whichever path touches the fewest, least-bad adjacency
         // violations, rather than a route picked with zero awareness of any
         // of this.
-        await markBlockedEdges(graph, locations, poiThresholdMeters, false);
+        await markBlockedEdgesWithProgress(graph, locations, poiThresholdMeters, false);
         const fallbackPath = dijkstraPath(graph.adjacency, startNode, endNode);
         if(fallbackPath){
           const pairs = nodePathToPairs(fallbackPath, graph.nodeById);
