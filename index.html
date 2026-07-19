@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.66</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.67</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -571,7 +571,18 @@
   let saveCachesTimer = null;
   function flushSaveCaches(){
     if(saveCachesTimer){ clearTimeout(saveCachesTimer); saveCachesTimer = null; }
+    // Diagnostic only. Each attempt below re-serializes the entire
+    // lineCache/lineNames/poiCache (JSON.stringify has to walk the whole
+    // object every time — there's no incremental/partial serialization),
+    // and a failing save can retry that up to ~21 times across the eviction
+    // escalation loop. For a large cache that's a lot of full-object
+    // stringify work, entirely unmeasured until now — the debug log showed
+    // a ~12s gap right after route drawing finished with nothing else to
+    // explain it, and this is the only unmeasured step in between.
+    const flushStartMs = performance.now();
+    let saveAttempts = 0;
     let dataOk = saveLineCache(lineCache) && saveLineNames(lineNames) && savePoiCache(poiCache);
+    saveAttempts++;
     // the official state-directory cache (see "official WA state directory"
     // below) is a single county-wide blob that lives outside the per-cell
     // loadedCells/cellRecency system this function otherwise manages, so the
@@ -585,6 +596,7 @@
       dropOfficialCacheForSpace();
       droppedOfficialCache = true;
       dataOk = saveLineCache(lineCache) && saveLineNames(lineNames) && savePoiCache(poiCache);
+      saveAttempts++;
     }
     let evictedTotal = 0;
     let batchSize = Math.max(50, Math.ceil(loadedCells.size * 0.1));
@@ -593,6 +605,7 @@
       if(evicted === 0) break; // nothing left worth evicting — retrying won't help
       evictedTotal += evicted;
       dataOk = saveLineCache(lineCache) && saveLineNames(lineNames) && savePoiCache(poiCache);
+      saveAttempts++;
       batchSize *= 2;
     }
     // loadedCells/cellRecency's own writes are small and would likely
@@ -601,6 +614,10 @@
     // once the data they describe is confirmed saved too
     const cellsOk = dataOk && saveLoadedCells(loadedCells);
     const recencyOk = dataOk && saveCellRecency(cellRecency);
+    const flushElapsedMs = Math.round(performance.now() - flushStartMs);
+    if(flushElapsedMs > 500){
+      showDebugMsg(`Slow cache save: ${flushElapsedMs}ms over ${saveAttempts} save attempt${saveAttempts===1?'':'s'} (${Object.keys(lineCache).length} lines, ${Object.keys(poiCache).length} locations, ${evictedTotal} cells evicted)`, 6000);
+    }
     if(droppedOfficialCache && dataOk){
       showDebugMsg('Freed local storage: dropped the cached official childcare/school directory (re-fetches automatically, next time you open Settings or within a month).', 5000);
     }
@@ -2357,30 +2374,45 @@
     const { nodeById, adjacency } = graph;
     const locationIndex = buildLocationIndex(locations);
     const poiSoftThreshold = poiThresholdMeters * POI_SOFT_BUFFER_MULTIPLIER;
+    // Every physical edge appears twice in adjacency — once from each
+    // endpoint's perspective, which is what lets Dijkstra walk it either
+    // direction — but the proximity check below only depends on the pair of
+    // endpoints (same midpoint, same three check points, same answer either
+    // way), so computing it separately for both directions was pure waste.
+    // Confirmed via the debug log on a real route: over 14 seconds for one
+    // call, the single biggest piece of a reported freeze. Cache the result
+    // per unordered node pair instead of recomputing it a second time.
+    const computed = new Map();
     adjacency.forEach((edges, fromId)=>{
       const a = nodeById.get(fromId);
       if(!a) return;
       edges.forEach(edge=>{
         const b = nodeById.get(edge.to);
         if(!b) return;
-        const midLat = (a.lat+b.lat)/2, midLng = (a.lng+b.lng)/2;
-        const checkPts = [[a.lat,a.lng],[b.lat,b.lng],[midLat,midLng]];
-        let minPoiDist = Infinity, poiBlocked = false;
-        outerLoc: for(const loc of nearbyIndexedPoints(locationIndex, midLat, midLng)){
-          for(const [plat,plng] of checkPts){
-            const d = distanceToLocationMeters(plat, plng, loc);
-            if(d < minPoiDist) minPoiDist = d;
-            if(d < poiThresholdMeters){ poiBlocked = true; break outerLoc; }
+        const pairKey = fromId < edge.to ? fromId+'|'+edge.to : edge.to+'|'+fromId;
+        let result = computed.get(pairKey);
+        if(!result){
+          const midLat = (a.lat+b.lat)/2, midLng = (a.lng+b.lng)/2;
+          const checkPts = [[a.lat,a.lng],[b.lat,b.lng],[midLat,midLng]];
+          let minPoiDist = Infinity, poiBlocked = false;
+          outerLoc: for(const loc of nearbyIndexedPoints(locationIndex, midLat, midLng)){
+            for(const [plat,plng] of checkPts){
+              const d = distanceToLocationMeters(plat, plng, loc);
+              if(d < minPoiDist) minPoiDist = d;
+              if(d < poiThresholdMeters){ poiBlocked = true; break outerLoc; }
+            }
           }
+          result = { minPoiDist, poiBlocked };
+          computed.set(pairKey, result);
         }
-        edge.poiBlocked = poiBlocked;
-        edge.blocked = strict && poiBlocked;
+        edge.poiBlocked = result.poiBlocked;
+        edge.blocked = strict && result.poiBlocked;
         if(edge.blocked){
           edge.costMultiplier = 1;
-        } else if(poiBlocked){
+        } else if(result.poiBlocked){
           edge.costMultiplier = FALLBACK_ADJACENCY_PENALTY;
         } else {
-          edge.costMultiplier = proximityCostMultiplier(minPoiDist, poiThresholdMeters, poiSoftThreshold);
+          edge.costMultiplier = proximityCostMultiplier(result.minPoiDist, poiThresholdMeters, poiSoftThreshold);
         }
       });
     });
