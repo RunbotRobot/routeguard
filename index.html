@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.67</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.68</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -1490,12 +1490,26 @@
     // means an almost-fully-loaded view fetches a small patch instead of
     // redoing the whole visible area.
     const fetchBounds = cellsUnionBounds(missingCells);
+    // Diagnostic only. This whole function is a SEPARATE fetch path from
+    // ensureCellLoaded/loadCellsWithProgress (route planning's own area
+    // loader, already instrumented) — it's the general viewport auto-load,
+    // and per the comment above, it fires on "the auto-fit zoom after
+    // generating a route" too. None of the route-planning diagnostics can
+    // see this path at all, and it was the last unmeasured place a route
+    // generation's debug log could still be hiding time.
+    const loadStartMs = performance.now();
 
     // path 1: your own tile cache, if configured — try this first
     if(cfg.url){
       try{
         const data = await loadViaTileCache(cfg.url, fetchBounds);
+        const fetchMs = Math.round(performance.now() - loadStartMs);
+        const applyStartMs = performance.now();
         const {poiCount, roadEdgeCount} = applyOverpassResults(data, fetchBounds, true); // fetchBounds is built from missingCells only — guaranteed fresh, nothing to reconcile
+        const applyMs = Math.round(performance.now() - applyStartMs);
+        if(fetchMs > 2000 || applyMs > 1000){
+          showDebugMsg(`Slow viewport auto-load: ${fetchMs}ms fetch (tile-cache) + ${applyMs}ms apply, ${missingCells.length} cell${missingCells.length===1?'':'s'}`, 6000);
+        }
         lastSuccessAt = Date.now();
         lastLoadedBounds = b;
         lastPoiCount = poiCount;
@@ -1534,7 +1548,13 @@
     try{
       const data = await Promise.any(attempts.map(a => a.promise));
       attempts.forEach(a => a.controller.abort()); // cancel the losers
+      const fetchMs = Math.round(performance.now() - loadStartMs);
+      const applyStartMs = performance.now();
       const {poiCount, roadEdgeCount} = applyOverpassResults(data, fetchBounds, true); // fetchBounds is built from missingCells only — guaranteed fresh, nothing to reconcile
+      const applyMs = Math.round(performance.now() - applyStartMs);
+      if(fetchMs > 2000 || applyMs > 1000){
+        showDebugMsg(`Slow viewport auto-load: ${fetchMs}ms fetch (direct-overpass) + ${applyMs}ms apply, ${missingCells.length} cell${missingCells.length===1?'':'s'}`, 6000);
+      }
       lastSuccessAt = Date.now();
       lastLoadedBounds = b;
       lastPoiCount = poiCount;
