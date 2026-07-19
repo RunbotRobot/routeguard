@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.69</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.70</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -665,7 +665,21 @@
   // so at most ~1s of loaded-but-not-yet-persisted data is ever at risk —
   // acceptable given this is re-fetchable map data, not user-entered data
   window.addEventListener('pagehide', flushSaveCaches);
-  window.addEventListener('visibilitychange', ()=>{ if(document.visibilityState === 'hidden') flushSaveCaches(); });
+  // Diagnostic only (the appendDebugLog call). A screen lock, switching
+  // apps, or the browser just deciding to background the tab all fire this
+  // — and browsers throttle timers hard in a backgrounded tab, which would
+  // stall a plain setTimeout (like the save debounce) exactly as
+  // completely as any genuinely slow function would, with nothing else in
+  // this app's own code able to log anything during that stretch either.
+  // A heartbeat interval can't tell those two apart (neither can run
+  // during ANY JS that's still executing, whatever it is) — this can,
+  // directly: if the debug log shows a "hidden" entry right where an
+  // unexplained gap starts, that gap isn't this app's code being slow at
+  // all.
+  window.addEventListener('visibilitychange', ()=>{
+    appendDebugLog(`(visibility: ${document.visibilityState})`);
+    if(document.visibilityState === 'hidden') flushSaveCaches();
+  });
 
   const LS_TILE_CACHE_CFG = "rg_tile_cache_cfg";
   const DEFAULT_TILE_CACHE_URL = "https://sweet-bar-0621.runbotrobot.workers.dev";
@@ -2879,6 +2893,25 @@
   // mapped sidewalk even should one exist alongside it.
   async function planRoute(a,b){
     showHint('Building a route that avoids being directly adjacent to known locations…');
+    // Diagnostic only. Every debug-log gap traced so far has ended the same
+    // way: whatever's supposed to happen next (a 1-second save debounce,
+    // most recently) doesn't fire anywhere close to on schedule, with
+    // nothing else in this app's own code logging anything during that
+    // stretch either — not a slow function, an idle one. That's consistent
+    // with something OUTSIDE this app's control entirely: browsers
+    // aggressively throttle timers in a backgrounded tab (screen locked,
+    // switched to another app), which would stall a plain setTimeout just
+    // as completely as it would this. An independent heartbeat, ticking on
+    // its own separate timer for the duration of route planning, tests
+    // that directly — if IT also goes quiet for the same stretch, nothing
+    // in this app could be the cause, since there'd be no JS running here
+    // at all to blame; if it keeps ticking right through the gap, that
+    // rules background-throttling out and points back at this app instead.
+    let heartbeatCount = 0;
+    const heartbeatTimer = setInterval(()=>{
+      heartbeatCount++;
+      appendDebugLog(`(heartbeat #${heartbeatCount})`);
+    }, 1000);
     try{
       const result = await findAvoidancePath(a, b);
       if(result.cancelled){
@@ -2917,6 +2950,8 @@
     }catch(err){
       showHint('');
       showWarn(`⚠ Could not build a route (${err.message||'error'}). Check your connection, or try a shorter route.`, null);
+    }finally{
+      clearInterval(heartbeatTimer);
     }
   }
 
