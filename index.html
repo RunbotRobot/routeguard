@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.70</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.71</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -1190,21 +1190,69 @@
   function drawUndrawnBulkContent(){
     if(pendingBulkLineDraw) pendingBulkLineDraw.cancelled = true;
     if(pendingBulkPinDraw) pendingBulkPinDraw.cancelled = true;
-    const viewBounds = map.getBounds().pad(1); // triples the width/height — buffer so nearby panning doesn't immediately need another pass
-    const lineKeys = Object.keys(lineCache).filter(key=>
-      !segPolylines[key] && lineCache[key].some(p=>viewBounds.contains(p)));
-    const poiKeys = Object.keys(poiCache).filter(key=>{
-      if(autoPinMarkers[key]) return false;
-      const p = poiCache[key];
-      return viewBounds.contains([p.lat, p.lng]);
+    // Diagnostic confirmed this: a synthetic 150,000-line cache in view
+    // took 17.5 real seconds to finish drawing here, chunked or not —
+    // chunking keeps each individual frame short, but does nothing about
+    // the total NUMBER of frames needed when there's this much to draw.
+    // The actual bug is that the 3x-padded buffer zone (extra room around
+    // the real viewport, purely so nearby panning doesn't immediately need
+    // another pass) was competing for the exact same chunked budget as
+    // what's actually on screen right now — for a long route's wide
+    // auto-fit view, that buffer can be enormous, and none of it is
+    // visible while it's slowly catching up. Split into two passes so
+    // what's actually visible finishes first, at whatever speed that
+    // alone takes; the invisible buffer zone trails afterward, where
+    // however long it takes is no longer something you can see or feel.
+    const filterStartMs = performance.now();
+    const visibleBounds = map.getBounds();
+    const bufferBounds = visibleBounds.pad(1); // triples the width/height
+    const visibleLineKeys = [], bufferLineKeys = [];
+    Object.keys(lineCache).forEach(key=>{
+      if(segPolylines[key]) return;
+      const latlngs = lineCache[key];
+      if(latlngs.some(p=>visibleBounds.contains(p))) visibleLineKeys.push(key);
+      else if(latlngs.some(p=>bufferBounds.contains(p))) bufferLineKeys.push(key);
     });
+    const visiblePoiKeys = [], bufferPoiKeys = [];
+    Object.keys(poiCache).forEach(key=>{
+      if(autoPinMarkers[key]) return;
+      const p = poiCache[key];
+      const pt = [p.lat, p.lng];
+      if(visibleBounds.contains(pt)) visiblePoiKeys.push(key);
+      else if(bufferBounds.contains(pt)) bufferPoiKeys.push(key);
+    });
+    const filterMs = Math.round(performance.now() - filterStartMs);
+    if(filterMs > 500 || visibleLineKeys.length > 300){
+      showDebugMsg(`Bulk catch-up: filter took ${filterMs}ms over ${Object.keys(lineCache).length} cached lines — ${visibleLineKeys.length} lines + ${visiblePoiKeys.length} locations actually visible, ${bufferLineKeys.length} lines + ${bufferPoiKeys.length} locations in the surrounding buffer`, 6000);
+    }
     // route edges are drawn immediately by renderRoutePairs and already
     // have a segPolylines entry by the time this runs, so anything reaching
     // here is never part of the current route
-    pendingBulkLineDraw = runChunked(lineKeys, key=>drawSegment(key, lineCache[key], false));
-    pendingBulkPinDraw = runChunked(poiKeys, key=>{
+    const lineDrawStartMs = performance.now();
+    pendingBulkLineDraw = runChunked(visibleLineKeys, key=>drawSegment(key, lineCache[key], false), 12, ()=>{
+      const visibleMs = Math.round(performance.now() - lineDrawStartMs);
+      if(visibleMs > 1000) showDebugMsg(`Bulk catch-up: finished drawing ${visibleLineKeys.length} VISIBLE lines after ${visibleMs}ms`, 6000);
+      const bufferStartMs = performance.now();
+      pendingBulkLineDraw = runChunked(bufferLineKeys, key=>drawSegment(key, lineCache[key], false), 12, ()=>{
+        const bufferMs = Math.round(performance.now() - bufferStartMs);
+        if(bufferMs > 1000) showDebugMsg(`Bulk catch-up: finished drawing ${bufferLineKeys.length} buffer-zone lines after ${bufferMs}ms`, 6000);
+      });
+    });
+    const pinDrawStartMs = performance.now();
+    pendingBulkPinDraw = runChunked(visiblePoiKeys, key=>{
       const p = poiCache[key];
       drawAutoPin(key, p.lat, p.lng, p.category, p.label);
+    }, 12, ()=>{
+      const visibleMs = Math.round(performance.now() - pinDrawStartMs);
+      if(visibleMs > 1000) showDebugMsg(`Bulk catch-up: finished drawing ${visiblePoiKeys.length} VISIBLE locations after ${visibleMs}ms`, 6000);
+      const bufferStartMs = performance.now();
+      pendingBulkPinDraw = runChunked(bufferPoiKeys, key=>{
+        const p = poiCache[key];
+        drawAutoPin(key, p.lat, p.lng, p.category, p.label);
+      }, 12, ()=>{
+        const bufferMs = Math.round(performance.now() - bufferStartMs);
+        if(bufferMs > 1000) showDebugMsg(`Bulk catch-up: finished drawing ${bufferPoiKeys.length} buffer-zone locations after ${bufferMs}ms`, 6000);
+      });
     });
   }
 
@@ -2154,7 +2202,7 @@
   // .setIcon() on every item that's ever been drawn, whether or not it's
   // anywhere near the current viewport. Returns a token whose .cancelled
   // flag can be set to stop a stale batch early (see callers below).
-  function runChunked(items, perItem, budgetMs){
+  function runChunked(items, perItem, budgetMs, onComplete){
     const token = { cancelled: false };
     let i = 0;
     function step(){
@@ -2163,7 +2211,11 @@
       while(i < items.length && performance.now() < end){
         perItem(items[i++]);
       }
-      if(i < items.length) requestAnimationFrame(step);
+      if(i < items.length){
+        requestAnimationFrame(step);
+      } else if(onComplete){
+        onComplete();
+      }
     }
     requestAnimationFrame(step);
     return token;
