@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.56</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.57</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -1847,8 +1847,20 @@
         routeCells.add(cellKeyForLatLng(lat,lng));
       });
     });
-    const candidates = Object.keys(cellRecency)
-      .filter(k=>loadedCells.has(k) && !routeCells.has(k))
+    // Iterate loadedCells (the authoritative "is this loaded" set), not
+    // cellRecency — a cell can end up in loadedCells without ever getting a
+    // cellRecency entry (markCellsLoadedForBounds's bounds-based
+    // re-derivation can occasionally miss a cell that ensureCellLoaded's
+    // belt-and-suspenders fallback still marks loaded directly, see its
+    // comment). Filtering candidates from cellRecency's keys instead of
+    // loadedCells's meant any such cell could never be evicted at all —
+    // permanently occupying space no matter how aggressively eviction
+    // escalated, which is exactly the kind of gap that would make recovery
+    // top out well short of actually freeing enough room. Missing recency
+    // (||0) sorts first — never having a recorded use is, if anything, an
+    // even better eviction candidate than something used a while ago.
+    const candidates = Array.from(loadedCells)
+      .filter(k=>!routeCells.has(k))
       .sort((a,b)=>(cellRecency[a]||0)-(cellRecency[b]||0));
     const toEvict = candidates.slice(0, targetCount);
     if(toEvict.length === 0) return 0;
@@ -2487,7 +2499,14 @@
     // here — applyOverpassResults (just above) already scheduled a save
     // that covers this cell too, see flushSaveCaches for why loadedCells is
     // saved together with lineCache/poiCache rather than independently.
+    // cellRecency is set here too (not just relying on the
+    // markCellsLoadedForBounds call above having already done it) — a cell
+    // reaching only this fallback path was, by definition, the exact case
+    // that call already missed, and evictLeastRecentlyUsedCells should
+    // treat a just-loaded cell as freshly used, not as the oldest thing in
+    // the cache.
     loadedCells.add(key);
+    cellRecency[key] = Date.now();
   }
 
   // sequential (not parallel) on purpose — this can be a lot of cells for a
