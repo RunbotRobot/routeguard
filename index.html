@@ -218,7 +218,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.74</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.75</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -2154,7 +2154,7 @@
   // Overpass) still has the real data and gets asked again the next time
   // this area is actually needed. Returns how many cells were evicted (0 if
   // there was nothing left worth evicting, e.g. everything remaining is
-  // route-protected).
+  // route- or viewport-protected).
   function evictLeastRecentlyUsedCells(targetCount){
     const routeCells = new Set();
     routeLayerKeySet.forEach(key=>{
@@ -2162,6 +2162,22 @@
         const [lat,lng] = p.split(',').map(Number);
         routeCells.add(cellKeyForLatLng(lat,lng));
       });
+    });
+    // Also never evict a cell within (a padded buffer around) the current
+    // viewport, regardless of recency. Recency alone wasn't a strong enough
+    // guarantee: a cell just finished loading gets its recency bumped, but
+    // under sustained storage pressure (a long route, panning through a
+    // cache that's chronically over quota) another flush can hit the
+    // escalating eviction loop moments later and still sweep it up if other
+    // cells happen to have similarly-fresh recency — reported directly: an
+    // area flashes into view for a second, then goes dark gray again,
+    // because it really was just evicted right after being drawn. Padded
+    // the same way drawUndrawnBulkContent pads its own "what's nearby"
+    // check, so a cell just out of frame that a small pan would reveal
+    // isn't left exposed to eviction either.
+    const viewportCells = new Set();
+    gridCellsForBounds(map.getBounds().pad(1)).forEach(c=>{
+      viewportCells.add(cellKeyForCellCenter(c.lat, c.lng));
     });
     // Iterate loadedCells (the authoritative "is this loaded" set), not
     // cellRecency — a cell can end up in loadedCells without ever getting a
@@ -2176,7 +2192,7 @@
     // (||0) sorts first — never having a recorded use is, if anything, an
     // even better eviction candidate than something used a while ago.
     const candidates = Array.from(loadedCells)
-      .filter(k=>!routeCells.has(k))
+      .filter(k=>!routeCells.has(k) && !viewportCells.has(k))
       .sort((a,b)=>(cellRecency[a]||0)-(cellRecency[b]||0));
     const toEvict = candidates.slice(0, targetCount);
     if(toEvict.length === 0) return 0;
