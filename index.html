@@ -183,6 +183,27 @@
   }
   #btnCompass.show{display:block;}
 
+  /* Google-Maps-style pin placement: a fixed pin stays centered on screen
+     while the map pans underneath it — the actual target lat/lng is
+     always just wherever the map's own center currently is, read at
+     "Done" time, so no separate coordinate tracking is needed here. The
+     pin itself is pointer-events:none so drags pass straight through to
+     the map beneath it. */
+  #pinPlacementPin{
+    position:absolute;left:50%;top:50%;transform:translate(-50%,-100%);
+    z-index:999;display:none;pointer-events:none;color:var(--avoid);
+    filter:drop-shadow(0 2px 3px rgba(0,0,0,.45));
+  }
+  #pinPlacementPin.show{display:block;}
+  #pinPlacementPin svg{width:40px;height:40px;}
+  #pinPlacementBar{
+    position:absolute;left:50%;bottom:14px;transform:translateX(-50%);z-index:1000;
+    display:none;align-items:center;gap:8px;background:#fff;border:1px solid var(--line);
+    border-radius:8px;padding:8px 10px;box-shadow:0 2px 8px rgba(0,0,0,.15);
+    max-width:calc(100% - 28px);
+  }
+  #pinPlacementBar.show{display:flex;}
+
   #liveStatus{
     position:absolute;left:14px;bottom:14px;right:78px;z-index:1000;background:#fff;border:1px solid var(--line);
     border-radius:8px;padding:7px 10px;font-size:11.5px;box-shadow:0 2px 8px rgba(0,0,0,.12);display:none;
@@ -228,7 +249,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.76</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.77</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -263,6 +284,15 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
     </button>
     <button id="btnSatellite" title="Toggle satellite view">🛰</button>
+
+    <div id="pinPlacementPin">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 22s-7.5-6.7-7.5-12A7.5 7.5 0 0 1 12 2.5a7.5 7.5 0 0 1 7.5 7.5c0 5.3-7.5 12-7.5 12z"/><circle cx="12" cy="9.5" r="2.7" fill="#fff"/></svg>
+    </div>
+    <div id="pinPlacementBar">
+      <span style="font-size:11.5px;color:var(--muted);margin-right:2px;">Pan the map to position the pin</span>
+      <button id="pinPlacementCancel" class="livebtn">Cancel</button>
+      <button id="pinPlacementDone" class="livebtn primary">Done</button>
+    </div>
 
     <div id="panel">
       <div class="section">
@@ -3158,6 +3188,7 @@
   }
 
   map.on('click', (e)=>{
+    if(placingPin) return; // map taps during centered-pin placement should just pan, not also fire pin/route mode logic
     if(mode === 'pin'){
       openPinModal(e.latlng);
     } else if(mode === 'route'){
@@ -3807,9 +3838,46 @@ ${pts}
     }
   };
 
+  // Google-Maps-style placement: a pin stays fixed at the center of the
+  // screen while you pan the map underneath it, instead of a single tap
+  // guessing where it should land — the target is always just wherever
+  // the map's own center ends up being when you tap "Done", read fresh at
+  // that moment rather than tracked separately as you pan.
+  const pinPlacementPin = document.getElementById('pinPlacementPin');
+  const pinPlacementBar = document.getElementById('pinPlacementBar');
+  let placingPin = false;
+  let pinPlacementReturnView = null; // {center, zoom} to restore on Cancel
+
+  function startPinPlacement(){
+    pinPlacementReturnView = { center: map.getCenter(), zoom: map.getZoom() };
+    placingPin = true;
+    pinPlacementPin.classList.add('show');
+    pinPlacementBar.classList.add('show');
+    fabPin.style.display = 'none';
+  }
+  function endPinPlacement(){
+    placingPin = false;
+    pinPlacementPin.classList.remove('show');
+    pinPlacementBar.classList.remove('show');
+    fabPin.style.display = '';
+  }
+
   fabPin.onclick = ()=>{
+    // start centered wherever the pin would previously have dropped
+    // immediately (current location if known, else whatever's already on
+    // screen) — panning from there is how you fine-tune it
     const ll = lastKnownLatLng ? {lat:lastKnownLatLng[0], lng:lastKnownLatLng[1]} : map.getCenter();
-    openPinModal(ll);
+    map.setView(ll, map.getZoom());
+    startPinPlacement();
+  };
+  document.getElementById('pinPlacementCancel').onclick = ()=>{
+    endPinPlacement();
+    if(pinPlacementReturnView) map.setView(pinPlacementReturnView.center, pinPlacementReturnView.zoom, { animate: false });
+  };
+  document.getElementById('pinPlacementDone').onclick = ()=>{
+    const center = map.getCenter();
+    endPinPlacement();
+    openPinModal({ lat: center.lat, lng: center.lng });
   };
 
   // ---------- locate ----------
