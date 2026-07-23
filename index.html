@@ -259,7 +259,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.81</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.82</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -504,6 +504,7 @@
   const LS_LOADED_CELLS = "rg_loaded_cells"; // grid cells (see TILE_GRID_SIZE) fully checked against every data source
   const LS_CELL_RECENCY = "rg_cell_recency"; // grid cell -> last-used timestamp, for LRU eviction when storage fills up
   const LS_DEBUG_MSGS = "rg_debug_msgs"; // whether routine/diagnostic messages (cache eviction, etc.) are shown
+  const LS_BLOCKED_LINES = "rg_blocked_lines"; // lineCache key -> true, roads manually marked "never route through"
 
   function loadPins(){ try{return JSON.parse(localStorage.getItem(LS_PINS))||[];}catch(e){return [];} }
   function loadLineCache(){ try{return JSON.parse(localStorage.getItem(LS_LINE_CACHE))||{};}catch(e){return {};} }
@@ -512,6 +513,7 @@
   function loadLoadedCells(){ try{return new Set(JSON.parse(localStorage.getItem(LS_LOADED_CELLS))||[]);}catch(e){return new Set();} }
   function loadCellRecency(){ try{return JSON.parse(localStorage.getItem(LS_CELL_RECENCY))||{};}catch(e){return {};} }
   function loadDebugMsgsEnabled(){ try{return localStorage.getItem(LS_DEBUG_MSGS) === '1';}catch(e){return false;} }
+  function loadBlockedLines(){ try{return JSON.parse(localStorage.getItem(LS_BLOCKED_LINES))||{};}catch(e){return {};} }
 
   // marked-line coloring (safe/avoid) is gone — pins are now the only way to
   // mark ground to avoid — so the old per-line marking store is dead weight;
@@ -579,6 +581,7 @@
     }
   }
   function savePins(p){ return safeLocalStorageSet(LS_PINS, JSON.stringify(p), true); }
+  function saveBlockedLines(){ return safeLocalStorageSet(LS_BLOCKED_LINES, JSON.stringify(blockedLines), true); }
   function saveLineCache(c){ return safeLocalStorageSet(LS_LINE_CACHE, JSON.stringify(c), false); }
   function saveLineNames(n){ return safeLocalStorageSet(LS_LINE_NAMES, JSON.stringify(n), false); }
   function savePoiCache(c){ return safeLocalStorageSet(LS_POI_CACHE, JSON.stringify(c), false); }
@@ -759,6 +762,10 @@
   let poiCache = loadPoiCache();   // OSM type+id -> {lat,lng,category,label} — every auto-detected location ever seen
   let loadedCells = loadLoadedCells(); // set of "lat,lng" cell-center keys fully checked against OSM data — persists like the caches above
   let cellRecency = loadCellRecency(); // cell key -> last-used timestamp (ms), for LRU eviction when local storage fills up
+  // lineCache key -> true, for a road manually marked "never route through" —
+  // authored data like pins, not a re-fetchable bulk cache, so it's saved as
+  // critical (see safeLocalStorageSet) and never wiped by pruneBulkCachesForSpace
+  let blockedLines = loadBlockedLines();
 
   // storage usage is per-origin (this app's own site data), not shared with
   // other websites or apps on the phone — each site gets its own separate
@@ -781,12 +788,14 @@
   }
 
   const CATEGORY_COLOR = { school:"#c1443c", playground:"#d98c2b", childcare:"#8a4fbf", community:"#1f9e9e", pool:"#0e9fd0", library:"#8a6d3b", other:"#3b6fd9" };
-  // no more per-line marking states — every walkable road/path is one
-  // color, and the currently planned route is another; a plain white casing
-  // (same as everything else, see drawSegment) already gives the route
+  // every walkable road/path is one color, the currently planned route is
+  // another, and a manually blocked road (see blockedLines) is a third,
+  // regardless of whether it's currently part of a route — a plain white
+  // casing (same as everything else, see drawSegment) already gives each
   // enough contrast against the basemap without a separate bold outline
   const WALKABLE_COLOR = "#f0c419";
   const ROUTE_COLOR = "#1f9e4a";
+  const BLOCKED_LINE_COLOR = "#d32f2f";
 
   // ---------- map ----------
   const map = L.map('map', {
@@ -1387,7 +1396,33 @@
       }
       return data;
     }).catch(err=>{ clearTimeout(timeoutId); throw err; });
-    return { promise, controller };
+    return { promise, controller, endpoint };
+  }
+
+  // Behaves like Promise.any — resolves as soon as any mirror succeeds, so a
+  // fast responder is never held up waiting for a slow/stalled one — but on
+  // total failure, throws with EACH mirror's own specific reason attached
+  // (timeout vs. HTTP status vs. network error) instead of Promise.any's
+  // generic, undifferentiated AggregateError message ("All promises were
+  // rejected"). That generic message made it impossible to tell, from a
+  // report alone, whether a failure was "every public mirror is
+  // simultaneously overloaded," "one endpoint is rate-limiting us," or a
+  // client-side network problem — this is what a "Could not check an area…"
+  // report actually needs to be diagnosable without guessing.
+  function raceOverpassAttempts(attempts){
+    return new Promise((resolve, reject)=>{
+      let remaining = attempts.length;
+      const reasons = new Array(attempts.length);
+      attempts.forEach((a, i)=>{
+        let host;
+        try{ host = new URL(a.endpoint).hostname; }catch(_){ host = a.endpoint || `mirror ${i+1}`; }
+        a.promise.then(resolve, err=>{
+          reasons[i] = `${host}: ${err && err.message ? err.message : String(err)}`;
+          remaining--;
+          if(remaining === 0) reject(new Error(reasons.join('; ')));
+        });
+      });
+    });
   }
 
   const TILE_GRID_SIZE = 0.02; // must match the worker's GRID_SIZE constant
@@ -1571,7 +1606,7 @@
         const cellBbox = `${c.lat-TILE_GRID_SIZE/2},${c.lng-TILE_GRID_SIZE/2},${c.lat+TILE_GRID_SIZE/2},${c.lng+TILE_GRID_SIZE/2}`;
         const query = buildOverpassQuery(cellBbox);
         const attempts = OVERPASS_ENDPOINTS.map(endpoint => fetchOverpassMirror(endpoint, query));
-        const data = await Promise.any(attempts.map(a => a.promise));
+        const data = await raceOverpassAttempts(attempts);
         attempts.forEach(a => a.controller.abort());
         await fetch(`${cacheUrl}/tile?lat=${c.lat}&lng=${c.lng}`, {
           method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data)
@@ -1684,7 +1719,7 @@
     const attempts = OVERPASS_ENDPOINTS.map(endpoint => fetchOverpassMirror(endpoint, query));
 
     try{
-      const data = await Promise.any(attempts.map(a => a.promise));
+      const data = await raceOverpassAttempts(attempts);
       attempts.forEach(a => a.controller.abort()); // cancel the losers
       const fetchMs = Math.round(performance.now() - loadStartMs);
       const applyStartMs = performance.now();
@@ -1704,6 +1739,7 @@
       if(cfg.url){ populateTileCacheInBackground(cfg.url, fetchBounds); } // fire-and-forget
     }catch(aggregateErr){
       stopLoadTicker();
+      showDebugMsg(`Viewport auto-load: every Overpass mirror failed — ${aggregateErr.message}`, 8000);
       if(lastSuccessAt){
         setDataStatus('st-stale', `⚠ Refresh failed — showing data from ${ageLabel(lastSuccessAt)}, may be outdated`);
       } else {
@@ -2031,7 +2067,7 @@
     segCasingLines[key] = casing;
 
     const pl = L.polyline(latlngs, {
-      renderer, color: isRoute ? ROUTE_COLOR : WALKABLE_COLOR, weight, opacity: 1,
+      renderer, color: blockedLines[key] ? BLOCKED_LINE_COLOR : (isRoute ? ROUTE_COLOR : WALKABLE_COLOR), weight, opacity: 1,
       interactive: false // clicks are handled by the wider invisible hit-line below
     }).addTo(segLayer);
     segPolylines[key] = pl;
@@ -2075,6 +2111,20 @@
     segHitLineIsRoute[key] = isRoute;
   }
 
+  // Recolors an already-drawn segment immediately after toggling its
+  // blocked state, without waiting for the next full drawSegment pass (e.g.
+  // the next pan/zoom or reload) — a "block this road" tap should show red
+  // right away. A no-op if the segment isn't currently drawn at all (out of
+  // view, or its cell hasn't been loaded yet); drawSegment already checks
+  // blockedLines on every draw, so it'll show correctly whenever it does
+  // get drawn regardless.
+  function refreshLineBlockStyle(key){
+    const pl = segPolylines[key];
+    if(!pl) return;
+    const isRoute = !!segHitLineIsRoute[key];
+    pl.setStyle({ color: blockedLines[key] ? BLOCKED_LINE_COLOR : (isRoute ? ROUTE_COLOR : WALKABLE_COLOR) });
+  }
+
   // ---------- identify a location (long-press) ----------
   function mapsLinks(lat, lng){
     return {
@@ -2083,33 +2133,34 @@
     };
   }
 
-  async function showIdentifyPopup(latlng){
+  // shared by the long-press "identify" popup and showSegmentNamePopup's
+  // fallback for an unnamed way — returns the inner HTML only (no wrapping
+  // div), so callers can drop it into whatever popup body they're building
+  async function reverseGeocodeHtml(latlng){
     const links = mapsLinks(latlng.lat, latlng.lng);
-    const popup = L.popup({maxWidth: 260})
-      .setLatLng(latlng)
-      .setContent(`<div style="font-size:12.5px;">Looking up what's here…</div>`)
-      .openOn(map);
     try{
       const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${latlng.lat}&lon=${latlng.lng}&zoom=18&addressdetails=1`);
       if(!res.ok) throw new Error('lookup failed');
       const data = await res.json();
       const name = data.name || (data.address && (data.address.amenity || data.address.building)) || null;
       const addr = data.display_name ? escapeHtml(data.display_name) : 'No address data available for this exact point.';
-      popup.setContent(`
-        <div style="font-size:12.5px;max-width:220px;">
-          ${name ? `<b>${escapeHtml(name)}</b><br>` : ''}
-          ${addr}<br><br>
-          <a href="${links.satellite}" target="_blank" rel="noopener">Open satellite view</a> ·
-          <a href="${links.street}" target="_blank" rel="noopener">Street map</a>
-        </div>`);
+      return `${name ? `<b>${escapeHtml(name)}</b><br>` : ''}${addr}<br><br>
+        <a href="${links.satellite}" target="_blank" rel="noopener">Open satellite view</a> ·
+        <a href="${links.street}" target="_blank" rel="noopener">Street map</a>`;
     }catch(err){
-      popup.setContent(`
-        <div style="font-size:12.5px;max-width:220px;">
-          Could not look up an address for this point.<br><br>
-          <a href="${links.satellite}" target="_blank" rel="noopener">Open satellite view</a> ·
-          <a href="${links.street}" target="_blank" rel="noopener">Street map</a>
-        </div>`);
+      return `Could not look up an address for this point.<br><br>
+        <a href="${links.satellite}" target="_blank" rel="noopener">Open satellite view</a> ·
+        <a href="${links.street}" target="_blank" rel="noopener">Street map</a>`;
     }
+  }
+
+  async function showIdentifyPopup(latlng){
+    const popup = L.popup({maxWidth: 260})
+      .setLatLng(latlng)
+      .setContent(`<div style="font-size:12.5px;">Looking up what's here…</div>`)
+      .openOn(map);
+    const html = await reverseGeocodeHtml(latlng);
+    if(map.hasLayer(popup)) popup.setContent(`<div style="font-size:12.5px;max-width:220px;">${html}</div>`);
   }
 
   // tapping a road shows its name straight from the cached OSM tag when we
@@ -2174,24 +2225,76 @@
     }
   }
 
+  // Block/unblock button embedded directly in the segment popup's HTML —
+  // there's no other interactive control inside a Leaflet popup anywhere in
+  // this app, so rather than invent an event-delegation scheme, the button
+  // is looked up and rewired (wireSegmentBlockButton) after every
+  // popup.setContent call, including the ones after this same click.
+  function segmentPopupHtml(key, bodyHtml){
+    const isBlocked = !!blockedLines[key];
+    return `<div style="font-size:12.5px;max-width:220px;">
+      ${bodyHtml}
+      <div style="margin-top:8px;">
+        <button id="segBlockBtn" style="font-size:11.5px;padding:4px 9px;border-radius:6px;border:1px solid ${isBlocked ? '#a52714' : '#999'};background:${isBlocked ? BLOCKED_LINE_COLOR : '#fff'};color:${isBlocked ? '#fff' : '#333'};cursor:pointer;">${isBlocked ? 'Unblock this road' : 'Block this road (avoid entirely)'}</button>
+      </div>
+    </div>`;
+  }
+  function wireSegmentBlockButton(popup, key, getBodyHtml){
+    const el = popup.getElement();
+    const btn = el && el.querySelector('#segBlockBtn');
+    if(!btn) return;
+    // Without this, the click bubbles past the popup content to the map
+    // container, which closes the popup as an ordinary "clicked elsewhere on
+    // the map" interaction before our own handler's setContent update is
+    // even visible — same class of fix as the wide invisible hit-lines
+    // needing their own stopPropagation in drawSegment above.
+    L.DomEvent.disableClickPropagation(btn);
+    btn.onclick = ()=>{
+      if(blockedLines[key]) delete blockedLines[key];
+      else blockedLines[key] = true;
+      saveBlockedLines();
+      refreshLineBlockStyle(key);
+      popup.setContent(segmentPopupHtml(key, getBodyHtml()));
+      wireSegmentBlockButton(popup, key, getBodyHtml);
+    };
+  }
+
   function showSegmentNamePopup(key, latlng){
     const name = lineNames[key];
     if(name){
       const crossName = crossStreetNameFor(key, latlng);
       const label = crossName || name;
-      const popup = L.popup({maxWidth: 240})
+      let bodyHtml = `<b>${escapeHtml(label)}</b>`;
+      const popup = L.popup({maxWidth: 260})
         .setLatLng(latlng)
-        .setContent(`<div style="font-size:12.5px;"><b>${escapeHtml(label)}</b></div>`)
+        .setContent(segmentPopupHtml(key, bodyHtml))
         .openOn(map);
+      wireSegmentBlockButton(popup, key, ()=>bodyHtml);
       cityStateZipFor(latlng.lat, latlng.lng).then(csz=>{
         if(!csz) return;
         // the popup may have been closed (or replaced by a later tap) by the
         // time this resolves — only touch it if it's still the open one
         if(!map.hasLayer(popup)) return;
-        popup.setContent(`<div style="font-size:12.5px;"><b>${escapeHtml(label)}</b><br>${escapeHtml(csz)}</div>`);
+        bodyHtml = `<b>${escapeHtml(label)}</b><br>${escapeHtml(csz)}`;
+        popup.setContent(segmentPopupHtml(key, bodyHtml));
+        wireSegmentBlockButton(popup, key, ()=>bodyHtml);
       });
     } else {
-      showIdentifyPopup(latlng);
+      // unnamed way (alley, unclassified track) — still worth being able to
+      // block, so this gets the same button rather than falling through to
+      // a plain, non-blockable identify popup
+      let bodyHtml = `Looking up what's here…`;
+      const popup = L.popup({maxWidth: 260})
+        .setLatLng(latlng)
+        .setContent(segmentPopupHtml(key, bodyHtml))
+        .openOn(map);
+      wireSegmentBlockButton(popup, key, ()=>bodyHtml);
+      reverseGeocodeHtml(latlng).then(html=>{
+        if(!map.hasLayer(popup)) return;
+        bodyHtml = html;
+        popup.setContent(segmentPopupHtml(key, bodyHtml));
+        wireSegmentBlockButton(popup, key, ()=>bodyHtml);
+      });
     }
   }
 
@@ -2439,6 +2542,43 @@
     }
     return best;
   }
+  // True minimum distance between a road edge (alat,alng)-(blat,blng) and a
+  // location, rather than sampling the edge at a few fixed points and
+  // measuring from each of those — that older approach (still used
+  // elsewhere as distanceToLocationMeters, point-to-location) checked only
+  // the edge's two endpoints and its midpoint, which is a fine
+  // approximation when consecutive OSM nodes are close together but
+  // silently under-detects a pin or POI sitting close to the middle third
+  // of an unusually long, sparsely-noded edge (a straight residential or
+  // service road with no intermediate nodes, for instance) — the true
+  // closest point on the edge could be nowhere near any of those 3 samples.
+  // For a plain point (no geometry, true of every pin and most POIs),
+  // pointToSegmentMeters already gives the exact distance from the location
+  // to the whole edge, not just to sampled points on it. For a location with
+  // real boundary geometry (a fetched building/way outline), the true
+  // segment-to-polyline distance is approximated by checking each boundary
+  // vertex against the edge and each edge endpoint against every boundary
+  // segment — enough to catch either shape passing close to or through the
+  // other at the scales these buffers operate at.
+  function edgeToLocationDistanceMeters(alat, alng, blat, blng, loc){
+    if(!loc.geometry || loc.geometry.length < 2){
+      return pointToSegmentMeters(loc.lat, loc.lng, alat, alng, blat, blng);
+    }
+    let best = Infinity;
+    for(let i=0;i<loc.geometry.length;i++){
+      const [glat,glng] = loc.geometry[i];
+      const d = pointToSegmentMeters(glat, glng, alat, alng, blat, blng);
+      if(d < best) best = d;
+    }
+    for(let i=0;i<loc.geometry.length-1;i++){
+      const [g1lat,g1lng] = loc.geometry[i], [g2lat,g2lng] = loc.geometry[i+1];
+      const dA = pointToSegmentMeters(alat, alng, g1lat, g1lng, g2lat, g2lng);
+      const dB = pointToSegmentMeters(blat, blng, g1lat, g1lng, g2lat, g2lng);
+      if(dA < best) best = dA;
+      if(dB < best) best = dB;
+    }
+    return best;
+  }
   // ---------- custom avoidance router ----------
   // No third-party routing service is involved anywhere in this app — a
   // service with no idea marked locations even exist can't be told to
@@ -2515,8 +2655,13 @@
         if(!nodeById.has(k2)) nodeById.set(k2, { lat: p2[0], lng: p2[1] });
         if(!adjacency.has(k1)) adjacency.set(k1, []);
         if(!adjacency.has(k2)) adjacency.set(k2, []);
-        const edgeAB = { to: k2, dist, blocked: false };
-        const edgeBA = { to: k1, dist, blocked: false };
+        // lineKey is carried onto both edge objects so markEdgesBlocked can
+        // check it against blockedLines — a manually blocked road (see
+        // showSegmentNamePopup) is excluded from routing entirely,
+        // independent of (and stricter than) the proximity-based
+        // blocking/penalty logic everything else here is about
+        const edgeAB = { to: k2, dist, blocked: false, lineKey };
+        const edgeBA = { to: k1, dist, blocked: false, lineKey };
         adjacency.get(k1).push(edgeAB);
         adjacency.get(k2).push(edgeBA);
         newEdgeRefs.push({ fromId: k1, edge: edgeAB });
@@ -2589,10 +2734,16 @@
   // (every pin, manual or auto-detected, is one — there's no separate
   // marked-line concept anymore), and separately scores how close it
   // passes (see proximityCostMultiplier above) so the pathfinder can prefer
-  // more clearance among otherwise-legal routes. Checked at both endpoints
-  // and the midpoint — edges between consecutive OSM nodes are typically
-  // short, so this is a good approximation of "does any part of this edge
-  // intrude".
+  // more clearance among otherwise-legal routes. Uses the true distance from
+  // the edge's full segment to the location (edgeToLocationDistanceMeters),
+  // not just from a few sampled points along the edge — a sparsely-noded
+  // edge (a long straight residential/service road with no intermediate OSM
+  // nodes) could otherwise have a pin sitting close to its middle third
+  // that's nowhere near either endpoint or the exact midpoint, and a
+  // sampled check would silently miss it entirely. Candidate locations are
+  // gathered from buckets around both endpoints AND the midpoint (not just
+  // the midpoint) for the same reason: a long edge can span more grid cells
+  // than the midpoint's own 3x3 neighborhood covers.
   //
   // Only ever runs in strict (hard-block) mode now — findAvoidancePath's
   // last-resort fallback pass no longer re-derives proximity at all, it
@@ -2629,22 +2780,29 @@
         let result = computed.get(pairKey);
         if(!result){
           const midLat = (a.lat+b.lat)/2, midLng = (a.lng+b.lng)/2;
-          const checkPts = [[a.lat,a.lng],[b.lat,b.lng],[midLat,midLng]];
+          const candidateLocs = new Map();
+          [[a.lat,a.lng],[midLat,midLng],[b.lat,b.lng]].forEach(([lat,lng])=>{
+            nearbyIndexedPoints(locationIndex, lat, lng).forEach(loc=>candidateLocs.set(loc.id, loc));
+          });
           let minPoiDist = Infinity, poiBlocked = false;
-          outerLoc: for(const loc of nearbyIndexedPoints(locationIndex, midLat, midLng)){
-            for(const [plat,plng] of checkPts){
-              const d = distanceToLocationMeters(plat, plng, loc);
-              if(d < minPoiDist) minPoiDist = d;
-              if(d < poiThresholdMeters){ poiBlocked = true; break outerLoc; }
-            }
+          for(const loc of candidateLocs.values()){
+            const d = edgeToLocationDistanceMeters(a.lat, a.lng, b.lat, b.lng, loc);
+            if(d < minPoiDist) minPoiDist = d;
+            if(d < poiThresholdMeters){ poiBlocked = true; break; }
           }
           result = { minPoiDist, poiBlocked };
           computed.set(pairKey, result);
         }
         edge.poiBlocked = result.poiBlocked;
         edge.minPoiDist = result.minPoiDist;
-        edge.blocked = result.poiBlocked;
-        edge.costMultiplier = result.poiBlocked ? 1 : proximityCostMultiplier(result.minPoiDist, poiThresholdMeters, poiSoftThreshold);
+        // A manually blocked road (see showSegmentNamePopup/blockedLines) is
+        // absolute — "disallow this path" means never traversed, not even as
+        // a last resort when nothing else avoids every adjacency (unlike
+        // ordinary proximity blocking, which the fallback pass below is
+        // allowed to relax under a steep penalty).
+        edge.manuallyBlocked = !!blockedLines[edge.lineKey];
+        edge.blocked = edge.manuallyBlocked || result.poiBlocked;
+        edge.costMultiplier = (edge.manuallyBlocked || result.poiBlocked) ? 1 : proximityCostMultiplier(result.minPoiDist, poiThresholdMeters, poiSoftThreshold);
       }, 12, resolve, onProgress);
     });
   }
@@ -2657,11 +2815,14 @@
   // every edge from data markEdgesBlocked already stashed on it. Nothing
   // here needs the location index at all: unblocking every edge and letting
   // Dijkstra pick whichever forces the fewest/least-bad violations only
-  // depends on distances already known, not on checking them again.
+  // depends on distances already known, not on checking them again. A
+  // manually blocked road is the one thing this never relaxes — see
+  // manuallyBlocked above.
   function applyFallbackCostMultipliers(graph, poiThresholdMeters){
     const poiSoftThreshold = poiThresholdMeters * POI_SOFT_BUFFER_MULTIPLIER;
     graph.adjacency.forEach(edges=>{
       edges.forEach(edge=>{
+        if(edge.manuallyBlocked) return;
         edge.blocked = false;
         edge.costMultiplier = edge.poiBlocked ? FALLBACK_ADJACENCY_PENALTY : proximityCostMultiplier(edge.minPoiDist, poiThresholdMeters, poiSoftThreshold);
       });
@@ -3009,6 +3170,12 @@
     const cfg = loadTileCacheCfg();
     let data = null;
     let source = 'tile-cache';
+    // Captured (not swallowed) so that if the direct-Overpass fallback below
+    // also fails entirely, the resulting error names every source that was
+    // actually tried — otherwise a report of "could not check this area"
+    // would silently omit the fact that the tile cache was tried first and
+    // why it didn't work, even though it's the very first thing attempted.
+    let tileCacheFailReason = null;
     if(cfg.url){
       try{
         // must exceed the worker's own internal Overpass timeout (20s, see
@@ -3024,16 +3191,26 @@
         const timeoutId = setTimeout(()=>controller.abort(), 25000);
         const res = await fetch(`${cfg.url}/tile?lat=${c.lat}&lng=${c.lng}`, {signal: controller.signal});
         clearTimeout(timeoutId);
-        if(res.ok) data = await res.json();
-      }catch(_){ /* fall through to a direct fetch below */ }
+        if(res.ok){ data = await res.json(); }
+        else{ tileCacheFailReason = `tile cache: HTTP ${res.status}`; }
+      }catch(err){ tileCacheFailReason = `tile cache: ${err && err.message ? err.message : String(err)}`; }
     }
     if(!data){
       source = 'direct-overpass';
       const cellBbox = `${c.lat-half},${c.lng-half},${c.lat+half},${c.lng+half}`;
       const query = buildOverpassQuery(cellBbox);
       const attempts = OVERPASS_ENDPOINTS.map(endpoint => fetchOverpassMirror(endpoint, query));
-      data = await Promise.any(attempts.map(a=>a.promise));
-      attempts.forEach(a=>a.controller.abort());
+      try{
+        data = await raceOverpassAttempts(attempts);
+      }catch(err){
+        // every source this cell had — tile cache (if configured) and every
+        // public mirror — failed. Fold the tile-cache reason in too so the
+        // final error, surfaced verbatim in the "Could not check an area…"
+        // warning, names every one of them instead of just the mirrors.
+        throw new Error(tileCacheFailReason ? `${tileCacheFailReason}; ${err.message}` : err.message);
+      }finally{
+        attempts.forEach(a=>a.controller.abort());
+      }
     }
     // Diagnostic only (debug-messages toggle) — helps tell apart a fast KV
     // cache hit from a genuine cache-miss round-trip through the worker to
@@ -3105,9 +3282,9 @@
         // Every timing diagnostic added so far (fetch time, apply time) only
         // fires once ensureCellLoaded actually returns data — none of them
         // can see a cell that hangs and then ultimately FAILS (every tile-
-        // cache/Overpass attempt rejecting, e.g. via Promise.any's
-        // AggregateError), since that throws before reaching any of that
-        // code. That was a real blind spot: a report of a long freeze with
+        // cache/Overpass source rejecting, see raceOverpassAttempts), since
+        // that throws before reaching any of that code. That was a real
+        // blind spot: a report of a long freeze with
         // literally no debug message from three separate rounds of
         // instrumentation is at least as consistent with "this cell never
         // succeeded at all" as with "it succeeded but slowly." This one
@@ -4049,7 +4226,7 @@ ${pts}
 
   // ---------- export / import / clear ----------
   document.getElementById('btnExport').onclick = ()=>{
-    const data = { pins, lineCache, lineNames, poiCache, exportedAt: new Date().toISOString(), version: 'routeguard-1' };
+    const data = { pins, lineCache, lineNames, poiCache, blockedLines, exportedAt: new Date().toISOString(), version: 'routeguard-1' };
     const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -4069,7 +4246,7 @@ ${pts}
     reader.onload = (evt)=>{
       try{
         const data = JSON.parse(evt.target.result);
-        let addedPins = 0, addedLines = 0, addedPois = 0;
+        let addedPins = 0, addedLines = 0, addedPois = 0, addedBlockedLines = 0;
 
         // pins: merge by near-identical position + category, skip exact duplicates
         if(Array.isArray(data.pins)){
@@ -4099,11 +4276,17 @@ ${pts}
             if(!poiCache[key]){ poiCache[key] = data.poiCache[key]; addedPois++; }
           });
         }
+        // manually blocked roads (older backups won't have this — harmless if absent)
+        if(data.blockedLines && typeof data.blockedLines === 'object'){
+          Object.keys(data.blockedLines).forEach(key=>{
+            if(!blockedLines[key]){ blockedLines[key] = true; addedBlockedLines++; refreshLineBlockStyle(key); }
+          });
+        }
 
-        savePins(pins); saveLineCache(lineCache); saveLineNames(lineNames); savePoiCache(poiCache);
+        savePins(pins); saveLineCache(lineCache); saveLineNames(lineNames); savePoiCache(poiCache); saveBlockedLines();
         renderPins();
         renderCachedLinesAndPois();
-        showWarn(`Imported: ${addedPins} pin${addedPins===1?'':'s'}, ${addedLines} line${addedLines===1?'':'s'}, ${addedPois} location${addedPois===1?'':'s'} added. Existing data was kept, not replaced.`, 6000);
+        showWarn(`Imported: ${addedPins} pin${addedPins===1?'':'s'}, ${addedLines} line${addedLines===1?'':'s'}, ${addedPois} location${addedPois===1?'':'s'}, ${addedBlockedLines} blocked road${addedBlockedLines===1?'':'s'} added. Existing data was kept, not replaced.`, 6000);
       }catch(err){
         showWarn('Could not read that file — make sure it\'s a RouteGuard backup JSON file.', 4000);
       }
@@ -4114,8 +4297,8 @@ ${pts}
 
   document.getElementById('btnClear').onclick = ()=>{
     if(document.getElementById('btnClear').dataset.confirm === '1'){
-      pins = []; lineCache = {}; lineNames = {}; poiCache = {}; cellRecency = {};
-      savePins(pins); saveLineCache(lineCache); saveLineNames(lineNames); savePoiCache(poiCache); saveCellRecency(cellRecency);
+      pins = []; lineCache = {}; lineNames = {}; poiCache = {}; cellRecency = {}; blockedLines = {};
+      savePins(pins); saveLineCache(lineCache); saveLineNames(lineNames); savePoiCache(poiCache); saveCellRecency(cellRecency); saveBlockedLines();
       // loadedCells records "this area has already been checked" — leaving
       // it in place after wiping the actual location/line data would let
       // the auto-load skip re-fetching (see loadNearbyData) and report the
@@ -4239,8 +4422,9 @@ ${pts}
   }
 
   // Same proximity check the router uses to block/penalize edges (see
-  // markBlockedEdges), applied here purely as a report — the segment's
-  // path is fixed and can't be adjusted, so this only ever warns.
+  // markEdgesBlocked and edgeToLocationDistanceMeters), applied here purely
+  // as a report — the segment's path is fixed and can't be adjusted, so this
+  // only ever warns.
   function checkSegmentForNearbyLocations(segmentPoints){
     const locations = allKnownLocationsForProximityCheck();
     const poiThresholdMeters = MIN_LOCATION_DISTANCE_FT * 0.3048;
@@ -4251,16 +4435,17 @@ ${pts}
     for(let i=0;i<segmentPoints.length-1;i++){
       const [alat,alng] = segmentPoints[i], [blat,blng] = segmentPoints[i+1];
       const midLat = (alat+blat)/2, midLng = (alng+blng)/2;
-      const checkPts = [[alat,alng],[blat,blng],[midLat,midLng]];
+      const candidateLocs = new Map();
+      [[alat,alng],[midLat,midLng],[blat,blng]].forEach(([lat,lng])=>{
+        nearbyIndexedPoints(locationIndex, lat, lng).forEach(loc=>candidateLocs.set(loc.id, loc));
+      });
       let edgeFlagged = false;
-      for(const loc of nearbyIndexedPoints(locationIndex, midLat, midLng)){
-        for(const [plat,plng] of checkPts){
-          const d = distanceToLocationMeters(plat, plng, loc);
-          if(d < closestMeters) closestMeters = d;
-          if(d < poiThresholdMeters){
-            edgeFlagged = true;
-            if(loc.id != null) flaggedLocIds.add(loc.id);
-          }
+      for(const loc of candidateLocs.values()){
+        const d = edgeToLocationDistanceMeters(alat, alng, blat, blng, loc);
+        if(d < closestMeters) closestMeters = d;
+        if(d < poiThresholdMeters){
+          edgeFlagged = true;
+          if(loc.id != null) flaggedLocIds.add(loc.id);
         }
       }
       if(edgeFlagged) flaggedEdgeCount++;
