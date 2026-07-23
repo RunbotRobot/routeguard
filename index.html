@@ -249,7 +249,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.77</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.78</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -4055,6 +4055,130 @@ ${pts}
       console.error('Could not restore in-progress recording:', err);
     }
   })();
+
+  // ---------- segment import (from a companion app) ----------
+  // Lets another app hand off a specific segment by URL:
+  // ?segmentUrl=<link to a GPX file>, fetched from THIS origin (the link
+  // needs to allow cross-origin requests from wherever RouteGuard is
+  // hosted). Plans an avoidance-checked approach route from your current
+  // location to the segment's start using the exact same router as any
+  // other route, then draws the segment's own fixed geometry continuing
+  // from there to its end — the segment's path itself is never rerouted
+  // (it has to stay the exact segment, that's the whole point of running
+  // it), but it IS checked against known locations so a heads-up still
+  // surfaces even though nothing about the path itself can be adjusted.
+  const SEGMENT_COLOR = "#1f6fd9";
+  const segmentImportLayer = L.layerGroup().addTo(map);
+  let segmentImportLine = null;
+
+  function parseGpxTrackPoints(gpxText){
+    const doc = new DOMParser().parseFromString(gpxText, 'application/xml');
+    if(doc.querySelector('parsererror')) throw new Error('could not parse GPX file');
+    const points = [];
+    // accept both track points and route points — whichever the source
+    // GPX happens to use, a Strava segment export could reasonably be either
+    doc.querySelectorAll('trkpt, rtept').forEach(node=>{
+      const lat = parseFloat(node.getAttribute('lat'));
+      const lon = parseFloat(node.getAttribute('lon'));
+      if(Number.isFinite(lat) && Number.isFinite(lon)) points.push([lat, lon]);
+    });
+    if(points.length < 2) throw new Error('GPX file has no usable track points');
+    return points;
+  }
+
+  function resolveCurrentLocation(){
+    return new Promise((resolve, reject)=>{
+      if(lastKnownLatLng){ resolve({lat:lastKnownLatLng[0], lng:lastKnownLatLng[1]}); return; }
+      if(!navigator.geolocation){ reject(new Error('Geolocation not available in this browser.')); return; }
+      navigator.geolocation.getCurrentPosition(
+        pos=>resolve({lat:pos.coords.latitude, lng:pos.coords.longitude}),
+        err=>reject(new Error('Could not get your location: '+err.message)),
+        { enableHighAccuracy:true, timeout:10000 }
+      );
+    });
+  }
+
+  // Same proximity check the router uses to block/penalize edges (see
+  // markBlockedEdges), applied here purely as a report — the segment's
+  // path is fixed and can't be adjusted, so this only ever warns.
+  function checkSegmentForNearbyLocations(segmentPoints){
+    const locations = allKnownLocationsForProximityCheck();
+    const poiThresholdMeters = MIN_LOCATION_DISTANCE_FT * 0.3048;
+    const locationIndex = buildLocationIndex(locations);
+    let closestMeters = Infinity;
+    let flaggedEdgeCount = 0;
+    const flaggedLocIds = new Set();
+    for(let i=0;i<segmentPoints.length-1;i++){
+      const [alat,alng] = segmentPoints[i], [blat,blng] = segmentPoints[i+1];
+      const midLat = (alat+blat)/2, midLng = (alng+blng)/2;
+      const checkPts = [[alat,alng],[blat,blng],[midLat,midLng]];
+      let edgeFlagged = false;
+      for(const loc of nearbyIndexedPoints(locationIndex, midLat, midLng)){
+        for(const [plat,plng] of checkPts){
+          const d = distanceToLocationMeters(plat, plng, loc);
+          if(d < closestMeters) closestMeters = d;
+          if(d < poiThresholdMeters){
+            edgeFlagged = true;
+            if(loc.id != null) flaggedLocIds.add(loc.id);
+          }
+        }
+      }
+      if(edgeFlagged) flaggedEdgeCount++;
+    }
+    return { flaggedEdgeCount, closestMeters, distinctLocationCount: flaggedLocIds.size };
+  }
+
+  async function importSegmentFromUrl(segmentUrl){
+    showHint('Loading segment…');
+    try{
+      const controller = new AbortController();
+      const timeoutId = setTimeout(()=>controller.abort(), 20000);
+      const res = await fetch(segmentUrl, { signal: controller.signal });
+      clearTimeout(timeoutId);
+      if(!res.ok) throw new Error('HTTP '+res.status);
+      const gpxText = await res.text();
+      const segmentPoints = parseGpxTrackPoints(gpxText);
+
+      const current = await resolveCurrentLocation();
+      const segStart = { lat: segmentPoints[0][0], lng: segmentPoints[0][1] };
+
+      showHint('Planning a route to the start of the segment…');
+      const result = await findAvoidancePath(current, segStart);
+      showHint('');
+
+      if(result.cancelled){
+        showWarn('Segment import cancelled — some areas along the approach hadn\'t been checked yet.', 4000);
+        return;
+      }
+      if(!result.pairs){
+        showWarn('⚠ Could not find a connected road route to this segment\'s start from your current location.', null);
+        return;
+      }
+
+      renderRoutePairs(result.pairs);
+
+      if(segmentImportLine) segmentImportLayer.removeLayer(segmentImportLine);
+      segmentImportLine = L.polyline(segmentPoints, { color: SEGMENT_COLOR, weight: 5, opacity: 1 }).addTo(segmentImportLayer);
+
+      map.fitBounds(L.latLngBounds(result.pairs.flat().concat(segmentPoints)), { padding: [40, 40] });
+
+      const safety = checkSegmentForNearbyLocations(segmentPoints);
+      if(safety.flaggedEdgeCount > 0){
+        const closestFt = Math.round(safety.closestMeters * 3.28084);
+        showWarn(`⚠ This segment passes within ${closestFt}ft of ${safety.distinctLocationCount} known location${safety.distinctLocationCount===1?'':'s'} (${safety.flaggedEdgeCount} point${safety.flaggedEdgeCount===1?'':'s'} along its length). The segment itself can't be rerouted — it has to stay the segment — but you may want extra care there.`, null);
+      } else if(result.isFallback){
+        showWarn(`⚠ No approach route avoids being directly adjacent to every known location — this one still has ${result.adjacencyViolationCount} unavoidable adjacenc${result.adjacencyViolationCount===1?'y':'ies'}.`, null);
+      } else {
+        showWarn(`Segment loaded (${segmentPoints.length} points) — approach route planned, shown in blue.`, 5000);
+      }
+    }catch(err){
+      showHint('');
+      showWarn(`⚠ Could not load segment (${err.message||'error'}).`, null);
+    }
+  }
+
+  const segmentUrlParam = new URLSearchParams(window.location.search).get('segmentUrl');
+  if(segmentUrlParam) importSegmentFromUrl(segmentUrlParam);
 
   // try to center on user on first load, then start the always-on position display
   if(navigator.geolocation){
