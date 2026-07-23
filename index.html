@@ -259,7 +259,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.82</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.83</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -436,6 +436,10 @@
         <button class="small-btn" id="btnExport" style="width:100%;margin-bottom:6px;">Export pins + lines (JSON)</button>
         <button class="small-btn" id="btnImport" style="width:100%;margin-bottom:6px;">Import from backup file</button>
         <input type="file" id="importFileInput" accept="application/json,.json" style="display:none;">
+        <button class="small-btn" id="btnExportDebug" style="width:100%;margin-bottom:6px;">Export debug snapshot (for troubleshooting)</button>
+        <div style="font-size:11px;color:var(--muted);margin-bottom:6px;">
+          Includes your pins, cached lines/locations, blocked roads, and the most recent route attempt (start/end and exactly how it resolved) plus the debug log above — everything needed to reproduce a routing issue exactly, to send along when reporting one.
+        </div>
         <button class="small-btn danger-text" id="btnClear" style="width:100%;">Clear all data</button>
         <div class="legend-row" style="justify-content:space-between;margin-top:10px;">
           <span>Show developer/debug messages</span>
@@ -2460,6 +2464,13 @@
   let routeLayerKeySet = new Set(); // same, as a Set — cheap membership checks from applyOverpassResults etc.
   let liveRoutePoints = []; // ordered [lat,lng] points along the current planned route (+ any imported segment), for the remaining-distance/time badge while running it
   const startEndLayer = L.layerGroup().addTo(map);
+  // Full detail on the most recent planRoute call — start/end, how it
+  // resolved, and which specific location(s) (if any) forced a fallback.
+  // Exists purely so "Export debug snapshot" (see btnExportDebug) can bundle
+  // a troubleshooting report that lets someone else reproduce the EXACT
+  // route attempt offline against the same pins/lines/POIs, rather than
+  // guessing at synthetic data from a description of what happened.
+  let lastRouteAttempt = null;
 
   // ---------- keep routes clear of nearby locations ----------
   // This isn't a generic "stay N feet away" radius — it's meant to
@@ -2488,11 +2499,15 @@
     // carry a POI's full boundary geometry through when we have it — a
     // school or park fetched as an OSM way can be large or oddly shaped,
     // and checking distance to just a single point (its centroid) can
-    // understate true closeness to the near edge of the property
-    Object.entries(poiCache).forEach(([id,p])=>locs.push({id:'poi:'+id, lat:p.lat, lng:p.lng, geometry:p.geometry}));
-    pins.forEach((p,i)=>locs.push({id:'pin:'+i, lat:p.lat, lng:p.lng}));
+    // understate true closeness to the near edge of the property.
+    // category/label (or the closest equivalent) are carried through too —
+    // not used by the distance math at all, only so a route that can't
+    // avoid a location entirely can say which one, instead of just a count
+    // (see findAvoidancePath's fallback pass).
+    Object.entries(poiCache).forEach(([id,p])=>locs.push({id:'poi:'+id, lat:p.lat, lng:p.lng, geometry:p.geometry, category:p.category, label:p.label}));
+    pins.forEach((p,i)=>locs.push({id:'pin:'+i, lat:p.lat, lng:p.lng, category:p.category, label:p.label}));
     officialRecordsCache.forEach(r=>{
-      if(loadedCells.has(cellKeyForLatLng(r.lat, r.lng))) locs.push({id:'official:'+r.id, lat:r.lat, lng:r.lng});
+      if(loadedCells.has(cellKeyForLatLng(r.lat, r.lng))) locs.push({id:'official:'+r.id, lat:r.lat, lng:r.lng, category:r.type, label:r.name});
     });
     return locs;
   }
@@ -2784,17 +2799,18 @@
           [[a.lat,a.lng],[midLat,midLng],[b.lat,b.lng]].forEach(([lat,lng])=>{
             nearbyIndexedPoints(locationIndex, lat, lng).forEach(loc=>candidateLocs.set(loc.id, loc));
           });
-          let minPoiDist = Infinity, poiBlocked = false;
+          let minPoiDist = Infinity, poiBlocked = false, closestLocId = null;
           for(const loc of candidateLocs.values()){
             const d = edgeToLocationDistanceMeters(a.lat, a.lng, b.lat, b.lng, loc);
-            if(d < minPoiDist) minPoiDist = d;
+            if(d < minPoiDist){ minPoiDist = d; closestLocId = loc.id; }
             if(d < poiThresholdMeters){ poiBlocked = true; break; }
           }
-          result = { minPoiDist, poiBlocked };
+          result = { minPoiDist, poiBlocked, closestLocId };
           computed.set(pairKey, result);
         }
         edge.poiBlocked = result.poiBlocked;
         edge.minPoiDist = result.minPoiDist;
+        edge.closestLocId = result.closestLocId;
         // A manually blocked road (see showSegmentNamePopup/blockedLines) is
         // absolute — "disallow this path" means never traversed, not even as
         // a last resort when nothing else avoids every adjacency (unlike
@@ -3058,6 +3074,7 @@
     const processedCellKeys = new Set();
     const proximityComputed = new Map();
     const locations = allKnownLocationsForProximityCheck();
+    const locationsById = new Map(locations.map(l=>[l.id, l]));
     const poiThresholdMeters = MIN_LOCATION_DISTANCE_FT * 0.3048;
 
     for(let attempt=0; attempt<AVOIDANCE_MARGIN_ATTEMPTS; attempt++){
@@ -3142,11 +3159,19 @@
         if(fallbackPath){
           const pairs = nodePathToPairs(fallbackPath, graph.nodeById);
           let adjacencyViolationCount = 0;
+          // which specific location(s) — not just how many edges — so both
+          // the user-facing warning and the debug log can name them, instead
+          // of leaving "1 unavoidable adjacency" as an unidentifiable count
+          const violatingLocIds = new Set();
           for(let i=0;i<fallbackPath.length-1;i++){
             const edge = (graph.adjacency.get(fallbackPath[i])||[]).find(e=>e.to===fallbackPath[i+1]);
-            if(edge && edge.poiBlocked) adjacencyViolationCount++;
+            if(edge && edge.poiBlocked){
+              adjacencyViolationCount++;
+              if(edge.closestLocId != null) violatingLocIds.add(edge.closestLocId);
+            }
           }
-          return { pairs, isFallback: true, adjacencyViolationCount };
+          const violatingLocations = [...violatingLocIds].map(id=>locationsById.get(id)).filter(Boolean);
+          return { pairs, isFallback: true, adjacencyViolationCount, violatingLocations };
         }
 
         return { pairs: null, startTrapped, endTrapped };
@@ -3318,6 +3343,15 @@
   // marked locations even exist can't be told to route around them, and
   // routes it back that visibly follow the road centerline instead of a
   // mapped sidewalk even should one exist alongside it.
+  // human-readable label for a location returned by
+  // allKnownLocationsForProximityCheck — used wherever a specific
+  // unavoidable adjacency needs to be named instead of just counted
+  function describeLocation(loc){
+    if(!loc) return 'an unidentified location';
+    if(loc.label) return loc.category ? `${loc.label} (${loc.category})` : loc.label;
+    return loc.category ? capitalize(loc.category) : 'a nearby location';
+  }
+
   async function planRoute(a,b){
     showHint('Building a route that avoids being directly adjacent to known locations…');
     // Diagnostic only. Every debug-log gap traced so far has ended the same
@@ -3339,10 +3373,12 @@
       heartbeatCount++;
       appendDebugLog(`(heartbeat #${heartbeatCount})`);
     }, 1000);
+    lastRouteAttempt = { at: new Date().toISOString(), start: {lat:a.lat,lng:a.lng}, end: {lat:b.lat,lng:b.lng} };
     try{
       const result = await findAvoidancePath(a, b);
       if(result.cancelled){
         showHint('');
+        lastRouteAttempt.outcome = 'cancelled';
         showWarn('Route planning cancelled — some areas along this route hadn\'t been checked yet.', 4000);
         return;
       }
@@ -3363,19 +3399,34 @@
         } else {
           msg = `⚠ No connected route exists between these points in the road data we have. Try a different start/end, or the areas in between may need to be loaded first.`;
         }
+        lastRouteAttempt.outcome = 'no-route';
+        lastRouteAttempt.startTrapped = !!result.startTrapped;
+        lastRouteAttempt.endTrapped = !!result.endTrapped;
         showWarn(msg, null);
         return;
       }
       renderRoutePairs(result.pairs);
       map.fitBounds(L.latLngBounds(result.pairs.flat()), { padding: [40, 40] });
       if(result.isFallback){
-        showWarn(`⚠ No route avoids being directly adjacent to every known location — this one still has ${result.adjacencyViolationCount} unavoidable adjacenc${result.adjacencyViolationCount===1?'y':'ies'} (chosen to minimize how many). Tap pins below to inspect, or try a different start/end.`, null);
+        lastRouteAttempt.outcome = 'fallback';
+        lastRouteAttempt.adjacencyViolationCount = result.adjacencyViolationCount;
+        lastRouteAttempt.violatingLocations = result.violatingLocations || [];
+        const locDesc = (result.violatingLocations && result.violatingLocations.length)
+          ? ` — ${result.violatingLocations.map(describeLocation).join(', ')}`
+          : '';
+        showWarn(`⚠ No route avoids being directly adjacent to every known location — this one still has ${result.adjacencyViolationCount} unavoidable adjacenc${result.adjacencyViolationCount===1?'y':'ies'}${locDesc} (chosen to minimize how many). Tap pins below to inspect, or try a different start/end.`, null);
+        if(result.violatingLocations && result.violatingLocations.length){
+          appendDebugLog(`Fallback route's unavoidable adjacenc${result.violatingLocations.length===1?'y':'ies'}: ${result.violatingLocations.map(l=>`${describeLocation(l)} @ ${l.lat.toFixed(5)},${l.lng.toFixed(5)} (${l.id})`).join(' | ')}`);
+        }
       } else {
+        lastRouteAttempt.outcome = 'success';
         showWarn('', null);
       }
       showHint('');
     }catch(err){
       showHint('');
+      lastRouteAttempt.outcome = 'error';
+      lastRouteAttempt.errorMessage = err.message || String(err);
       showWarn(`⚠ Could not build a route (${err.message||'error'}). Check your connection, or try a shorter route.`, null);
     }finally{
       clearInterval(heartbeatTimer);
@@ -4236,6 +4287,31 @@ ${pts}
     URL.revokeObjectURL(url);
   };
 
+  // Everything needed to reproduce a routing issue exactly offline, rather
+  // than guessing at synthetic data from a description of what happened —
+  // the same pins/lines/POIs/blocked-roads the regular backup has, plus
+  // loadedCells (so re-running findAvoidancePath against this data doesn't
+  // trigger fresh network fetches for areas already checked), the most
+  // recent route attempt's exact start/end and outcome (see lastRouteAttempt
+  // in planRoute), and the debug log text as it stands right now.
+  document.getElementById('btnExportDebug').onclick = ()=>{
+    const data = {
+      pins, lineCache, lineNames, poiCache, blockedLines,
+      loadedCells: [...loadedCells],
+      lastRouteAttempt,
+      debugLog: debugLogTextarea ? debugLogTextarea.value : '',
+      exportedAt: new Date().toISOString(), version: 'routeguard-debug-1'
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const stamp = new Date().toISOString().replace(/[:.]/g,'-');
+    a.href = url; a.download = `routeguard-debug-${stamp}.json`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showWarn('Debug snapshot downloaded.', 3000);
+  };
+
   const importFileInput = document.getElementById('importFileInput');
   document.getElementById('btnImport').onclick = ()=> importFileInput.click();
 
@@ -4297,7 +4373,7 @@ ${pts}
 
   document.getElementById('btnClear').onclick = ()=>{
     if(document.getElementById('btnClear').dataset.confirm === '1'){
-      pins = []; lineCache = {}; lineNames = {}; poiCache = {}; cellRecency = {}; blockedLines = {};
+      pins = []; lineCache = {}; lineNames = {}; poiCache = {}; cellRecency = {}; blockedLines = {}; lastRouteAttempt = null;
       savePins(pins); saveLineCache(lineCache); saveLineNames(lineNames); savePoiCache(poiCache); saveCellRecency(cellRecency); saveBlockedLines();
       // loadedCells records "this area has already been checked" — leaving
       // it in place after wiping the actual location/line data would let
