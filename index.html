@@ -249,7 +249,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.78</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.79</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -4158,7 +4158,12 @@ ${pts}
       renderRoutePairs(result.pairs);
 
       if(segmentImportLine) segmentImportLayer.removeLayer(segmentImportLine);
-      segmentImportLine = L.polyline(segmentPoints, { color: SEGMENT_COLOR, weight: 5, opacity: 1 }).addTo(segmentImportLayer);
+      // reuse the route's own canvas/pane (routeLinesPane, never hidden,
+      // sits above the yellow bulk-lines pane) rather than the plain
+      // default pane a bare L.polyline would otherwise land on — without
+      // this the segment was drawing UNDERNEATH ordinary yellow roads
+      // instead of standing out over them
+      segmentImportLine = L.polyline(segmentPoints, { renderer: routeSegRenderer, color: SEGMENT_COLOR, weight: 5, opacity: 1 }).addTo(segmentImportLayer);
 
       map.fitBounds(L.latLngBounds(result.pairs.flat().concat(segmentPoints)), { padding: [40, 40] });
 
