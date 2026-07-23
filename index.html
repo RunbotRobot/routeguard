@@ -123,6 +123,16 @@
     padding:7px 12px;border-radius:14px;font-size:12px;font-weight:600;line-height:1.35;
     box-shadow:0 2px 8px rgba(0,0,0,.15);display:inline-flex;align-items:flex-start;gap:6px;
   }
+
+  /* how far there is left to go on the current planned route, and a
+     conservative time estimate (3 mph) — kept visible on the map itself
+     (not tucked in Settings) since it's meant to be glanced at while
+     actually running, not looked up */
+  #routeProgressBadge{
+    position:absolute;left:14px;top:12px;z-index:1000;display:none;
+    background:#fff;color:var(--ink);padding:7px 12px;border-radius:14px;
+    font-size:12px;font-weight:600;box-shadow:0 2px 8px rgba(0,0,0,.15);
+  }
   #dataStatus .sw{width:8px;height:8px;border-radius:50%;flex-shrink:0;margin-top:3px;}
   #dataStatus #dataStatusText{
     white-space:normal;overflow-wrap:break-word;flex:1;min-width:0;
@@ -249,7 +259,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.79</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.80</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -257,6 +267,7 @@
   <div id="main">
     <div id="map"></div>
     <div id="dataStatus" class="st-loading"><span class="sw"></span><span id="dataStatusText">Not loaded yet</span></div>
+    <div id="routeProgressBadge"></div>
     <div id="hint"></div>
     <button id="btnCancelRoute" style="display:none;position:absolute;left:50%;top:52px;transform:translateX(-50%);z-index:1000;background:#c1443c;color:#fff;border:none;padding:6px 14px;border-radius:16px;font-size:12.5px;box-shadow:0 3px 10px rgba(0,0,0,.2);cursor:pointer;">Cancel route</button>
     <div id="routeLoadProgress" style="display:none;position:absolute;left:50%;top:52px;transform:translateX(-50%);z-index:1001;background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 14px;box-shadow:0 3px 10px rgba(0,0,0,.25);min-width:220px;text-align:center;">
@@ -2344,6 +2355,7 @@
   let routeClicks = [];
   let routeLayerKeys = []; // keys drawn for the *current* route so we can revert old ones on replan
   let routeLayerKeySet = new Set(); // same, as a Set — cheap membership checks from applyOverpassResults etc.
+  let liveRoutePoints = []; // ordered [lat,lng] points along the current planned route (+ any imported segment), for the remaining-distance/time badge while running it
   const startEndLayer = L.layerGroup().addTo(map);
 
   // ---------- keep routes clear of nearby locations ----------
@@ -2398,6 +2410,24 @@
     t = Math.max(0, Math.min(1, t));
     const cx = bx*t, cy = by*t;
     return Math.hypot(px-cx, py-cy);
+  }
+  // Same projection math as pointToSegmentMeters, but also reports how far
+  // (0 to 1) along the segment the closest point falls — needed to turn
+  // "closest point on the route" into "how much of the route is behind
+  // that point", not just how far away it is.
+  function projectOntoSegmentMeters(plat, plng, alat, alng, blat, blng){
+    const refLat = alat;
+    const mLat = 111320, mLng = 111320 * Math.cos(refLat * Math.PI/180);
+    const px = (plng-alng)*mLng, py = (plat-alat)*mLat;
+    const bx = (blng-alng)*mLng, by = (blat-alat)*mLat;
+    const lengthSq = bx*bx + by*by;
+    let t = 0;
+    if(lengthSq > 0){
+      t = (px*bx + py*by) / lengthSq;
+      t = Math.max(0, Math.min(1, t));
+    }
+    const cx = bx*t, cy = by*t;
+    return { distMeters: Math.hypot(px-cx, py-cy), t };
   }
   function distanceToLocationMeters(lat, lng, loc){
     if(!loc.geometry || loc.geometry.length < 2) return haversineMeters(lat, lng, loc.lat, loc.lng);
@@ -3127,6 +3157,12 @@
 
   let pendingRouteRender = null;
   function renderRoutePairs(pairs){
+    // ordered start-to-end points along this route, for the remaining-
+    // distance/time badge — a fresh plan always replaces whatever was
+    // being tracked before (updateRouteProgress reads this fresh on every
+    // GPS fix, no separate invalidation needed)
+    liveRoutePoints = pairs.length ? [pairs[0][0], ...pairs.map(p=>p[1])] : [];
+    updateRouteProgressVisibility();
     const newKeys = pairs.map(pair=>edgeKey(pair[0], pair[1]));
     // set this before drawing so any concurrent applyOverpassResults call
     // (a background cell load finishing mid-view) already sees the new
@@ -3495,6 +3531,56 @@
   const headingBadge = document.getElementById('headingBadge');
   let followMode = true;
 
+  // ---------- remaining distance/time on the current planned route ----------
+  const routeProgressBadge = document.getElementById('routeProgressBadge');
+  const MILES_PER_METER = 1 / 1609.34;
+  const ASSUMED_PACE_MPH = 3; // conservative — a brisk walk, not a running pace, so the estimate errs toward "more time than you'll actually need"
+
+  function formatRemainingTime(hours){
+    const totalMinutes = Math.round(hours * 60);
+    if(totalMinutes < 1) return 'under a minute';
+    const h = Math.floor(totalMinutes / 60), m = totalMinutes % 60;
+    if(h === 0) return `${m} min`;
+    if(m === 0) return `${h}h`;
+    return `${h}h ${m}m`;
+  }
+
+  // Finds the closest point on the current route to (lat,lng), then sums
+  // the route's own length from there to its end — not just straight-line
+  // distance to the endpoint, since the actual remaining run follows
+  // whatever the route's real path does (turns, doubling back, etc).
+  // Cheap enough to run on every GPS fix even for a long, dense route: a
+  // few thousand basic point-to-segment checks is well under what a phone
+  // struggles with, nothing like the graph-scale work route PLANNING does.
+  function updateRouteProgress(lat, lng){
+    if(liveRoutePoints.length < 2){ routeProgressBadge.style.display = 'none'; return; }
+    let bestDist = Infinity, bestCumulativeMeters = 0, runningMeters = 0;
+    for(let i=0;i<liveRoutePoints.length-1;i++){
+      const [alat,alng] = liveRoutePoints[i], [blat,blng] = liveRoutePoints[i+1];
+      const segMeters = haversineMeters(alat, alng, blat, blng);
+      const { distMeters, t } = projectOntoSegmentMeters(lat, lng, alat, alng, blat, blng);
+      if(distMeters < bestDist){
+        bestDist = distMeters;
+        bestCumulativeMeters = runningMeters + t * segMeters;
+      }
+      runningMeters += segMeters;
+    }
+    const remainingMeters = Math.max(0, runningMeters - bestCumulativeMeters);
+    const remainingMiles = remainingMeters * MILES_PER_METER;
+    const remainingHours = remainingMiles / ASSUMED_PACE_MPH;
+    routeProgressBadge.textContent = `${remainingMiles.toFixed(1)} mi to go · ~${formatRemainingTime(remainingHours)}`;
+    routeProgressBadge.style.display = 'inline-block';
+  }
+  // Called whenever the route itself changes (planned, replanned, cleared,
+  // or a segment imported) — separate from updateRouteProgress, which
+  // needs a live GPS fix and only runs from the position-watch callback.
+  // Immediately hides the badge on a route change rather than leaving a
+  // stale distance/time on screen until the next fix updates it.
+  function updateRouteProgressVisibility(){
+    if(liveRoutePoints.length < 2) routeProgressBadge.style.display = 'none';
+    else if(lastKnownLatLng) updateRouteProgress(lastKnownLatLng[0], lastKnownLatLng[1]);
+  }
+
   function liveDivIcon(){
     return L.divIcon({
       html:'<div class="live-wrap"><div class="live-cone" id="liveCone"></div><div class="live-dot"></div></div>',
@@ -3679,6 +3765,7 @@
           const ll = [lat, lng];
           lastKnownLatLng = ll;
           lastSpeed = pos.coords.speed;
+          updateRouteProgress(lat, lng);
 
           if(recording){
             trackPoints.push({
@@ -3736,6 +3823,7 @@
     fabPin.classList.remove('show');
     btnCompass.classList.remove('show');
     headingBadge.style.display = 'none';
+    routeProgressBadge.style.display = 'none'; // no live position to base "remaining" on anymore
     if(liveMarker){ map.removeLayer(liveMarker); liveMarker = null; coneEl = null; }
     if(liveAccuracyCircle){ map.removeLayer(liveAccuracyCircle); liveAccuracyCircle = null; }
     updateMapRotationVisual(); // showingLocation just went false — snaps rotation back to north-up if it was active
@@ -3999,6 +4087,8 @@ ${pts}
       Object.keys(segHitLineIsRoute).forEach(k=>delete segHitLineIsRoute[k]);
       routeLayerKeys = [];
       routeLayerKeySet = new Set();
+      liveRoutePoints = [];
+      routeProgressBadge.style.display = 'none';
       autoPinLayer.clearLayers();
       Object.keys(autoPinMarkers).forEach(k=>delete autoPinMarkers[k]);
       lastLoadedBounds = null;
@@ -4164,6 +4254,12 @@ ${pts}
       // this the segment was drawing UNDERNEATH ordinary yellow roads
       // instead of standing out over them
       segmentImportLine = L.polyline(segmentPoints, { renderer: routeSegRenderer, color: SEGMENT_COLOR, weight: 5, opacity: 1 }).addTo(segmentImportLayer);
+
+      // renderRoutePairs just above only tracked the approach portion for
+      // the remaining-distance/time badge — the actual run continues on
+      // through the segment itself, so extend it to cover that too
+      liveRoutePoints = liveRoutePoints.concat(segmentPoints);
+      updateRouteProgressVisibility();
 
       map.fitBounds(L.latLngBounds(result.pairs.flat().concat(segmentPoints)), { padding: [40, 40] });
 
