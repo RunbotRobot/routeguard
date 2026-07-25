@@ -259,7 +259,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.85</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.86</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -985,7 +985,25 @@
       const color = CATEGORY_COLOR[p.category] || CATEGORY_COLOR.other;
       const m = L.marker([p.lat,p.lng], {icon: pinIcon(color, false)}).addTo(pinLayer);
       m.pinMeta = { color, dashed: false };
-      m.bindPopup(`<b>${escapeHtml(p.label || capitalize(p.category))}</b><br>${capitalize(p.category)}`);
+      const removeBtnId = `removePin-${idx}`;
+      m.bindPopup(`<div style="font-size:12.5px;">
+        <b>${escapeHtml(p.label || capitalize(p.category))}</b><br>${capitalize(p.category)}
+        <div style="margin-top:8px;">
+          <button id="${removeBtnId}" style="font-size:11.5px;padding:4px 9px;border-radius:6px;border:1px solid #c1443c;background:#fff;color:#c1443c;cursor:pointer;">Remove pin</button>
+        </div>
+      </div>`);
+      // p (not idx) is what's actually removed — idx is only used to make a
+      // unique button id for this render pass, and could be stale by the
+      // time this popup is actually clicked if pins changes in between
+      m.on('popupopen', ()=>{
+        const btn = document.getElementById(removeBtnId);
+        if(btn) btn.onclick = ()=>{
+          const i = pins.indexOf(p);
+          if(i !== -1) pins.splice(i, 1);
+          savePins(pins);
+          renderPins();
+        };
+      });
       const row = document.createElement('div');
       row.className = 'pin-item';
       row.innerHTML = `<span class="swatch" style="background:${color}"></span><span class="lbl">${escapeHtml(p.label||capitalize(p.category))}</span><button title="delete">✕</button>`;
