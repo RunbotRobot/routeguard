@@ -259,7 +259,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.84</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.85</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -710,22 +710,18 @@
       showDebugMsg('Local storage on this device couldn\'t fully keep a local copy of everything just checked — this route or area was larger than what fits. Nothing is lost: it\'s all safely stored on RouteGuard\'s permanent server cache. A refresh will just re-fetch a few spots from there (fast) instead of loading them instantly.', 8000);
     }
   }
-  // Diagnostic only. flushSaveCaches itself measures fast (1.3-1.4s) every
-  // time it's actually been captured, yet there's consistently a ~12-14s
-  // gap in the debug log between route drawing and flushSaveCaches
-  // running — remarkably consistent across multiple route generations,
-  // which reads more like something repeatedly pushing this debounce back
-  // (each call here resets the 1s timer) than like one single slow
-  // operation. Logs every call, unconditionally (not gated by the
-  // debug-messages toggle, and not shown as a live banner popup — this can
-  // fire often and isn't meant to interrupt anything), so the next debug
-  // log capture shows whether scheduling keeps getting reset well past
-  // when route drawing finishes, or whether there's a genuine gap where
-  // nothing appears to be calling this at all.
-  let scheduleSaveCachesCallCount = 0;
+  // Used to log unconditionally on every single call (once per cell
+  // contributing to a save burst) — that was diagnostic instrumentation for
+  // a since-solved mystery (a consistent ~12-14s gap between route drawing
+  // and flushSaveCaches actually running, root-caused to drawUndrawnBulkContent,
+  // unrelated to this function at all). Left logging that verbosely after
+  // the mystery was solved meant this fired continuously for as long as the
+  // viewport auto-loader kept loading newly-panned-into cells — entirely
+  // independent of route planning, so cancelling a route did nothing to
+  // stop it — which flooded the debug log badly enough to make selecting
+  // and copying it out impractical. flushSaveCaches still has its own "Slow
+  // cache save" diagnostic for anything genuinely worth flagging here.
   function scheduleSaveCaches(){
-    scheduleSaveCachesCallCount++;
-    appendDebugLog(`(schedule save #${scheduleSaveCachesCallCount})`);
     if(saveCachesTimer) clearTimeout(saveCachesTimer);
     saveCachesTimer = setTimeout(flushSaveCaches, 1000);
   }
@@ -899,10 +895,23 @@
     const ts = new Date().toLocaleTimeString('en-US', {hour12:false});
     debugLogEntries.push(`[${ts}]${gapLabel} ${msg}`);
     if(debugLogEntries.length > 2000) debugLogEntries.shift();
-    if(debugLogTextarea){
+    // Skip live-updating the textarea while it's focused — reassigning
+    // .value wipes whatever text the user currently has selected, so a
+    // message arriving mid "select all, then copy" would silently clear the
+    // selection before they ever got to actually copy it. Whatever's
+    // already on screen stays exactly as selected; new entries catch up
+    // once they click away (see the blur listener below), or via "Export
+    // debug snapshot" in the meantime, which reads the underlying data
+    // directly rather than the textarea.
+    if(debugLogTextarea && document.activeElement !== debugLogTextarea){
       debugLogTextarea.value = debugLogEntries.join('\n');
       debugLogTextarea.scrollTop = debugLogTextarea.scrollHeight;
     }
+  }
+  if(debugLogTextarea){
+    debugLogTextarea.addEventListener('blur', ()=>{
+      debugLogTextarea.value = debugLogEntries.join('\n');
+    });
   }
   if(btnClearDebugLog){
     btnClearDebugLog.onclick = ()=>{
@@ -2821,16 +2830,26 @@
   // each time — it's keyed per unordered node pair since a physical edge
   // appears twice in adjacency (once from each endpoint), and both copies
   // always have the same answer.
+  // Returns { promise, cancel() } rather than a plain promise — cancel()
+  // stops the underlying runChunked token AND resolves the promise right
+  // away (with cancelled:true), rather than leaving an awaiting caller
+  // hung forever waiting on a chunk loop that's stopped advancing. Bailing
+  // out here is always safe: it never hands back a graph with some edges
+  // checked and others not, because the caller (findAvoidancePath) treats
+  // any cancellation as aborting the whole route attempt, the same way
+  // cancelling the area-loading step already does — never "proceed with
+  // whatever got checked so far."
   function markEdgesBlocked(edgeRefs, nodeById, locations, poiThresholdMeters, computed, onProgress){
     const locationIndex = buildLocationIndex(locations);
     const poiSoftThreshold = poiThresholdMeters * POI_SOFT_BUFFER_MULTIPLIER;
+    let resolvePromise;
+    const promise = new Promise(resolve=>{ resolvePromise = resolve; });
     // Chunked (runChunked) so this can be spread across animation frames
     // instead of one uninterrupted pass — this was the single largest
     // synchronous block left after the direction-dedup fix above, confirmed
     // by a real report of panning staying frozen for exactly this step's
     // duration, every time.
-    return new Promise(resolve=>{
-      runChunked(edgeRefs, ({fromId, edge})=>{
+    const token = runChunked(edgeRefs, ({fromId, edge})=>{
         const a = nodeById.get(fromId);
         const b = nodeById.get(edge.to);
         if(!a || !b) return;
@@ -2862,8 +2881,8 @@
         edge.manuallyBlocked = !!blockedLines[edge.lineKey];
         edge.blocked = edge.manuallyBlocked || result.poiBlocked;
         edge.costMultiplier = (edge.manuallyBlocked || result.poiBlocked) ? 1 : proximityCostMultiplier(result.minPoiDist, poiThresholdMeters, poiSoftThreshold);
-      }, 12, resolve, onProgress);
-    });
+      }, 12, ()=>resolvePromise({cancelled:false}), onProgress);
+    return { promise, cancel(){ token.cancelled = true; resolvePromise({cancelled:true}); } };
   }
 
   // Cheap last-resort fallback: rather than re-running markEdgesBlocked with
@@ -3047,32 +3066,41 @@
   // during the gap between the area-loading bar disappearing and the route
   // actually being drawn. Delayed onset (only appears if this is still
   // running after ~800ms) so a fast route — most of them — never flashes
-  // it. No cancel button here, unlike the loading step: interrupting a
-  // partially-finished blocked-edge check would hand Dijkstra a graph
-  // where some edges never got checked at all, which could route straight
-  // through a location's buffer that just hadn't been reached yet — a
-  // decidedly worse failure mode than a route sometimes taking a little
-  // longer to plan than you'd like.
+  // it.
+  //
+  // Cancel here means abandoning this findAvoidancePath call entirely, the
+  // same as cancelling the area-loading step already does — never handing
+  // Dijkstra a graph where some edges got checked and others didn't, which
+  // could route straight through a location's buffer that just hadn't been
+  // reached yet. A very large corridor's worth of edges against a large
+  // known-location set can genuinely take minutes even chunked (never
+  // freezing the tab, but real wall-clock time all the same); leaving no way
+  // out of that wait at all was worse than the risk this used to avoid,
+  // since findAvoidancePath already discards this cancellation as cleanly
+  // as any other — there was never a partial-graph path for it to fall
+  // through in the first place.
   async function markBlockedEdgesWithProgress(edgeRefs, nodeById, locations, poiThresholdMeters, computed){
     const progressEl = document.getElementById('routeLoadProgress');
     const textEl = document.getElementById('routeLoadProgressText');
     const barEl = document.getElementById('routeLoadProgressBar');
     const cancelBtn = document.getElementById('btnCancelRouteLoad');
     let shown = false;
+    const check = markEdgesBlocked(edgeRefs, nodeById, locations, poiThresholdMeters, computed, (done, total)=>{
+      if(!shown) return;
+      const pct = Math.round(done/total*100);
+      textEl.textContent = `Checking for nearby locations… (${pct}%)`;
+      barEl.style.width = `${pct}%`;
+    });
     const showTimer = setTimeout(()=>{
       shown = true;
-      cancelBtn.style.display = 'none';
+      cancelBtn.onclick = check.cancel;
+      cancelBtn.style.display = '';
       barEl.style.width = '0%';
       textEl.textContent = 'Checking for nearby locations…';
       progressEl.style.display = 'block';
     }, 800);
     try{
-      await markEdgesBlocked(edgeRefs, nodeById, locations, poiThresholdMeters, computed, (done, total)=>{
-        if(!shown) return;
-        const pct = Math.round(done/total*100);
-        textEl.textContent = `Checking for nearby locations… (${pct}%)`;
-        barEl.style.width = `${pct}%`;
-      });
+      return await check.promise;
     } finally {
       clearTimeout(showTimer);
       if(shown){
@@ -3156,7 +3184,8 @@
       }
 
       const blockStartMs = performance.now();
-      await markBlockedEdgesWithProgress(newEdgeRefs, graph.nodeById, locations, poiThresholdMeters, proximityComputed);
+      const blockResult = await markBlockedEdgesWithProgress(newEdgeRefs, graph.nodeById, locations, poiThresholdMeters, proximityComputed);
+      if(blockResult && blockResult.cancelled) return { cancelled: true };
       const blockMs = Math.round(performance.now() - blockStartMs);
       if(blockMs > 500){
         showDebugMsg(`Slow blocked-edge check: ${blockMs}ms over ${newEdgeRefs.length} new edges, ${locations.length} known locations (attempt ${attempt+1}/${AVOIDANCE_MARGIN_ATTEMPTS})`, 6000);
@@ -3430,7 +3459,7 @@
       if(result.cancelled){
         showHint('');
         lastRouteAttempt.outcome = 'cancelled';
-        showWarn('Route planning cancelled — some areas along this route hadn\'t been checked yet.', 4000);
+        showWarn('Route planning cancelled — this route hasn\'t been fully checked, so nothing was drawn.', 4000);
         return;
       }
       if(!result.pairs){
@@ -4350,7 +4379,7 @@ ${pts}
       pins, lineCache, lineNames, poiCache, blockedLines,
       loadedCells: [...loadedCells],
       lastRouteAttempt,
-      debugLog: debugLogTextarea ? debugLogTextarea.value : '',
+      debugLog: debugLogEntries.join('\n'),
       exportedAt: new Date().toISOString(), version: 'routeguard-debug-1'
     };
     const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
