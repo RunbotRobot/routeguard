@@ -259,7 +259,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.83</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.84</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -876,10 +876,18 @@
   // (debug or real) instead, timestamped with the gap since the previous
   // entry — exactly what's needed to spot a long stall between two log
   // lines even if nothing logged anything DURING the stall itself. Bounded
-  // to the most recent 500 entries so a long session doesn't grow this
+  // to the most recent 2000 entries so a long session doesn't grow this
   // without limit; kept in memory only, not persisted, since it's a
   // this-session debugging aid, not something worth spending any of the
   // same local storage budget the rest of this app works hard to protect.
+  // Raised from 500 after a real report of a genuinely long (17+ minute)
+  // route-planning stall: at one heartbeat entry per second (see planRoute),
+  // that alone is over a thousand entries — enough to have already evicted
+  // every entry from BEFORE the stall started by the time it finally failed,
+  // losing exactly the early context (slow-area-load timings, the corridor
+  // widening attempts) needed to diagnose it. See also the heartbeat
+  // throttling below, which cuts that volume at the source instead of just
+  // making more room for it.
   const debugLogTextarea = document.getElementById('debugLogTextarea');
   const btnClearDebugLog = document.getElementById('btnClearDebugLog');
   let debugLogEntries = [];
@@ -890,7 +898,7 @@
     lastDebugLogAtMs = now;
     const ts = new Date().toLocaleTimeString('en-US', {hour12:false});
     debugLogEntries.push(`[${ts}]${gapLabel} ${msg}`);
-    if(debugLogEntries.length > 500) debugLogEntries.shift();
+    if(debugLogEntries.length > 2000) debugLogEntries.shift();
     if(debugLogTextarea){
       debugLogTextarea.value = debugLogEntries.join('\n');
       debugLogTextarea.scrollTop = debugLogTextarea.scrollHeight;
@@ -1403,30 +1411,63 @@
     return { promise, controller, endpoint };
   }
 
-  // Behaves like Promise.any — resolves as soon as any mirror succeeds, so a
-  // fast responder is never held up waiting for a slow/stalled one — but on
-  // total failure, throws with EACH mirror's own specific reason attached
-  // (timeout vs. HTTP status vs. network error) instead of Promise.any's
-  // generic, undifferentiated AggregateError message ("All promises were
-  // rejected"). That generic message made it impossible to tell, from a
-  // report alone, whether a failure was "every public mirror is
-  // simultaneously overloaded," "one endpoint is rate-limiting us," or a
-  // client-side network problem — this is what a "Could not check an area…"
-  // report actually needs to be diagnosable without guessing.
-  function raceOverpassAttempts(attempts){
-    return new Promise((resolve, reject)=>{
-      let remaining = attempts.length;
-      const reasons = new Array(attempts.length);
-      attempts.forEach((a, i)=>{
-        let host;
-        try{ host = new URL(a.endpoint).hostname; }catch(_){ host = a.endpoint || `mirror ${i+1}`; }
-        a.promise.then(resolve, err=>{
+  // Fires OVERPASS_ENDPOINTS one at a time with a short stagger, instead of
+  // all 5 in parallel for every single cell — that all-5-at-once approach
+  // (still visible in the wording above in spirit, but replaced here) was
+  // confirmed directly from a user's debug log to be enough simultaneous
+  // load on these free, shared public mirrors to get rate-limited: three of
+  // five mirrors came back HTTP 429 in one single "Could not check an area"
+  // failure, during a route search covering many cells. Hedging keeps
+  // almost all the latency benefit the parallel approach was built for — a
+  // healthy first mirror still answers before a second one is even
+  // launched, so the common case is identical in speed — while only ever
+  // bringing in additional mirrors when the current one is actually slow or
+  // has failed, instead of hitting every mirror on every cell regardless.
+  // On total failure, rejects with EACH tried mirror's own specific reason
+  // attached (timeout vs. HTTP status vs. network error), same as before —
+  // that's what makes a "Could not check an area…" report diagnosable
+  // without guessing.
+  const OVERPASS_HEDGE_DELAY_MS = 600;
+  function raceOverpassMirrorsHedged(query){
+    const controllers = [];
+    let settled = false;
+    const promise = new Promise((resolve, reject)=>{
+      const reasons = new Array(OVERPASS_ENDPOINTS.length).fill(null);
+      let remaining = OVERPASS_ENDPOINTS.length;
+      let launched = 0;
+      const timers = [];
+      function launchNext(){
+        if(settled || launched >= OVERPASS_ENDPOINTS.length) return;
+        const i = launched++;
+        const endpoint = OVERPASS_ENDPOINTS[i];
+        const attempt = fetchOverpassMirror(endpoint, query);
+        controllers.push(attempt.controller);
+        attempt.promise.then(data=>{
+          if(settled) return;
+          settled = true;
+          timers.forEach(t=>clearTimeout(t));
+          resolve(data);
+        }, err=>{
+          if(settled) return;
+          let host;
+          try{ host = new URL(endpoint).hostname; }catch(_){ host = endpoint; }
           reasons[i] = `${host}: ${err && err.message ? err.message : String(err)}`;
           remaining--;
-          if(remaining === 0) reject(new Error(reasons.join('; ')));
+          if(remaining === 0){
+            settled = true;
+            timers.forEach(t=>clearTimeout(t));
+            reject(new Error(reasons.join('; ')));
+          } else {
+            launchNext(); // this mirror failed — bring in the next one right away rather than waiting out the rest of the stagger
+          }
         });
-      });
+        if(launched < OVERPASS_ENDPOINTS.length){
+          timers.push(setTimeout(launchNext, OVERPASS_HEDGE_DELAY_MS));
+        }
+      }
+      launchNext();
     });
+    return { promise, abort(){ controllers.forEach(c=>c.abort()); } };
   }
 
   const TILE_GRID_SIZE = 0.02; // must match the worker's GRID_SIZE constant
@@ -1609,9 +1650,9 @@
       try{
         const cellBbox = `${c.lat-TILE_GRID_SIZE/2},${c.lng-TILE_GRID_SIZE/2},${c.lat+TILE_GRID_SIZE/2},${c.lng+TILE_GRID_SIZE/2}`;
         const query = buildOverpassQuery(cellBbox);
-        const attempts = OVERPASS_ENDPOINTS.map(endpoint => fetchOverpassMirror(endpoint, query));
-        const data = await raceOverpassAttempts(attempts);
-        attempts.forEach(a => a.controller.abort());
+        const race = raceOverpassMirrorsHedged(query);
+        const data = await race.promise;
+        race.abort();
         await fetch(`${cacheUrl}/tile?lat=${c.lat}&lng=${c.lng}`, {
           method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data)
         });
@@ -1717,14 +1758,16 @@
     const bbox = `${fetchBounds.getSouth()},${fetchBounds.getWest()},${fetchBounds.getNorth()},${fetchBounds.getEast()}`;
     const query = buildOverpassQuery(bbox);
 
-    // try every mirror at once and take whichever answers first, instead of
+    // hedged across mirrors — see raceOverpassMirrorsHedged — instead of
     // waiting out a full timeout on one before trying the next (that's what
-    // was producing the up-to-45-second waits)
-    const attempts = OVERPASS_ENDPOINTS.map(endpoint => fetchOverpassMirror(endpoint, query));
+    // was originally producing up-to-45-second waits) or hitting every
+    // mirror at once regardless (which turned out to trigger rate-limiting
+    // under real load)
+    const race = raceOverpassMirrorsHedged(query);
 
     try{
-      const data = await raceOverpassAttempts(attempts);
-      attempts.forEach(a => a.controller.abort()); // cancel the losers
+      const data = await race.promise;
+      race.abort(); // cancel any still-pending mirror
       const fetchMs = Math.round(performance.now() - loadStartMs);
       const applyStartMs = performance.now();
       const {poiCount, roadEdgeCount} = applyOverpassResults(data, fetchBounds, true); // fetchBounds is built from missingCells only — guaranteed fresh, nothing to reconcile
@@ -3224,9 +3267,9 @@
       source = 'direct-overpass';
       const cellBbox = `${c.lat-half},${c.lng-half},${c.lat+half},${c.lng+half}`;
       const query = buildOverpassQuery(cellBbox);
-      const attempts = OVERPASS_ENDPOINTS.map(endpoint => fetchOverpassMirror(endpoint, query));
+      const race = raceOverpassMirrorsHedged(query);
       try{
-        data = await raceOverpassAttempts(attempts);
+        data = await race.promise;
       }catch(err){
         // every source this cell had — tile cache (if configured) and every
         // public mirror — failed. Fold the tile-cache reason in too so the
@@ -3234,7 +3277,7 @@
         // warning, names every one of them instead of just the mirrors.
         throw new Error(tileCacheFailReason ? `${tileCacheFailReason}; ${err.message}` : err.message);
       }finally{
-        attempts.forEach(a=>a.controller.abort());
+        race.abort();
       }
     }
     // Diagnostic only (debug-messages toggle) — helps tell apart a fast KV
@@ -3307,7 +3350,7 @@
         // Every timing diagnostic added so far (fetch time, apply time) only
         // fires once ensureCellLoaded actually returns data — none of them
         // can see a cell that hangs and then ultimately FAILS (every tile-
-        // cache/Overpass source rejecting, see raceOverpassAttempts), since
+        // cache/Overpass source rejecting, see raceOverpassMirrorsHedged), since
         // that throws before reaching any of that code. That was a real
         // blind spot: a report of a long freeze with
         // literally no debug message from three separate rounds of
@@ -3368,10 +3411,18 @@
     // in this app could be the cause, since there'd be no JS running here
     // at all to blame; if it keeps ticking right through the gap, that
     // rules background-throttling out and points back at this app instead.
+    // Only every 5th tick is actually logged (still ticks every second
+    // internally, so a stall is detected just as promptly) — a genuinely
+    // long route-planning attempt can run for many minutes, and at one
+    // logged entry per second that alone was enough to flood the debug
+    // log's fixed size and evict everything from BEFORE the stall started —
+    // exactly the early context (slow-area timings, corridor-widening
+    // attempts) needed to diagnose it. One entry per 5 seconds is still far
+    // more resolution than needed to prove liveness.
     let heartbeatCount = 0;
     const heartbeatTimer = setInterval(()=>{
       heartbeatCount++;
-      appendDebugLog(`(heartbeat #${heartbeatCount})`);
+      if(heartbeatCount % 5 === 0) appendDebugLog(`(heartbeat #${heartbeatCount})`);
     }, 1000);
     lastRouteAttempt = { at: new Date().toISOString(), start: {lat:a.lat,lng:a.lng}, end: {lat:b.lat,lng:b.lng} };
     try{
