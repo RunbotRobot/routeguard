@@ -127,9 +127,16 @@
   /* how far there is left to go on the current planned route, and a
      conservative time estimate (3 mph) — kept visible on the map itself
      (not tucked in Settings) since it's meant to be glanced at while
-     actually running, not looked up */
+     actually running, not looked up.
+     Stacked below #dataStatus on the SAME (right) side, not left:14px/top:12px
+     like it used to be — that overlapped Leaflet's zoom control (also
+     top-left), and on a narrow phone screen #dataStatus (up to 78vw wide)
+     could reach far enough left to overlap this too, since they were on
+     opposite sides fighting for the same vertical position. #dataStatus's
+     height is fixed (#dataStatusText has a hard height:2.7em below), so a
+     flat top offset here reliably clears it regardless of message length. */
   #routeProgressBadge{
-    position:absolute;left:14px;top:12px;z-index:1000;display:none;
+    position:absolute;right:14px;top:70px;z-index:1000;display:none;
     background:#fff;color:var(--ink);padding:7px 12px;border-radius:14px;
     font-size:12px;font-weight:600;box-shadow:0 2px 8px rgba(0,0,0,.15);
   }
@@ -259,7 +266,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.86</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.87</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
