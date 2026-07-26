@@ -266,7 +266,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.87</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.88</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -4648,15 +4648,30 @@ ${pts}
       const current = await resolveCurrentLocation();
       const segStart = { lat: segmentPoints[0][0], lng: segmentPoints[0][1] };
 
+      // Same tracking planRoute does for a manually-planned route (see
+      // lastRouteAttempt there) — segment-import approach routes go through
+      // this exact same router and can fail the exact same ways, but until
+      // now a failure here left lastRouteAttempt untouched, so a debug
+      // snapshot exported after one of these had no record of what was
+      // actually attempted (start/end coordinates, outcome) at all. Set
+      // BEFORE calling findAvoidancePath, not after — an operational failure
+      // (e.g. "no road data returned for this area") throws rather than
+      // returning normally, and still needs to be captured.
+      lastRouteAttempt = { at: new Date().toISOString(), start: {lat:current.lat,lng:current.lng}, end: {lat:segStart.lat,lng:segStart.lng}, context: 'segment-import' };
+
       showHint('Planning a route to the start of the segment…');
       const result = await findAvoidancePath(current, segStart);
       showHint('');
 
       if(result.cancelled){
+        lastRouteAttempt.outcome = 'cancelled';
         showWarn('Segment import cancelled — some areas along the approach hadn\'t been checked yet.', 4000);
         return;
       }
       if(!result.pairs){
+        lastRouteAttempt.outcome = 'no-route';
+        lastRouteAttempt.startTrapped = !!result.startTrapped;
+        lastRouteAttempt.endTrapped = !!result.endTrapped;
         showWarn('⚠ Could not find a connected road route to this segment\'s start from your current location.', null);
         return;
       }
@@ -4680,6 +4695,10 @@ ${pts}
       map.fitBounds(L.latLngBounds(result.pairs.flat().concat(segmentPoints)), { padding: [40, 40] });
 
       const safety = checkSegmentForNearbyLocations(segmentPoints);
+      lastRouteAttempt.outcome = result.isFallback ? 'fallback' : 'success';
+      if(result.isFallback) lastRouteAttempt.adjacencyViolationCount = result.adjacencyViolationCount;
+      lastRouteAttempt.segmentSafety = { flaggedEdgeCount: safety.flaggedEdgeCount, closestMeters: safety.closestMeters, distinctLocationCount: safety.distinctLocationCount };
+
       if(safety.flaggedEdgeCount > 0){
         const closestFt = Math.round(safety.closestMeters * 3.28084);
         showWarn(`⚠ This segment passes within ${closestFt}ft of ${safety.distinctLocationCount} known location${safety.distinctLocationCount===1?'':'s'} (${safety.flaggedEdgeCount} point${safety.flaggedEdgeCount===1?'':'s'} along its length). The segment itself can't be rerouted — it has to stay the segment — but you may want extra care there.`, null);
@@ -4690,6 +4709,7 @@ ${pts}
       }
     }catch(err){
       showHint('');
+      if(lastRouteAttempt){ lastRouteAttempt.outcome = 'error'; lastRouteAttempt.errorMessage = err.message || String(err); }
       showWarn(`⚠ Could not load segment (${err.message||'error'}).`, null);
     }
   }
