@@ -266,7 +266,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.89</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.90</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -445,7 +445,7 @@
         <input type="file" id="importFileInput" accept="application/json,.json" style="display:none;">
         <button class="small-btn" id="btnExportDebug" style="width:100%;margin-bottom:6px;">Export debug snapshot (for troubleshooting)</button>
         <div style="font-size:11px;color:var(--muted);margin-bottom:6px;">
-          Includes your pins, cached lines/locations, blocked roads, and the most recent route attempt (start/end and exactly how it resolved) plus the debug log above — everything needed to reproduce a routing issue exactly, to send along when reporting one. If a tile cache relay URL is set below, this uploads there instead of downloading a file — share the short code shown instead.
+          Includes pins, cached lines/locations, and blocked roads near your most recent route attempt (not your whole history), plus exactly how that attempt resolved and the debug log above — everything needed to reproduce a routing issue exactly, to send along when reporting one. If a tile cache relay URL is set below, this uploads there instead of downloading a file — share the link shown instead.
         </div>
         <div id="debugSnapshotResult" style="display:none;margin-bottom:6px;">
           <input type="text" id="debugSnapshotCode" readonly style="width:100%;box-sizing:border-box;font-family:monospace;font-size:12.5px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:#f5f7f5;">
@@ -4396,6 +4396,34 @@ ${pts}
     URL.revokeObjectURL(url);
   };
 
+  // A route-planning question only ever needs the road/location data near
+  // THAT route, not everywhere ever visited — dumping the entire historical
+  // lineCache (which can run into the tens of thousands of lines for a
+  // wide-ranging user, tens of megabytes) made every export slow to
+  // copy/attach/paste for no reason, when the last route attempt's own
+  // corridor search never touched almost all of it. Scopes to a padded
+  // bounding box around lastRouteAttempt's start/end — 20km is comfortably
+  // wider than the widest corridor findAvoidancePath will ever actually
+  // search (see AVOIDANCE_MARGIN_ATTEMPTS), so nothing the real search could
+  // have used gets left out. Falls back to the unscoped full export when
+  // there's no lastRouteAttempt to scope around at all.
+  const DEBUG_SNAPSHOT_SCOPE_PAD_METERS = 20000;
+  function boundsAroundLastRouteAttempt(){
+    if(!lastRouteAttempt || !lastRouteAttempt.start || !lastRouteAttempt.end) return null;
+    const lats = [lastRouteAttempt.start.lat, lastRouteAttempt.end.lat];
+    const lngs = [lastRouteAttempt.start.lng, lastRouteAttempt.end.lng];
+    const midLat = (lats[0]+lats[1])/2;
+    const latPad = DEBUG_SNAPSHOT_SCOPE_PAD_METERS / 111320;
+    const lngPad = DEBUG_SNAPSHOT_SCOPE_PAD_METERS / (111320 * Math.cos(midLat * Math.PI/180));
+    return {
+      latMin: Math.min(...lats)-latPad, latMax: Math.max(...lats)+latPad,
+      lngMin: Math.min(...lngs)-lngPad, lngMax: Math.max(...lngs)+lngPad
+    };
+  }
+  function inBounds(lat, lng, b){
+    return lat>=b.latMin && lat<=b.latMax && lng>=b.lngMin && lng<=b.lngMax;
+  }
+
   // Everything needed to reproduce a routing issue exactly offline, rather
   // than guessing at synthetic data from a description of what happened —
   // the same pins/lines/POIs/blocked-roads the regular backup has, plus
@@ -4412,10 +4440,40 @@ ${pts}
   // back to the original file download when no relay is set up, so this
   // still works with zero server-side setup.
   async function uploadOrDownloadDebugSnapshot(){
+    const scopeBounds = boundsAroundLastRouteAttempt();
+    let scopedLineCache = lineCache, scopedPoiCache = poiCache, scopedPins = pins,
+        scopedBlockedLines = blockedLines, scopedLoadedCells = [...loadedCells];
+    if(scopeBounds){
+      scopedLineCache = {};
+      Object.keys(lineCache).forEach(k=>{
+        const [p1,p2] = lineCache[k];
+        if(inBounds(p1[0],p1[1],scopeBounds) || inBounds(p2[0],p2[1],scopeBounds)) scopedLineCache[k] = lineCache[k];
+      });
+      scopedPoiCache = {};
+      Object.keys(poiCache).forEach(k=>{
+        const p = poiCache[k];
+        if(inBounds(p.lat,p.lng,scopeBounds)) scopedPoiCache[k] = poiCache[k];
+      });
+      scopedPins = pins.filter(p=>inBounds(p.lat,p.lng,scopeBounds));
+      scopedBlockedLines = {};
+      Object.keys(blockedLines).forEach(k=>{
+        const pair = lineCache[k];
+        if(pair && (inBounds(pair[0][0],pair[0][1],scopeBounds) || inBounds(pair[1][0],pair[1][1],scopeBounds))) scopedBlockedLines[k] = true;
+      });
+      scopedLoadedCells = [...loadedCells].filter(k=>{
+        const [lat,lng] = k.split(',').map(Number);
+        return inBounds(lat,lng,scopeBounds);
+      });
+    }
+    // lineNames is keyed identically to lineCache (same edgeKey), so scoping
+    // it to just the keys that survived above keeps it in sync automatically
+    const scopedLineNames = {};
+    Object.keys(scopedLineCache).forEach(k=>{ if(lineNames[k]) scopedLineNames[k] = lineNames[k]; });
     const data = {
-      pins, lineCache, lineNames, poiCache, blockedLines,
-      loadedCells: [...loadedCells],
+      pins: scopedPins, lineCache: scopedLineCache, lineNames: scopedLineNames, poiCache: scopedPoiCache, blockedLines: scopedBlockedLines,
+      loadedCells: scopedLoadedCells,
       lastRouteAttempt,
+      scopedToLastRouteAttempt: !!scopeBounds,
       debugLog: debugLogEntries.join('\n'),
       exportedAt: new Date().toISOString(), version: 'routeguard-debug-1'
     };
@@ -4435,7 +4493,8 @@ ${pts}
         resultEl.style.display = 'block';
         codeEl.focus();
         codeEl.select();
-        showWarn('Debug snapshot uploaded — copy the link below to share it.', 5000);
+        const sizeNote = scopeBounds ? ` (scoped to the last route attempt: ${Object.keys(scopedLineCache).length} of ${Object.keys(lineCache).length} lines)` : '';
+        showWarn(`Debug snapshot uploaded${sizeNote} — copy the link below to share it.`, 6000);
         return;
       }catch(err){
         showWarn(`⚠ Could not upload snapshot (${err.message||'error'}) — downloading a file instead.`, 4000);
