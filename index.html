@@ -266,7 +266,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.88</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.89</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -445,7 +445,11 @@
         <input type="file" id="importFileInput" accept="application/json,.json" style="display:none;">
         <button class="small-btn" id="btnExportDebug" style="width:100%;margin-bottom:6px;">Export debug snapshot (for troubleshooting)</button>
         <div style="font-size:11px;color:var(--muted);margin-bottom:6px;">
-          Includes your pins, cached lines/locations, blocked roads, and the most recent route attempt (start/end and exactly how it resolved) plus the debug log above — everything needed to reproduce a routing issue exactly, to send along when reporting one.
+          Includes your pins, cached lines/locations, blocked roads, and the most recent route attempt (start/end and exactly how it resolved) plus the debug log above — everything needed to reproduce a routing issue exactly, to send along when reporting one. If a tile cache relay URL is set below, this uploads there instead of downloading a file — share the short code shown instead.
+        </div>
+        <div id="debugSnapshotResult" style="display:none;margin-bottom:6px;">
+          <input type="text" id="debugSnapshotCode" readonly style="width:100%;box-sizing:border-box;font-family:monospace;font-size:12.5px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:#f5f7f5;">
+          <div style="font-size:11px;color:var(--muted);margin-top:3px;">Tap the code above to select it, then copy — share it in chat. Expires in 7 days.</div>
         </div>
         <button class="small-btn danger-text" id="btnClear" style="width:100%;">Clear all data</button>
         <div class="legend-row" style="justify-content:space-between;margin-top:10px;">
@@ -4399,7 +4403,15 @@ ${pts}
   // trigger fresh network fetches for areas already checked), the most
   // recent route attempt's exact start/end and outcome (see lastRouteAttempt
   // in planRoute), and the debug log text as it stands right now.
-  document.getElementById('btnExportDebug').onclick = ()=>{
+  //
+  // If a tile cache relay is configured, this uploads there (POST
+  // /debug-snapshot, see routeguard-worker) instead of downloading a file —
+  // requested directly after a report that an 8MB-plus download, repeated
+  // every debugging round-trip, is a real burden when local device storage
+  // can only be cleared with help on a schedule measured in weeks. Falls
+  // back to the original file download when no relay is set up, so this
+  // still works with zero server-side setup.
+  async function uploadOrDownloadDebugSnapshot(){
     const data = {
       pins, lineCache, lineNames, poiCache, blockedLines,
       loadedCells: [...loadedCells],
@@ -4407,15 +4419,40 @@ ${pts}
       debugLog: debugLogEntries.join('\n'),
       exportedAt: new Date().toISOString(), version: 'routeguard-debug-1'
     };
-    const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
+    const json = JSON.stringify(data);
+    const cfg = loadTileCacheCfg();
+    const resultEl = document.getElementById('debugSnapshotResult');
+    const codeEl = document.getElementById('debugSnapshotCode');
+    if(cfg.url){
+      try{
+        const controller = new AbortController();
+        const timeoutId = setTimeout(()=>controller.abort(), 20000);
+        const res = await fetch(`${cfg.url}/debug-snapshot`, { method:'POST', body: json, signal: controller.signal });
+        clearTimeout(timeoutId);
+        if(!res.ok) throw new Error('HTTP '+res.status);
+        const { id } = await res.json();
+        codeEl.value = `${cfg.url}/debug-snapshot/${id}`;
+        resultEl.style.display = 'block';
+        codeEl.focus();
+        codeEl.select();
+        showWarn('Debug snapshot uploaded — copy the link below to share it.', 5000);
+        return;
+      }catch(err){
+        showWarn(`⚠ Could not upload snapshot (${err.message||'error'}) — downloading a file instead.`, 4000);
+        // fall through to file download below
+      }
+    }
+    const blob = new Blob([json], {type:'application/json'});
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     const stamp = new Date().toISOString().replace(/[:.]/g,'-');
     a.href = url; a.download = `routeguard-debug-${stamp}.json`;
     document.body.appendChild(a); a.click(); document.body.removeChild(a);
     URL.revokeObjectURL(url);
+    if(resultEl) resultEl.style.display = 'none';
     showWarn('Debug snapshot downloaded.', 3000);
-  };
+  }
+  document.getElementById('btnExportDebug').onclick = uploadOrDownloadDebugSnapshot;
 
   const importFileInput = document.getElementById('importFileInput');
   document.getElementById('btnImport').onclick = ()=> importFileInput.click();
