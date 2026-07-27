@@ -266,7 +266,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.91</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.92</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -2437,7 +2437,7 @@
     // (||0) sorts first — never having a recorded use is, if anything, an
     // even better eviction candidate than something used a while ago.
     const candidates = Array.from(loadedCells)
-      .filter(k=>!routeCells.has(k) && !viewportCells.has(k))
+      .filter(k=>!routeCells.has(k) && !viewportCells.has(k) && !inFlightRouteSearchCellKeys.has(k))
       .sort((a,b)=>(cellRecency[a]||0)-(cellRecency[b]||0));
     const toEvict = candidates.slice(0, targetCount);
     if(toEvict.length === 0) return 0;
@@ -2549,6 +2549,22 @@
   let routeClicks = [];
   let routeLayerKeys = []; // keys drawn for the *current* route so we can revert old ones on replan
   let routeLayerKeySet = new Set(); // same, as a Set — cheap membership checks from applyOverpassResults etc.
+  // Cells belonging to a findAvoidancePath call that's still in progress —
+  // i.e. loaded (or being loaded) as part of a corridor search whose route
+  // hasn't been found/drawn yet, so it has no routeLayerKeySet entry to be
+  // protected by. Without this, evictLeastRecentlyUsedCells (see its own
+  // comment on routeCells) only shields the *previous* displayed route and
+  // the current viewport — for a route/area big enough to blow past local
+  // storage's quota (a real report: a single route's own corridor held
+  // 38,465 of the device's 60,239 cached lines), eviction can and does start
+  // reclaiming cells this exact in-flight search already fetched, before
+  // findAvoidancePath ever gets to use them — the same "data was fetched but
+  // silently never reached the routing graph" failure this file's
+  // stale-lineCellIndex fix addressed, just via a different path (deleted
+  // out from under it instead of never indexed). findAvoidancePath adds to
+  // this set as its corridor grows and always clears it (success, failure,
+  // or cancellation) in a finally block.
+  let inFlightRouteSearchCellKeys = new Set();
   let liveRoutePoints = []; // ordered [lat,lng] points along the current planned route (+ any imported segment), for the remaining-distance/time badge while running it
   const startEndLayer = L.layerGroup().addTo(map);
   // Full detail on the most recent planRoute call — start/end, how it
@@ -3192,6 +3208,7 @@
     const locationsById = new Map(locations.map(l=>[l.id, l]));
     const poiThresholdMeters = MIN_LOCATION_DISTANCE_FT * 0.3048;
 
+    try{
     for(let attempt=0; attempt<AVOIDANCE_MARGIN_ATTEMPTS; attempt++){
       const marginMeters = avoidanceMarginMeters(straightLineMeters, attempt);
       const isLastAttempt = attempt === AVOIDANCE_MARGIN_ATTEMPTS-1;
@@ -3201,6 +3218,13 @@
       // attempt are skipped automatically (loadedCells persists across
       // attempts), so widening only ever fetches the newly-added fringe
       const corridorCells = corridorCellsForRoute(a, b, marginMeters);
+      // Protect this attempt's whole corridor from local-storage eviction
+      // (see evictLeastRecentlyUsedCells and inFlightRouteSearchCellKeys's
+      // own comment) BEFORE fetching anything — a save debounced from an
+      // earlier cell's applyOverpassResults call can fire, and start
+      // evicting, at any point while loadCellsWithProgress below is still
+      // working through this same corridor's cells.
+      corridorCells.forEach(c=>inFlightRouteSearchCellKeys.add(cellKeyForCellCenter(c.lat,c.lng)));
       const missingCells = corridorCells.filter(c=>!loadedCells.has(cellKeyForCellCenter(c.lat,c.lng)));
       if(missingCells.length){
         const result = await loadCellsWithProgress(missingCells);
@@ -3311,6 +3335,9 @@
       }
     }
     return { pairs: null };
+    }finally{
+      inFlightRouteSearchCellKeys.clear();
+    }
   }
 
   // fetch (tile cache first, direct Overpass as fallback) and apply exactly
