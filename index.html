@@ -266,7 +266,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.92</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.93</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -2128,6 +2128,22 @@
     const weight = Math.max(1.2, base * scale);
     const casing = weight + Math.max(1, 3 * scale);
     return { weight, casing };
+  }
+
+  // A Strava segment import shares the route's own canvas/pane (see
+  // segmentImportLine below) and gets drawn UNDER a planned route's own
+  // polylines whenever the two overlap — the approach route to a segment's
+  // start (and any route planned afterward) is drawn after the segment on
+  // that shared canvas, so the route paints on top, hiding the blue segment
+  // line completely wherever they coincide. Reordering which one paints on
+  // top would need touching the chunked route-draw path (see runChunked
+  // callers), so instead this makes the segment reliably wider than the
+  // route's own on-screen footprint (weight + white casing) at every zoom
+  // level, the same zoom-linked scaling segWeightsForZoom already applies to
+  // routes/lines — a fixed margin beyond the route's casing keeps a blue rim
+  // visible on both sides even where the route runs directly overtop.
+  function segmentImportWeightForZoom(zoom){
+    return segWeightsForZoom(true, zoom).casing + 6;
   }
 
   // same zoom-linked shrinkage as lines, applied to pin/marker diameter —
@@ -4732,6 +4748,12 @@ ${pts}
   const SEGMENT_COLOR = "#1f6fd9";
   const segmentImportLayer = L.layerGroup().addTo(map);
   let segmentImportLine = null;
+  // keep the imported segment's peek-out margin correct as you zoom — see
+  // segmentImportWeightForZoom's own comment for why it's wider than a
+  // route's on-screen footprint in the first place
+  map.on('zoomend', ()=>{
+    if(segmentImportLine) segmentImportLine.setStyle({ weight: segmentImportWeightForZoom(map.getZoom()) });
+  });
 
   function parseGpxTrackPoints(gpxText){
     const doc = new DOMParser().parseFromString(gpxText, 'application/xml');
@@ -4842,7 +4864,12 @@ ${pts}
       // default pane a bare L.polyline would otherwise land on — without
       // this the segment was drawing UNDERNEATH ordinary yellow roads
       // instead of standing out over them
-      segmentImportLine = L.polyline(segmentPoints, { renderer: routeSegRenderer, color: SEGMENT_COLOR, weight: 5, opacity: 1 }).addTo(segmentImportLayer);
+      //
+      // weight comes from segmentImportWeightForZoom (see its own comment)
+      // rather than a fixed number — wide enough to still show a blue rim
+      // on either side even where the approach route (or any route planned
+      // afterward) runs directly overtop and paints on top of it.
+      segmentImportLine = L.polyline(segmentPoints, { renderer: routeSegRenderer, color: SEGMENT_COLOR, weight: segmentImportWeightForZoom(map.getZoom()), opacity: 1 }).addTo(segmentImportLayer);
 
       // renderRoutePairs just above only tracked the approach portion for
       // the remaining-distance/time badge — the actual run continues on
