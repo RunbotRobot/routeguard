@@ -266,7 +266,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.93</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.94</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -3707,13 +3707,33 @@
   });
 
   // ---------- plan route by address ----------
+  // A suite/unit/apartment/floor number isn't a separately geocodable
+  // feature — there's no distinct lat/lng for "Suite 200" inside a
+  // building, it's the same point as the building itself — but leaving one
+  // in the free-text query to Nominatim doesn't just get harmlessly
+  // ignored: it often throws its parser off enough that an address which
+  // resolves cleanly without it returns no match at all. Stripped before
+  // geocoding only, never touching what's actually shown in the input box,
+  // so the user's own typed text (and whatever they eventually confirm/
+  // reuse it for) is untouched.
+  function stripUnitDesignators(address){
+    return address
+      .replace(/[,]?\s*\b(?:suite|ste|unit|apt|apartment|floor|fl|room|rm|bldg|building)\.?\s*[a-z0-9-]+\b/gi, '')
+      .replace(/[,]?\s*#\s*[a-z0-9-]+\b/gi, '')
+      .replace(/\s+,/g, ',')
+      .replace(/,\s*,+/g, ',')
+      .replace(/\s{2,}/g, ' ')
+      .replace(/^[,\s]+|[,\s]+$/g, '')
+      .trim();
+  }
   // Nominatim (OSM's own geocoder) — free, no key, matches the rest of the
   // app's OSM-based stack. Its usage policy caps requests at 1/sec and asks
   // for at most on-demand lookups, not autocomplete-style querying — this
   // only ever fires on an explicit "Find route" tap, at most twice per tap,
   // paced with a deliberate gap below.
   async function geocodeAddress(query){
-    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(query)}`;
+    const cleaned = stripUnitDesignators(query);
+    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(cleaned || query)}`;
     const controller = new AbortController();
     const timeoutId = setTimeout(()=>controller.abort(), 10000);
     try{
