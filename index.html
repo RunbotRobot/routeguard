@@ -266,7 +266,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.94</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.95</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -4053,7 +4053,16 @@
     const remainingMeters = Math.max(0, runningMeters - bestCumulativeMeters);
     const remainingMiles = remainingMeters * MILES_PER_METER;
     const remainingHours = remainingMiles / ASSUMED_PACE_MPH;
-    routeProgressBadge.textContent = `${remainingMiles.toFixed(1)} mi to go · ~${formatRemainingTime(remainingHours)}`;
+    // wall-clock finish time, not just a duration — "~46m" answers "how
+    // much longer", but not "will I be back before the store closes /
+    // it gets dark", which is what an ETA is actually for. Uses the
+    // device's own locale/12-vs-24-hour formatting rather than a fixed
+    // format, same as everything else user-facing here (the debug log's
+    // own timestamps deliberately force 24-hour instead — that's a
+    // diagnostics format, not a reading-at-a-glance one).
+    const eta = new Date(Date.now() + remainingHours * 3600 * 1000);
+    const etaLabel = eta.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
+    routeProgressBadge.textContent = `${remainingMiles.toFixed(1)} mi to go · ~${formatRemainingTime(remainingHours)} · ETA ${etaLabel}`;
     routeProgressBadge.style.display = 'inline-block';
   }
   // Called whenever the route itself changes (planned, replanned, cleared,
