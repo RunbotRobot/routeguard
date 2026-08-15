@@ -266,7 +266,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.95</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.96</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -458,6 +458,13 @@
         </div>
         <div style="font-size:11px;color:var(--muted);margin-top:4px;">
           Routine background activity (like local cache housekeeping) stays silent by default. Turn this on while testing to see it happen.
+        </div>
+        <div class="legend-row" style="justify-content:space-between;margin-top:10px;">
+          <span>Show avoidance buffers</span>
+          <input type="checkbox" id="showAvoidBuffersToggle" style="width:auto;">
+        </div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px;">
+          Draws the actual keep-out zone around every known location (the buffer distance a route has to clear, not just the location's own footprint) — off by default since it's a lot to draw over a wide area; turn it on while troubleshooting why a route was or wasn't allowed near a specific spot.
         </div>
         <div class="legend-row" style="justify-content:space-between;margin-top:10px;">
           <span>Debug log</span>
@@ -807,6 +814,11 @@
   const WALKABLE_COLOR = "#f0c419";
   const ROUTE_COLOR = "#1f9e4a";
   const BLOCKED_LINE_COLOR = "#d32f2f";
+  // deliberately a different hue from BLOCKED_LINE_COLOR (a road-red),
+  // not just a different shade of the same red — the avoidance-buffer
+  // overlay (see renderAvoidBuffers) needs to read as a distinct kind of
+  // "red" at a glance, not be mistaken for a blocked road
+  const AVOID_BUFFER_COLOR = "#e91e63";
 
   // ---------- map ----------
   const map = L.map('map', {
@@ -989,6 +1001,10 @@
   const pinLayer = L.layerGroup().addTo(map);
   function renderPins(){
     pinLayer.clearLayers();
+    // a pin is one of the location types the avoidance buffer overlay
+    // draws (see renderAvoidBuffers) — added/removed pins need to be
+    // reflected immediately, not just on the next pan/zoom
+    renderAvoidBuffers();
     const list = document.getElementById('pinList');
     list.innerHTML = '';
     document.getElementById('pinCount').textContent = pins.length;
@@ -1256,6 +1272,10 @@
     // cache than the last. Debounced: the actual write happens once
     // shortly after the burst settles, not once per cell.
     scheduleSaveCaches();
+    // cheap when off (see renderAvoidBuffers' own early return) — keeps a
+    // location that just arrived from this fetch showing its buffer
+    // immediately rather than waiting for the next pan/zoom
+    renderAvoidBuffers();
     // seenLineKeys (every edge key this specific fetch reported, whether or
     // not it was already cached) lets findAvoidancePath's per-call line-cell
     // index (see buildLineCellIndex/indexLineIntoCellIndex) stay current as
@@ -2630,6 +2650,63 @@
     });
     return locs;
   }
+
+  // ---------- avoidance-buffer overlay (troubleshooting aid) ----------
+  // Shows the actual keep-out zone the router enforces, not just a
+  // location's own footprint — a route is only blocked once it comes
+  // within MIN_LOCATION_DISTANCE_FT, so a road running right along the
+  // edge of a school's mapped property line but still outside that buffer
+  // is legitimately allowed, which looks wrong at a glance without seeing
+  // the buffer itself. Off by default (see the settings toggle) and
+  // scoped to the current viewport — allKnownLocationsForProximityCheck()
+  // returns every location ever cached, which for a wide-ranging user can
+  // run into the thousands (same concern the bulk-lines/pins rendering
+  // already had, see drawUndrawnBulkContent) and there's nothing to gain
+  // from materializing circles for locations nowhere near what's on
+  // screen right now.
+  const LS_SHOW_AVOID_BUFFERS = "rg_show_avoid_buffers";
+  let showAvoidBuffers = (function(){ try{ return localStorage.getItem(LS_SHOW_AVOID_BUFFERS) === '1'; }catch(e){ return false; } })();
+  const avoidBufferLayer = L.layerGroup();
+  // Canvas, not Leaflet's default SVG, for the same reason every other
+  // potentially-numerous shape in this file uses one (see segRenderer/
+  // routeSegRenderer) — an SVG element per shape doesn't scale to however
+  // many locations a dense area can have.
+  const avoidBufferRenderer = L.canvas({ padding: 0.5 });
+  function renderAvoidBuffers(){
+    avoidBufferLayer.clearLayers();
+    if(!showAvoidBuffers) return;
+    const thresholdMeters = MIN_LOCATION_DISTANCE_FT * 0.3048;
+    // generous pad so the buffer for a location just outside the visible
+    // edge (whose own circle still reaches into view) doesn't pop in/out
+    // right at the viewport boundary as you pan
+    const viewBounds = map.getBounds().pad(0.5);
+    allKnownLocationsForProximityCheck().forEach(loc=>{
+      if(!viewBounds.contains([loc.lat, loc.lng])) return;
+      // the location's own real footprint (a fetched building/way
+      // outline), where we have one — drawn distinctly from the buffer
+      // circle below so a big campus/park's true boundary is still
+      // visible, not just its enclosing circle
+      if(loc.geometry && loc.geometry.length > 2){
+        L.polygon(loc.geometry, {
+          renderer: avoidBufferRenderer,
+          color: AVOID_BUFFER_COLOR, weight: 1.5, opacity: 0.9,
+          fillColor: AVOID_BUFFER_COLOR, fillOpacity: 0.25, interactive: false
+        }).addTo(avoidBufferLayer);
+      }
+      // the actual keep-out buffer every edge is checked against — an
+      // approximation for a location with real boundary geometry (the
+      // true zone is that shape expanded outward by the buffer distance,
+      // not a circle around its centroid), but exact for the common case
+      // of a plain point location (a pin, or most auto-detected POIs)
+      L.circle([loc.lat, loc.lng], {
+        renderer: avoidBufferRenderer,
+        radius: thresholdMeters,
+        color: AVOID_BUFFER_COLOR, weight: 1, opacity: 0.7,
+        fillColor: AVOID_BUFFER_COLOR, fillOpacity: 0.15, interactive: false
+      }).addTo(avoidBufferLayer);
+    });
+  }
+  map.on('moveend zoomend', ()=>{ if(showAvoidBuffers) renderAvoidBuffers(); });
   // minimum distance from a point to a location — the location's actual
   // boundary when we have one (a fetched polygon/way), otherwise straight
   // to its point. A local equirectangular projection is accurate enough at
@@ -4001,6 +4078,25 @@
   let liveMarker = null, liveAccuracyCircle = null, coneEl = null;
   let lastKnownLatLng = null;
   let lastHeadingDeg = 0;
+  // Unwrapped/continuous version of the same heading — lastHeadingDeg
+  // itself stays a plain 0-360 compass reading (that's what headingLabel
+  // and anything else reading "which way am I facing" wants), but every
+  // CSS transform driven by heading (the live-cone's rotate(), and the
+  // map-rotation pane's) needs the SHORTEST-path angle instead, or a
+  // reading that crosses the 0/360 seam (say 358° to 2°, a real 4° turn)
+  // gets handed to CSS as a jump from 358deg to 2deg — which CSS animates
+  // (or, for the pane, simply computes) as -356 degrees of rotation, not
+  // +4, since raw degree values carry no notion of wrapping on their own.
+  // That's exactly the "spins the wrong way and overshoots past north"
+  // bug reported live: keeping a running, never-wrapped total and always
+  // stepping toward the new reading by its equivalent angle within ±180°
+  // of wherever the total currently sits makes every update the shortest
+  // possible turn, with no seam anywhere on the compass.
+  let continuousHeadingDeg = 0;
+  function stepTowardShortestAngle(fromContinuous, toRawDeg){
+    const delta = (((toRawDeg - fromContinuous) % 360) + 540) % 360 - 180;
+    return fromContinuous + delta;
+  }
   let trackPoints = []; // {lat,lng,ele,time}
   let recording = false;
   let showingLocation = false;
@@ -4160,7 +4256,12 @@
   map.on('move zoom', reapplyRotationTransform);
 
   function updateMapRotationVisual(){
-    const targetDeg = rotationShouldBeActive() ? -lastHeadingDeg : 0;
+    // -continuousHeadingDeg (see its own comment), not -lastHeadingDeg —
+    // rotationShouldBeActive() going false is a deliberate, immediate
+    // reset to plain north-up (suspending for a touch, or the toggle
+    // turning off), not a heading update, so that branch snaps straight
+    // to 0 same as before rather than taking "the short way back to 0".
+    const targetDeg = rotationShouldBeActive() ? -continuousHeadingDeg : 0;
     if(targetDeg === currentRotationDeg) return;
     currentRotationDeg = targetDeg;
     reapplyRotationTransform();
@@ -4189,6 +4290,7 @@
 
   function setHeading(deg){
     lastHeadingDeg = deg;
+    continuousHeadingDeg = stepTowardShortestAngle(continuousHeadingDeg, deg);
     if(!coneEl && liveMarker){
       const el = liveMarker.getElement();
       if(el) coneEl = el.querySelector('#liveCone');
@@ -4197,8 +4299,12 @@
     // while the map itself is rotating to face this heading, the cone
     // stays fixed pointing straight up — the map's own orientation is what
     // conveys direction now. North-up (rotation inactive) is the normal
-    // case: the cone rotates to point the way you're facing instead.
-    if(coneEl) coneEl.style.transform = `rotate(${rotationShouldBeActive() ? 0 : deg}deg)`;
+    // case: the cone rotates to point the way you're facing instead, via
+    // continuousHeadingDeg (see its own comment) rather than the raw
+    // reading, so the CSS transition on .live-cone always takes the
+    // shortest turn instead of animating the long way around whenever a
+    // reading crosses the 0/360 seam.
+    if(coneEl) coneEl.style.transform = `rotate(${rotationShouldBeActive() ? 0 : continuousHeadingDeg}deg)`;
     headingBadge.textContent = headingLabel(deg);
   }
 
@@ -4489,6 +4595,16 @@ ${pts}
   debugMsgsToggle.onchange = ()=>{
     debugMsgsEnabled = debugMsgsToggle.checked;
     try{ localStorage.setItem(LS_DEBUG_MSGS, debugMsgsEnabled ? '1' : '0'); }catch(e){}
+  };
+
+  const showAvoidBuffersToggle = document.getElementById('showAvoidBuffersToggle');
+  showAvoidBuffersToggle.checked = showAvoidBuffers;
+  if(showAvoidBuffers){ avoidBufferLayer.addTo(map); renderAvoidBuffers(); }
+  showAvoidBuffersToggle.onchange = ()=>{
+    showAvoidBuffers = showAvoidBuffersToggle.checked;
+    try{ localStorage.setItem(LS_SHOW_AVOID_BUFFERS, showAvoidBuffers ? '1' : '0'); }catch(e){}
+    if(showAvoidBuffers){ avoidBufferLayer.addTo(map); renderAvoidBuffers(); }
+    else avoidBufferLayer.remove();
   };
 
   // ---------- export / import / clear ----------
