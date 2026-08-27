@@ -266,7 +266,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.96</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.97</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -503,22 +503,116 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js" crossorigin="anonymous"></script>
 <script>
-(function(){
+(async function(){
   "use strict";
 
-  window.addEventListener('error', (e)=>{
-    console.error('Unhandled error:', e.error || e.message);
+  function showUnhandledErrorBanner(message){
     try{
       const w = document.getElementById('warnbar');
       const wt = document.getElementById('warnbarText');
       if(w && wt){
-        wt.textContent = '⚠ Something went wrong (' + (e.message||'unknown error') + '). Some features may not work — reloading the page usually fixes this.';
+        wt.textContent = '⚠ Something went wrong (' + (message||'unknown error') + '). Some features may not work — reloading the page usually fixes this.';
         w.style.display = 'flex';
       }
     }catch(_){}
+  }
+  window.addEventListener('error', (e)=>{
+    console.error('Unhandled error:', e.error || e.message);
+    showUnhandledErrorBanner(e.message);
+  });
+  // This whole file's top-level code now runs inside one big async function
+  // (see the IIFE below — needed so the IndexedDB reads that replaced
+  // synchronous localStorage reads can be awaited before anything that
+  // depends on them runs). That has a real consequence for error handling:
+  // an uncaught throw anywhere in top-level code — not just inside an
+  // explicit async helper — now rejects that async function's own promise
+  // instead of surfacing as a plain synchronous exception, so it fires
+  // 'unhandledrejection', not 'error'. Without this listener, any such
+  // error would silently vanish instead of showing the banner above.
+  window.addEventListener('unhandledrejection', (e)=>{
+    const err = e.reason;
+    console.error('Unhandled promise rejection:', err);
+    showUnhandledErrorBanner(err && err.message ? err.message : String(err));
   });
 
   // ---------- storage ----------
+  // Actual map/location DATA — every road/POI ever seen, pins, blocked
+  // roads, the official directory, an in-progress GPS recording — lives in
+  // IndexedDB, not localStorage. localStorage's quota (5-10MB, fixed
+  // regardless of how much disk is actually free) is shared by EVERY page
+  // at this same origin, not just this app, and a wide-ranging user's cache
+  // genuinely grows past what fits there (a real report: 60,000+ cached
+  // lines) — every byte spent here was a byte unavailable to anything else
+  // running at this origin. IndexedDB's usage is accounted separately from
+  // localStorage in every major browser and scales with actual free disk
+  // space rather than a small fixed cap, and — a bonus, not the reason for
+  // the move — stores plain objects/arrays/Sets directly via structured
+  // clone, no JSON stringify/parse round-trip needed.
+  //
+  // Small, rarely-written settings (tile cache URL, Strava credentials, UI
+  // toggles) are NOT part of this move and stay in localStorage — synchronous
+  // access is simpler for those, and their combined size is negligible
+  // (kilobytes, not the megabytes the data above can reach).
+  const IDB_NAME = "routeguard-db";
+  const IDB_VERSION = 1;
+  const IDB_STORE = "data";
+  let idbPromise = null;
+  function openIdb(){
+    if(idbPromise) return idbPromise;
+    idbPromise = new Promise((resolve, reject)=>{
+      if(!window.indexedDB){ reject(new Error('IndexedDB not available in this browser')); return; }
+      const req = indexedDB.open(IDB_NAME, IDB_VERSION);
+      req.onupgradeneeded = ()=>{ req.result.createObjectStore(IDB_STORE); };
+      req.onsuccess = ()=>resolve(req.result);
+      req.onerror = ()=>reject(req.error);
+    });
+    return idbPromise;
+  }
+  function idbGet(key){
+    return openIdb().then(db=>new Promise((resolve, reject)=>{
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).get(key);
+      req.onsuccess = ()=>resolve(req.result);
+      req.onerror = ()=>reject(req.error);
+    }));
+  }
+  function idbSet(key, value){
+    return openIdb().then(db=>new Promise((resolve, reject)=>{
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).put(value, key);
+      tx.oncomplete = ()=>resolve(true);
+      tx.onerror = ()=>reject(tx.error);
+      tx.onabort = ()=>reject(tx.error || new Error('IndexedDB transaction aborted'));
+    }));
+  }
+  function idbDelete(key){
+    return openIdb().then(db=>new Promise((resolve, reject)=>{
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).delete(key);
+      tx.oncomplete = ()=>resolve(true);
+      tx.onerror = ()=>reject(tx.error);
+    }));
+  }
+  // One-time move of anything still sitting in localStorage under the old
+  // keys into IndexedDB, then removed from localStorage so the space is
+  // actually freed. Idempotent and cheap to re-check on every load: once a
+  // key's localStorage copy is gone, this has nothing left to do for it.
+  async function migrateDataFromLocalStorage(){
+    for(const key of DATA_KEYS){
+      let raw;
+      try{ raw = localStorage.getItem(key); }catch(e){ continue; }
+      if(raw == null) continue;
+      try{
+        const parsed = JSON.parse(raw);
+        const value = key === LS_LOADED_CELLS ? new Set(Array.isArray(parsed) ? parsed : []) : parsed;
+        await idbSet(key, value);
+        localStorage.removeItem(key);
+      }catch(err){
+        console.error(`Could not migrate ${key} from localStorage to IndexedDB:`, err);
+      }
+    }
+  }
+
   const LS_PINS = "rg_pins";
   const LS_LINE_CACHE = "rg_line_cache"; // every line geometry ever discovered, regardless of marking
   const LS_LINE_NAMES = "rg_line_names"; // edge key -> OSM street name, for the tap-for-name popup
@@ -527,40 +621,48 @@
   const LS_CELL_RECENCY = "rg_cell_recency"; // grid cell -> last-used timestamp, for LRU eviction when storage fills up
   const LS_DEBUG_MSGS = "rg_debug_msgs"; // whether routine/diagnostic messages (cache eviction, etc.) are shown
   const LS_BLOCKED_LINES = "rg_blocked_lines"; // lineCache key -> true, roads manually marked "never route through"
+  const LS_OFFICIAL_CACHE = "rg_official_cache"; // county-wide official childcare/school directory, see its own section below
+  const LS_ACTIVE_RECORDING = "rg_active_recording"; // in-progress GPX capture, re-saved on every GPS fix — see the recording section below
+  // every key migrateDataFromLocalStorage moves out of localStorage — kept
+  // as one list so that function and any future data key added stay in sync.
+  // LS_LOADED_CELLS holds a Set, not a plain JSON-parseable value —
+  // migrateDataFromLocalStorage special-cases it by key (see there).
+  const DATA_KEYS = [LS_PINS, LS_LINE_CACHE, LS_LINE_NAMES, LS_POI_CACHE, LS_LOADED_CELLS, LS_CELL_RECENCY, LS_BLOCKED_LINES, LS_OFFICIAL_CACHE, LS_ACTIVE_RECORDING];
 
-  function loadPins(){ try{return JSON.parse(localStorage.getItem(LS_PINS))||[];}catch(e){return [];} }
-  function loadLineCache(){ try{return JSON.parse(localStorage.getItem(LS_LINE_CACHE))||{};}catch(e){return {};} }
-  function loadLineNames(){ try{return JSON.parse(localStorage.getItem(LS_LINE_NAMES))||{};}catch(e){return {};} }
-  function loadPoiCache(){ try{return JSON.parse(localStorage.getItem(LS_POI_CACHE))||{};}catch(e){return {};} }
-  function loadLoadedCells(){ try{return new Set(JSON.parse(localStorage.getItem(LS_LOADED_CELLS))||[]);}catch(e){return new Set();} }
-  function loadCellRecency(){ try{return JSON.parse(localStorage.getItem(LS_CELL_RECENCY))||{};}catch(e){return {};} }
+  async function loadPins(){ try{ return (await idbGet(LS_PINS)) || []; }catch(e){ return []; } }
+  async function loadLineCache(){ try{ return (await idbGet(LS_LINE_CACHE)) || {}; }catch(e){ return {}; } }
+  async function loadLineNames(){ try{ return (await idbGet(LS_LINE_NAMES)) || {}; }catch(e){ return {}; } }
+  async function loadPoiCache(){ try{ return (await idbGet(LS_POI_CACHE)) || {}; }catch(e){ return {}; } }
+  async function loadLoadedCells(){ try{ const v = await idbGet(LS_LOADED_CELLS); return v instanceof Set ? v : new Set(); }catch(e){ return new Set(); } }
+  async function loadCellRecency(){ try{ return (await idbGet(LS_CELL_RECENCY)) || {}; }catch(e){ return {}; } }
   function loadDebugMsgsEnabled(){ try{return localStorage.getItem(LS_DEBUG_MSGS) === '1';}catch(e){return false;} }
-  function loadBlockedLines(){ try{return JSON.parse(localStorage.getItem(LS_BLOCKED_LINES))||{};}catch(e){return {};} }
+  async function loadBlockedLines(){ try{ return (await idbGet(LS_BLOCKED_LINES)) || {}; }catch(e){ return {}; } }
 
   // marked-line coloring (safe/avoid) is gone — pins are now the only way to
   // mark ground to avoid — so the old per-line marking store is dead weight;
   // clean it up rather than leaving an orphaned key behind
   try{ localStorage.removeItem('rg_segments'); }catch(e){}
 
+
   // lineCache/lineNames/poiCache (every road/name/POI ever auto-detected,
   // kept forever) are by far the biggest thing this app stores, and are
   // always safely re-fetchable — so if a write of safety-critical data
-  // (pins) hits the shared localStorage quota, free space by clearing THOSE
+  // (pins) hits the shared IndexedDB quota, free space by clearing THOSE
   // first, never the other way around, then retry once. This is the
   // nuclear option (wipes everything) — used only for the rare case of a
   // tiny critical write (pins) failing; the much more common case, the
   // bulk caches themselves growing too big, is handled by
   // evictLeastRecentlyUsedCells instead (partial, LRU-based, see below).
-  function pruneBulkCachesForSpace(){
+  async function pruneBulkCachesForSpace(){
     lineCache = {};
     lineNames = {};
     poiCache = {};
     cellRecency = {};
-    try{ localStorage.removeItem(LS_LINE_CACHE); }catch(e){}
-    try{ localStorage.removeItem(LS_LINE_NAMES); }catch(e){}
-    try{ localStorage.removeItem(LS_POI_CACHE); }catch(e){}
-    try{ localStorage.removeItem(LS_CELL_RECENCY); }catch(e){}
-    dropOfficialCacheForSpace();
+    try{ await idbDelete(LS_LINE_CACHE); }catch(e){}
+    try{ await idbDelete(LS_LINE_NAMES); }catch(e){}
+    try{ await idbDelete(LS_POI_CACHE); }catch(e){}
+    try{ await idbDelete(LS_CELL_RECENCY); }catch(e){}
+    await dropOfficialCacheForSpace();
   }
   // Routine/diagnostic messages (cache eviction happening, etc.) — off by
   // default so a wide-ranging user whose local cache fills up and
@@ -575,12 +677,15 @@
     // itself is gated.
     if(debugMsgsEnabled) showWarn(msg, ms); else appendDebugLog(msg);
   }
+  // IndexedDB's own QuotaExceededError is the same DOMException name/code
+  // localStorage used to throw, so this check (and the retry-after-pruning
+  // strategy below) carries over unchanged from the old localStorage version.
   function isQuotaExceeded(err){
     return !!err && (err.name === 'QuotaExceededError' || err.code === 22 || err.code === 1014);
   }
-  function safeLocalStorageSet(key, valueStr, isCritical){
+  async function safeIdbSet(key, value, isCritical){
     try{
-      localStorage.setItem(key, valueStr);
+      await idbSet(key, value);
       return true;
     }catch(err){
       if(!isQuotaExceeded(err)){ console.error(`Could not save ${key}:`, err); return false; }
@@ -591,9 +696,9 @@
         return false;
       }
       console.error(`Could not save ${key} — storage full. Clearing cached auto-detected map data to make room and retrying.`);
-      pruneBulkCachesForSpace();
+      await pruneBulkCachesForSpace();
       try{
-        localStorage.setItem(key, valueStr);
+        await idbSet(key, value);
         showWarn('⚠ Storage was full — cleared cached auto-detected lines/locations (they reload automatically as you revisit areas) to make room for your change.', 6000);
         return true;
       }catch(err2){
@@ -602,13 +707,13 @@
       }
     }
   }
-  function savePins(p){ return safeLocalStorageSet(LS_PINS, JSON.stringify(p), true); }
-  function saveBlockedLines(){ return safeLocalStorageSet(LS_BLOCKED_LINES, JSON.stringify(blockedLines), true); }
-  function saveLineCache(c){ return safeLocalStorageSet(LS_LINE_CACHE, JSON.stringify(c), false); }
-  function saveLineNames(n){ return safeLocalStorageSet(LS_LINE_NAMES, JSON.stringify(n), false); }
-  function savePoiCache(c){ return safeLocalStorageSet(LS_POI_CACHE, JSON.stringify(c), false); }
-  function saveLoadedCells(s){ return safeLocalStorageSet(LS_LOADED_CELLS, JSON.stringify([...s]), false); }
-  function saveCellRecency(r){ return safeLocalStorageSet(LS_CELL_RECENCY, JSON.stringify(r), false); }
+  function savePins(p){ return safeIdbSet(LS_PINS, p, true); }
+  function saveBlockedLines(){ return safeIdbSet(LS_BLOCKED_LINES, blockedLines, true); }
+  function saveLineCache(c){ return safeIdbSet(LS_LINE_CACHE, c, false); }
+  function saveLineNames(n){ return safeIdbSet(LS_LINE_NAMES, n, false); }
+  function savePoiCache(c){ return safeIdbSet(LS_POI_CACHE, c, false); }
+  function saveLoadedCells(s){ return safeIdbSet(LS_LOADED_CELLS, s, false); }
+  function saveCellRecency(r){ return safeIdbSet(LS_CELL_RECENCY, r, false); }
 
   // debounces the (expensive, growing) lineCache/lineNames/poiCache save so a
   // burst of many calls in quick succession — dozens of cells loading during
@@ -621,13 +726,13 @@
   // "already checked" for an area whose actual road/location data never
   // made it to disk — a false all-clear for a safety-critical cache.
   //
-  // Local storage (5-10MB, shared with everything else this origin ever
-  // stores) is nowhere near big enough to hold a permanent record of
+  // Even with IndexedDB's much larger quota (see the storage section up
+  // top), it's not a good use of it to hold a permanent record of
   // everywhere a wide-ranging user (a 50-mile running radius, further still
   // by car) has ever checked — nor does it need to: the tile-cache worker
   // already keeps its own durable copy of everything (KV storage, no
   // comparable size pressure, ~60-day staleness before it bothers Overpass
-  // again), so local storage only needs to behave like a fast cache of
+  // again), so on-device storage only needs to behave like a fast cache of
   // recently-relevant areas, not the permanent record. If a save hits the
   // quota, evict the least-recently-used cached areas (see
   // evictLeastRecentlyUsedCells) and retry — revisiting an evicted area
@@ -645,19 +750,28 @@
   // plateauing at a number picked for a much smaller one. Bounded by a
   // generous attempt count, not a fixed cell count.
   let saveCachesTimer = null;
-  function flushSaveCaches(){
+  // saveLineCache/saveLineNames/savePoiCache each open their own IndexedDB
+  // transaction — running the three in parallel (Promise.all) rather than
+  // sequentially is what actually matters now that a "save" isn't one
+  // synchronous localStorage.setItem call any more; awaiting each one in
+  // turn would pay round-trip latency three times over for no benefit,
+  // since none of the three depends on another's result.
+  async function saveCoreCaches(){
+    const [a, b, c] = await Promise.all([saveLineCache(lineCache), saveLineNames(lineNames), savePoiCache(poiCache)]);
+    return a && b && c;
+  }
+  async function flushSaveCaches(){
     if(saveCachesTimer){ clearTimeout(saveCachesTimer); saveCachesTimer = null; }
-    // Diagnostic only. Each attempt below re-serializes the entire
-    // lineCache/lineNames/poiCache (JSON.stringify has to walk the whole
-    // object every time — there's no incremental/partial serialization),
-    // and a failing save can retry that up to ~21 times across the eviction
-    // escalation loop. For a large cache that's a lot of full-object
-    // stringify work, entirely unmeasured until now — the debug log showed
-    // a ~12s gap right after route drawing finished with nothing else to
-    // explain it, and this is the only unmeasured step in between.
+    // Diagnostic only. Each attempt below hands the entire lineCache/
+    // lineNames/poiCache to IndexedDB's structured-clone (no JSON stringify
+    // needed any more, but still a walk of the whole object), and a failing
+    // save can retry that up to ~21 times across the eviction escalation
+    // loop. For a large cache that's real work, worth keeping visible — the
+    // debug log once showed a ~12s gap right after route drawing finished
+    // with nothing else to explain it, traced to exactly this step.
     const flushStartMs = performance.now();
     let saveAttempts = 0;
-    let dataOk = saveLineCache(lineCache) && saveLineNames(lineNames) && savePoiCache(poiCache);
+    let dataOk = await saveCoreCaches();
     saveAttempts++;
     // the official state-directory cache (see "official WA state directory"
     // below) is a single county-wide blob that lives outside the per-cell
@@ -669,9 +783,9 @@
     // eviction attempts on data that's actually expensive to rebuild.
     let droppedOfficialCache = false;
     if(!dataOk){
-      dropOfficialCacheForSpace();
+      await dropOfficialCacheForSpace();
       droppedOfficialCache = true;
-      dataOk = saveLineCache(lineCache) && saveLineNames(lineNames) && savePoiCache(poiCache);
+      dataOk = await saveCoreCaches();
       saveAttempts++;
     }
     let evictedTotal = 0;
@@ -680,7 +794,7 @@
       const evicted = evictLeastRecentlyUsedCells(batchSize);
       if(evicted === 0) break; // nothing left worth evicting — retrying won't help
       evictedTotal += evicted;
-      dataOk = saveLineCache(lineCache) && saveLineNames(lineNames) && savePoiCache(poiCache);
+      dataOk = await saveCoreCaches();
       saveAttempts++;
       batchSize *= 2;
     }
@@ -688,44 +802,40 @@
     // succeed even when the much bigger lineCache/poiCache write above just
     // failed — only actually attempt (and let them succeed at) persisting
     // once the data they describe is confirmed saved too
-    const cellsOk = dataOk && saveLoadedCells(loadedCells);
-    const recencyOk = dataOk && saveCellRecency(cellRecency);
+    const cellsOk = dataOk && await saveLoadedCells(loadedCells);
+    const recencyOk = dataOk && await saveCellRecency(cellRecency);
     const flushElapsedMs = Math.round(performance.now() - flushStartMs);
     if(flushElapsedMs > 500){
       showDebugMsg(`Slow cache save: ${flushElapsedMs}ms over ${saveAttempts} save attempt${saveAttempts===1?'':'s'} (${Object.keys(lineCache).length} lines, ${Object.keys(poiCache).length} locations, ${evictedTotal} cells evicted)`, 6000);
     }
     if(droppedOfficialCache && dataOk){
-      showDebugMsg('Freed local storage: dropped the cached official childcare/school directory (re-fetches automatically, next time you open Settings or within a month).', 5000);
+      showDebugMsg('Freed on-device storage: dropped the cached official childcare/school directory (re-fetches automatically, next time you open Settings or within a month).', 5000);
     }
     if(evictedTotal > 0 && dataOk){
-      showDebugMsg(`Freed local storage: dropped ${evictedTotal} least-recently-used cached area${evictedTotal===1?'':'s'} (still available from the worker cache if you revisit).`, 5000);
+      showDebugMsg(`Freed on-device storage: dropped ${evictedTotal} least-recently-used cached area${evictedTotal===1?'':'s'} (still available from the worker cache if you revisit).`, 5000);
     }
     if(!dataOk || !cellsOk || !recencyOk){
       // By this point every evictable cell (everything except the cells the
       // currently-drawn route itself occupies, which eviction always
       // protects — see evictLeastRecentlyUsedCells) has already been tried.
       // If it still doesn't fit, that means the route/area just checked is
-      // itself bigger than this device's local storage — not that anything
-      // is actually at risk: the worker's KV cache already has a permanent
-      // copy of every road/location involved (that's true regardless of
-      // whether the local mirror below succeeds), and everything currently
-      // on screen is already drawn from in-memory data, unaffected by
-      // whether this save succeeds. The only real consequence is that a
-      // refresh will re-fetch the un-mirrored areas from the worker (fast)
-      // instead of loading them instantly from this device — not a re-check
-      // from scratch, and nothing is lost.
+      // itself bigger than this device's remaining IndexedDB quota — not
+      // that anything is actually at risk: the worker's KV cache already
+      // has a permanent copy of every road/location involved (that's true
+      // regardless of whether the local mirror below succeeds), and
+      // everything currently on screen is already drawn from in-memory
+      // data, unaffected by whether this save succeeds. The only real
+      // consequence is that a refresh will re-fetch the un-mirrored areas
+      // from the worker (fast) instead of loading them instantly from this
+      // device — not a re-check from scratch, and nothing is lost.
       //
-      // Originally a real (always-shown) warning — downgraded to the same
-      // debug tier as the eviction messages just above once real usage
-      // showed it firing on essentially every pan/zoom while scouting a
-      // wide area with a full local cache (expected: a 30-mile scouting
-      // session generates new cells about as fast as old ones can be
-      // evicted to make room). That's routine, harmless housekeeping for a
-      // wide-ranging user, not something worth interrupting every couple
-      // of gestures to reassure them about — exactly the "normal/expected,
-      // not a genuine problem" category the debug-messages toggle exists
-      // for.
-      showDebugMsg('Local storage on this device couldn\'t fully keep a local copy of everything just checked — this route or area was larger than what fits. Nothing is lost: it\'s all safely stored on RouteGuard\'s permanent server cache. A refresh will just re-fetch a few spots from there (fast) instead of loading them instantly.', 8000);
+      // Should be rare now that this is IndexedDB rather than localStorage
+      // (a real quota in the hundreds of MB to GB range, not a fixed 5-10MB
+      // cap) — kept at the same debug tier as the eviction messages above
+      // regardless, since it's still the same "routine housekeeping, not a
+      // genuine problem" category if it ever does happen for a truly huge
+      // cache.
+      showDebugMsg('On-device storage couldn\'t fully keep a local copy of everything just checked — this route or area was larger than what fits. Nothing is lost: it\'s all safely stored on RouteGuard\'s permanent server cache. A refresh will just re-fetch a few spots from there (fast) instead of loading them instantly.', 8000);
     }
   }
   // Used to log unconditionally on every single call (once per cell
@@ -745,7 +855,14 @@
   }
   // flush immediately if the page is being backgrounded/closed mid-burst,
   // so at most ~1s of loaded-but-not-yet-persisted data is ever at risk —
-  // acceptable given this is re-fetchable map data, not user-entered data
+  // acceptable given this is re-fetchable map data, not user-entered data.
+  // Unlike the old localStorage.setItem this now ultimately calls, an
+  // IndexedDB write is asynchronous — pagehide firing doesn't guarantee
+  // this actually finishes before the page is gone, only that it started.
+  // Browsers do give a page a brief window to complete in-flight IndexedDB
+  // work on pagehide/unload, and losing the last ~1s of re-fetchable cache
+  // data on a hard close is the same acceptable-risk tradeoff as before,
+  // just no longer backed by a synchronous guarantee.
   window.addEventListener('pagehide', flushSaveCaches);
   // Diagnostic only (the appendDebugLog call). A screen lock, switching
   // apps, or the browser just deciding to background the tab all fire this
@@ -774,23 +891,48 @@
   }
   function saveTileCacheCfg(c){ localStorage.setItem(LS_TILE_CACHE_CFG, JSON.stringify(c)); }
 
-  let pins = loadPins();
-  let lineCache = loadLineCache(); // key -> latlngs — every line ever seen, kept until a fresh fetch of that exact area proves it's gone
-  let lineNames = loadLineNames(); // key -> OSM street name (only set when the way had one)
-  let poiCache = loadPoiCache();   // OSM type+id -> {lat,lng,category,label} — every auto-detected location ever seen
-  let loadedCells = loadLoadedCells(); // set of "lat,lng" cell-center keys fully checked against OSM data — persists like the caches above
-  let cellRecency = loadCellRecency(); // cell key -> last-used timestamp (ms), for LRU eviction when local storage fills up
-  // lineCache key -> true, for a road manually marked "never route through" —
-  // authored data like pins, not a re-fetchable bulk cache, so it's saved as
-  // critical (see safeLocalStorageSet) and never wiped by pruneBulkCachesForSpace
-  let blockedLines = loadBlockedLines();
+  // Every one of these used to be a synchronous localStorage read
+  // (`let pins = loadPins();` etc, right at top-level) — now that they're
+  // IndexedDB reads, they're awaited here instead, once, before any of the
+  // rest of this file's top-level setup (map creation, event wiring, the
+  // initial cached-data render) runs. Everything below this block still
+  // executes synchronously relative to itself, exactly as before — only
+  // this one point pauses, briefly (a handful of local IndexedDB reads),
+  // before it does.
+  await migrateDataFromLocalStorage();
+  let [pins, lineCache, lineNames, poiCache, loadedCells, cellRecency, blockedLines] = await Promise.all([
+    loadPins(),
+    loadLineCache(), // key -> latlngs — every line ever seen, kept until a fresh fetch of that exact area proves it's gone
+    loadLineNames(), // key -> OSM street name (only set when the way had one)
+    loadPoiCache(),  // OSM type+id -> {lat,lng,category,label} — every auto-detected location ever seen
+    loadLoadedCells(), // set of "lat,lng" cell-center keys fully checked against OSM data — persists like the caches above
+    loadCellRecency(), // cell key -> last-used timestamp (ms), for LRU eviction when on-device storage fills up
+    // lineCache key -> true, for a road manually marked "never route
+    // through" — authored data like pins, not a re-fetchable bulk cache, so
+    // it's saved as critical (see safeIdbSet) and never wiped by
+    // pruneBulkCachesForSpace
+    loadBlockedLines(),
+  ]);
 
-  // storage usage is per-origin (this app's own site data), not shared with
-  // other websites or apps on the phone — each site gets its own separate
-  // quota, typically 5-10MB depending on browser
-  function updateStorageUsageDisplay(){
+  // Reports IndexedDB usage (where all the actual map/location data lives
+  // now — see the storage section up top) via the StorageManager API
+  // rather than hand-summing key lengths the way the old localStorage-only
+  // version had to; falls back to that old byte-count for a browser without
+  // navigator.storage.estimate() (Safari added it late), where it's now
+  // reporting just the small settings still left in localStorage.
+  async function updateStorageUsageDisplay(){
     const el = document.getElementById('storageUsage');
     if(!el) return;
+    try{
+      if(navigator.storage && navigator.storage.estimate){
+        const { usage, quota } = await navigator.storage.estimate();
+        const usedMb = (usage||0)/1024/1024;
+        const usedLabel = usedMb < 1 ? `${((usage||0)/1024).toFixed(1)} KB` : `${usedMb.toFixed(2)} MB`;
+        const quotaLabel = quota ? `, ${(quota/1024/1024/1024).toFixed(1)} GB available` : '';
+        el.textContent = `Storage used: ${usedLabel}${quotaLabel} — separate from other sites/apps, not the old 5-10MB localStorage limit`;
+        return;
+      }
+    }catch(err){ /* fall through to the localStorage-only estimate below */ }
     try{
       let bytes = 0;
       for(let i=0;i<localStorage.length;i++){
@@ -798,8 +940,7 @@
         bytes += (k.length + (localStorage.getItem(k)||'').length) * 2; // UTF-16, ~2 bytes/char
       }
       const kb = bytes/1024;
-      const label = kb < 1024 ? `${kb.toFixed(1)} KB` : `${(kb/1024).toFixed(2)} MB`;
-      el.textContent = `Storage used: ${label} (typical limit is 5–10 MB, only for this site)`;
+      el.textContent = `Local settings: ${kb.toFixed(1)} KB (bulk map data is stored separately, in IndexedDB)`;
     }catch(err){
       el.textContent = 'Storage: could not calculate';
     }
@@ -1937,17 +2078,16 @@
   setInterval(()=> checkTileCacheHealth(false), 10 * 60 * 1000); // every 10 minutes
 
   // ---------- official WA state directory (centers, school-age, outdoor programs) ----------
-  const LS_OFFICIAL_CACHE = "rg_official_cache";
   const OFFICIAL_REFRESH_MS = 30 * 24 * 60 * 60 * 1000; // ~monthly, as requested
-  function loadOfficialCache(){ try{return JSON.parse(localStorage.getItem(LS_OFFICIAL_CACHE))||null;}catch(e){return null;} }
-  function saveOfficialCache(c){ return safeLocalStorageSet(LS_OFFICIAL_CACHE, JSON.stringify(c), false); }
+  async function loadOfficialCache(){ try{ return (await idbGet(LS_OFFICIAL_CACHE)) || null; }catch(e){ return null; } }
+  function saveOfficialCache(c){ return safeIdbSet(LS_OFFICIAL_CACHE, c, false); }
   // called from flushSaveCaches (freeing space for the per-cell caches) and
   // pruneBulkCachesForSpace (the nuclear option for a critical write) — see
   // both for why this cache specifically goes first. Safe to drop any time:
   // loadOfficialChildcareData() re-fetches it from the worker whenever it's
   // missing, at most a ~20s fetch, not a rebuild of anything irreplaceable.
-  function dropOfficialCacheForSpace(){
-    try{ localStorage.removeItem(LS_OFFICIAL_CACHE); }catch(e){}
+  async function dropOfficialCacheForSpace(){
+    try{ await idbDelete(LS_OFFICIAL_CACHE); }catch(e){}
     officialRecordsCache = [];
     renderOfficialRecords(officialRecordsCache);
   }
@@ -1991,7 +2131,7 @@
   async function loadOfficialChildcareData(force){
     const cfg = loadTileCacheCfg();
     if(!cfg.url){ officialDataStatusEl.textContent = 'Needs a tile cache worker configured above'; return; }
-    const cached = loadOfficialCache();
+    const cached = await loadOfficialCache();
     const now = Date.now();
     if(!force && cached && (now - cached.fetchedAt) < OFFICIAL_REFRESH_MS){
       renderOfficialRecords(cached.records);
@@ -2020,8 +2160,8 @@
     }
   }
 
-  officialDataToggle.addEventListener('change', ()=>{
-    const cached = loadOfficialCache();
+  officialDataToggle.addEventListener('change', async ()=>{
+    const cached = await loadOfficialCache();
     if(cached) renderOfficialRecords(cached.records);
   });
   document.getElementById('btnRefreshOfficial').onclick = ()=> loadOfficialChildcareData(true);
@@ -4447,13 +4587,20 @@
   };
 
   // --- recording (GPX capture), independent of mode and of the location toggle above ---
-  const LS_ACTIVE_RECORDING = "rg_active_recording";
+  // Re-saved on every single GPS fix while recording (see the
+  // watchPosition callback below) — trackPoints only grows for as long as
+  // a recording runs, so this was rewriting an ever-larger blob to
+  // localStorage every few seconds for the whole length of a run. Not
+  // awaited at either call site below (fire-and-forget, same as the old
+  // synchronous call was effectively "fire and forget" from the caller's
+  // perspective) — nothing downstream needs to know when this particular
+  // write actually lands.
   function saveActiveRecording(){
-    try{ localStorage.setItem(LS_ACTIVE_RECORDING, JSON.stringify({trackPoints, startedAt: recordingStartedAt})); }
-    catch(err){ console.error('Could not save in-progress recording:', err); }
+    idbSet(LS_ACTIVE_RECORDING, {trackPoints, startedAt: recordingStartedAt})
+      .catch(err=>console.error('Could not save in-progress recording:', err));
   }
   function clearActiveRecording(){
-    try{ localStorage.removeItem(LS_ACTIVE_RECORDING); }catch(err){}
+    idbDelete(LS_ACTIVE_RECORDING).catch(()=>{});
   }
   let recordingStartedAt = null;
 
@@ -4860,12 +5007,13 @@ ${pts}
   setInterval(scheduleStorageUsageUpdate, 60000);
 
   // if a recording was in progress when the page was reloaded (crash, manual
-  // refresh, new version), resume it instead of silently losing the run
-  (function restoreActiveRecording(){
+  // refresh, new version), resume it instead of silently losing the run.
+  // Not awaited — this can finish a beat after the rest of init, same as
+  // it could before (it was already the last thing in the file) — nothing
+  // else here depends on it having resolved yet.
+  (async function restoreActiveRecording(){
     try{
-      const raw = localStorage.getItem(LS_ACTIVE_RECORDING);
-      if(!raw) return;
-      const saved = JSON.parse(raw);
+      const saved = await idbGet(LS_ACTIVE_RECORDING);
       if(!saved || !Array.isArray(saved.trackPoints) || saved.trackPoints.length === 0) return;
       trackPoints = saved.trackPoints;
       recordingStartedAt = saved.startedAt || new Date().toISOString();
