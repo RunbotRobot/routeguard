@@ -140,6 +140,19 @@
     background:#fff;color:var(--ink);padding:7px 12px;border-radius:14px;
     font-size:12px;font-weight:600;box-shadow:0 2px 8px rgba(0,0,0,.15);
   }
+  /* stays visible (not auto-dismissed like #warnbar) for as long as you're
+     off the planned route, with the one interactive element that silences
+     the repeating spoken alert — see updateVoiceGuidance/btnAckOffRoute */
+  #offRouteBanner{
+    position:absolute;left:50%;top:52px;transform:translateX(-50%);z-index:1001;display:none;
+    background:#c1443c;color:#fff;padding:8px 10px 8px 14px;border-radius:20px;
+    font-size:12.5px;font-weight:600;box-shadow:0 3px 10px rgba(0,0,0,.25);
+    align-items:center;gap:10px;max-width:90%;
+  }
+  #btnAckOffRoute{
+    background:#fff;color:#c1443c;border:none;padding:5px 12px;border-radius:14px;
+    font-size:12px;font-weight:700;cursor:pointer;flex:none;
+  }
   #dataStatus .sw{width:8px;height:8px;border-radius:50%;flex-shrink:0;margin-top:3px;}
   #dataStatus #dataStatusText{
     white-space:normal;overflow-wrap:break-word;flex:1;min-width:0;
@@ -266,7 +279,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.97</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.98</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -275,6 +288,10 @@
     <div id="map"></div>
     <div id="dataStatus" class="st-loading"><span class="sw"></span><span id="dataStatusText">Not loaded yet</span></div>
     <div id="routeProgressBadge"></div>
+    <div id="offRouteBanner">
+      <span id="offRouteBannerText">⚠ Off route</span>
+      <button id="btnAckOffRoute">Acknowledge</button>
+    </div>
     <div id="hint"></div>
     <button id="btnCancelRoute" style="display:none;position:absolute;left:50%;top:52px;transform:translateX(-50%);z-index:1000;background:#c1443c;color:#fff;border:none;padding:6px 14px;border-radius:16px;font-size:12.5px;box-shadow:0 3px 10px rgba(0,0,0,.2);cursor:pointer;">Cancel route</button>
     <div id="routeLoadProgress" style="display:none;position:absolute;left:50%;top:52px;transform:translateX(-50%);z-index:1001;background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 14px;box-shadow:0 3px 10px rgba(0,0,0,.25);min-width:220px;text-align:center;">
@@ -354,6 +371,13 @@
           Off by default. Automatically snaps back to normal north-up the instant you touch the map for any reason (pan, tap a road, drop a pin, switch to Pin/Route mode) — tapping "Recenter" is what turns it back on, same as it already does for following your position. If pins, lines, or tapped road names ever look wrong, turn this off immediately; everything reverts to normal north-up and stays that way.
         </div>
         <div id="headingBadge" style="font-size:11.5px;color:var(--muted);margin-top:6px;display:none;">Facing —</div>
+        <div class="legend-row" style="justify-content:space-between;margin-top:10px;">
+          <span>Voice guidance</span>
+          <input type="checkbox" id="voiceGuidanceToggle" checked style="width:auto;">
+        </div>
+        <div style="font-size:11.5px;color:var(--muted);margin-top:4px;">
+          Spoken turn-by-turn directions and off-route alerts while following a planned route, using your device's own text-to-speech (nothing sent anywhere). Turn off to keep the visual route/distance tracking without the audio.
+        </div>
       </div>
 
       <div class="section">
@@ -2742,6 +2766,15 @@
   // or cancellation) in a finally block.
   let inFlightRouteSearchCellKeys = new Set();
   let liveRoutePoints = []; // ordered [lat,lng] points along the current planned route (+ any imported segment), for the remaining-distance/time badge while running it
+  // Turn-by-turn maneuvers for the current planned route — see
+  // buildRouteManeuvers/appendGeometricManeuvers (built alongside
+  // liveRoutePoints, in renderRoutePairs and the segment-import flow) and
+  // updateVoiceGuidance (consumes them on every GPS fix). Kept separate
+  // from liveRoutePoints itself since a maneuver needs more than a bare
+  // point — a distance-along-route, a turn direction, a street name, and
+  // whether it's already been spoken.
+  let routeManeuvers = [];
+  let nextManeuverIndex = 0; // index into routeManeuvers of the next not-yet-passed one
   const startEndLayer = L.layerGroup().addTo(map);
   // Full detail on the most recent planRoute call — start/end, how it
   // resolved, and which specific location(s) (if any) forced a fallback.
@@ -2882,6 +2915,150 @@
     }
     const cx = bx*t, cy = by*t;
     return { distMeters: Math.hypot(px-cx, py-cy), t };
+  }
+
+  // ---------- turn-by-turn maneuver generation (see updateVoiceGuidance) ----------
+  // Standard great-circle initial bearing, in degrees clockwise from north
+  // (0-360) — used to compare the direction of travel on either side of a
+  // junction, not for anything requiring geodesic precision, so the plain
+  // spherical formula (rather than an ellipsoidal one) is more than enough
+  // at these distances.
+  function bearingBetween(lat1, lng1, lat2, lng2){
+    const toRad = d => d * Math.PI / 180;
+    const y = Math.sin(toRad(lng2-lng1)) * Math.cos(toRad(lat2));
+    const x = Math.cos(toRad(lat1))*Math.sin(toRad(lat2)) - Math.sin(toRad(lat1))*Math.cos(toRad(lat2))*Math.cos(toRad(lng2-lng1));
+    return (Math.atan2(y, x) * 180/Math.PI + 360) % 360;
+  }
+  // signed turn angle from one bearing to another, -180..180 — positive is
+  // clockwise (a right turn), negative counterclockwise (a left turn)
+  function turnAngleDeg(bearingIn, bearingOut){
+    let d = bearingOut - bearingIn;
+    while(d > 180) d -= 360;
+    while(d < -180) d += 360;
+    return d;
+  }
+  // Below ~20° is normal road noise (a gentle curve, GPS/node jitter), not
+  // a real maneuver — filtered out entirely unless the street name changes
+  // (see buildRouteManeuvers), in which case it's announced as a plain
+  // "Continue onto X" rather than a turn.
+  const TURN_ANNOUNCE_THRESHOLD_DEG = 20;
+  function classifyTurn(angleDeg){
+    const a = Math.abs(angleDeg);
+    if(a < TURN_ANNOUNCE_THRESHOLD_DEG) return null;
+    const dir = angleDeg >= 0 ? 'right' : 'left';
+    if(a < 45) return `slight ${dir}`;
+    if(a < 150) return dir;
+    if(a < 170) return `sharp ${dir}`;
+    return 'u-turn';
+  }
+  // A single node-to-node OSM edge is often only a few meters — the raw
+  // bearing of just the last edge into (or first edge out of) a junction
+  // is noisy. Walks back (or forward) along the polyline until it's
+  // covered targetMeters (or run out of points, for a short leg), then
+  // takes the bearing across that whole stretch — smooths out exactly the
+  // kind of single-node wobble that would otherwise misfire as a "slight
+  // turn" on a straight road.
+  function bearingApproaching(points, targetMeters){
+    let dist = 0, idx = points.length - 1;
+    while(idx > 0 && dist < targetMeters){
+      dist += haversineMeters(points[idx-1][0], points[idx-1][1], points[idx][0], points[idx][1]);
+      idx--;
+    }
+    return bearingBetween(points[idx][0], points[idx][1], points[points.length-1][0], points[points.length-1][1]);
+  }
+  function bearingLeaving(points, targetMeters){
+    let dist = 0, idx = 0;
+    while(idx < points.length-1 && dist < targetMeters){
+      dist += haversineMeters(points[idx][0], points[idx][1], points[idx+1][0], points[idx+1][1]);
+      idx++;
+    }
+    return bearingBetween(points[0][0], points[0][1], points[idx][0], points[idx][1]);
+  }
+  const BEARING_SAMPLE_METERS = 15;
+
+  // Groups a route's individual OSM edges into "legs" (consecutive edges
+  // sharing the same street name — or all unnamed, grouped together too)
+  // and emits one maneuver at each real junction between legs: a plain
+  // "continue" when only the name changes with no real turn, a turn
+  // maneuver when the bearing changes past TURN_ANNOUNCE_THRESHOLD_DEG
+  // (regardless of whether the name also changed), plus a depart maneuver
+  // at the very start and an arrive maneuver at the very end. distanceFromStart
+  // on every maneuver is cumulative meters along the route from its first
+  // point — what updateVoiceGuidance compares against a live GPS fix's own
+  // distance-along-route (see updateRouteProgress) to decide when to speak.
+  function buildRouteManeuvers(pairs, keys){
+    if(!pairs.length) return [];
+    const legs = [];
+    pairs.forEach((pair, i)=>{
+      const name = lineNames[keys[i]] || null;
+      const last = legs[legs.length-1];
+      if(last && last.name === name) last.points.push(pair[1]);
+      else legs.push({ name, points: [pair[0], pair[1]] });
+    });
+    const maneuvers = [{
+      type: 'depart', streetName: legs[0].name, point: legs[0].points[0],
+      distanceFromStart: 0, announcedFar: true, announcedNear: false
+    }];
+    let cumMeters = 0;
+    for(let i=0;i<legs.length;i++){
+      const leg = legs[i];
+      for(let j=0;j<leg.points.length-1;j++){
+        cumMeters += haversineMeters(leg.points[j][0], leg.points[j][1], leg.points[j+1][0], leg.points[j+1][1]);
+      }
+      const next = legs[i+1];
+      if(!next) continue;
+      const junction = leg.points[leg.points.length-1];
+      const angle = turnAngleDeg(
+        bearingApproaching(leg.points, BEARING_SAMPLE_METERS),
+        bearingLeaving(next.points, BEARING_SAMPLE_METERS)
+      );
+      const turn = classifyTurn(angle);
+      if(turn || next.name !== leg.name){
+        maneuvers.push({
+          type: turn ? 'turn' : 'continue', direction: turn, streetName: next.name,
+          point: junction, distanceFromStart: cumMeters, announcedFar: false, announcedNear: false
+        });
+      }
+    }
+    const lastLeg = legs[legs.length-1];
+    maneuvers.push({
+      type: 'arrive', point: lastLeg.points[lastLeg.points.length-1],
+      distanceFromStart: cumMeters, announcedFar: false, announcedNear: false
+    });
+    return maneuvers;
+  }
+  // Same turn detection as buildRouteManeuvers, minus the street-name
+  // grouping — for an imported Strava segment's own raw GPX points (see
+  // the segment-import flow), which have geometry but no per-edge street
+  // name the way OSM-derived route edges do. distanceOffsetMeters carries
+  // the running total from wherever the approach route (built by
+  // buildRouteManeuvers) left off, so both halves share one continuous
+  // distanceFromStart scale for updateVoiceGuidance to walk through in order.
+  function appendGeometricManeuvers(points, distanceOffsetMeters){
+    if(points.length < 2) return;
+    let cumMeters = distanceOffsetMeters;
+    // i runs over interior points only (1..length-2) — a turn is evaluated
+    // AT points[i], so cumMeters must reflect distance-to-points[i] at
+    // that moment, not points[i+1]: each edge's length is added only after
+    // evaluating the turn at its start point, not before.
+    for(let i=1;i<points.length-1;i++){
+      cumMeters += haversineMeters(points[i-1][0], points[i-1][1], points[i][0], points[i][1]);
+      const angle = turnAngleDeg(
+        bearingApproaching(points.slice(0, i+1), BEARING_SAMPLE_METERS),
+        bearingLeaving(points.slice(i), BEARING_SAMPLE_METERS)
+      );
+      const turn = classifyTurn(angle);
+      if(turn){
+        routeManeuvers.push({
+          type: 'turn', direction: turn, streetName: null,
+          point: points[i], distanceFromStart: cumMeters, announcedFar: false, announcedNear: false
+        });
+      }
+    }
+    cumMeters += haversineMeters(points[points.length-2][0], points[points.length-2][1], points[points.length-1][0], points[points.length-1][1]);
+    const last = routeManeuvers[routeManeuvers.length-1];
+    if(last && last.type === 'arrive') last.distanceFromStart = cumMeters;
+    else routeManeuvers.push({ type:'arrive', point: points[points.length-1], distanceFromStart: cumMeters, announcedFar:false, announcedNear:false });
   }
   function distanceToLocationMeters(lat, lng, loc){
     if(!loc.geometry || loc.geometry.length < 2) return haversineMeters(lat, lng, loc.lat, loc.lng);
@@ -3846,6 +4023,11 @@
     liveRoutePoints = pairs.length ? [pairs[0][0], ...pairs.map(p=>p[1])] : [];
     updateRouteProgressVisibility();
     const newKeys = pairs.map(pair=>edgeKey(pair[0], pair[1]));
+    // turn-by-turn maneuvers for the freshly-planned route — see
+    // buildRouteManeuvers's own comment. A fresh plan always replaces
+    // whatever was being narrated before, same as liveRoutePoints above.
+    routeManeuvers = buildRouteManeuvers(pairs, newKeys);
+    resetVoiceGuidanceState();
     // set this before drawing so any concurrent applyOverpassResults call
     // (a background cell load finishing mid-view) already sees the new
     // route membership rather than a stale one — this part stays
@@ -4273,8 +4455,13 @@
   // Cheap enough to run on every GPS fix even for a long, dense route: a
   // few thousand basic point-to-segment checks is well under what a phone
   // struggles with, nothing like the graph-scale work route PLANNING does.
+  // Returns {bestDist, bestCumulativeMeters} (bestDist: how far off the
+  // route this fix is; bestCumulativeMeters: distance along the route from
+  // its start to the closest point) so updateVoiceGuidance can reuse the
+  // exact same closest-point projection this function already computes,
+  // rather than walking liveRoutePoints a second time on every GPS fix.
   function updateRouteProgress(lat, lng){
-    if(liveRoutePoints.length < 2){ routeProgressBadge.style.display = 'none'; return; }
+    if(liveRoutePoints.length < 2){ routeProgressBadge.style.display = 'none'; return null; }
     let bestDist = Infinity, bestCumulativeMeters = 0, runningMeters = 0;
     for(let i=0;i<liveRoutePoints.length-1;i++){
       const [alat,alng] = liveRoutePoints[i], [blat,blng] = liveRoutePoints[i+1];
@@ -4300,6 +4487,7 @@
     const etaLabel = eta.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
     routeProgressBadge.textContent = `${remainingMiles.toFixed(1)} mi to go · ~${formatRemainingTime(remainingHours)} · ETA ${etaLabel}`;
     routeProgressBadge.style.display = 'inline-block';
+    return { bestDist, bestCumulativeMeters };
   }
   // Called whenever the route itself changes (planned, replanned, cleared,
   // or a segment imported) — separate from updateRouteProgress, which
@@ -4309,6 +4497,113 @@
   function updateRouteProgressVisibility(){
     if(liveRoutePoints.length < 2) routeProgressBadge.style.display = 'none';
     else if(lastKnownLatLng) updateRouteProgress(lastKnownLatLng[0], lastKnownLatLng[1]);
+  }
+
+  // ---------- turn-by-turn voice guidance & off-route alerts ----------
+  const LS_VOICE_GUIDANCE = "rg_voice_guidance";
+  let voiceGuidanceEnabled = (function(){ try{ return localStorage.getItem(LS_VOICE_GUIDANCE) !== '0'; }catch(e){ return true; } })(); // on by default
+  const voiceGuidanceToggle = document.getElementById('voiceGuidanceToggle');
+  voiceGuidanceToggle.checked = voiceGuidanceEnabled;
+  voiceGuidanceToggle.onchange = ()=>{
+    voiceGuidanceEnabled = voiceGuidanceToggle.checked;
+    try{ localStorage.setItem(LS_VOICE_GUIDANCE, voiceGuidanceEnabled ? '1' : '0'); }catch(e){}
+    if(!voiceGuidanceEnabled && 'speechSynthesis' in window) speechSynthesis.cancel();
+  };
+  function speak(text){
+    if(!voiceGuidanceEnabled || !text) return;
+    if(!('speechSynthesis' in window)) return;
+    try{
+      // Not explicitly cancelling any in-progress utterance first — the
+      // browser already queues consecutive speak() calls rather than
+      // talking over itself, and cancelling on every call would cut off a
+      // longer instruction the instant a short one (like an off-route
+      // re-alert) came in right behind it.
+      speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+    }catch(err){ console.error('Speech synthesis failed:', err); }
+  }
+  const METERS_PER_FOOT = 0.3048;
+  const FAR_ANNOUNCE_METERS = 500 * METERS_PER_FOOT; // heads-up, well before the turn
+  const NEAR_ANNOUNCE_METERS = 30 * METERS_PER_FOOT; // "now"
+  const OFF_ROUTE_METERS = 130 * METERS_PER_FOOT; // generous enough for GPS drift/sidewalk-vs-road offset
+  const OFF_ROUTE_REALERT_MS = 10000;
+  const TURN_PHRASE = {
+    left: 'Turn left', right: 'Turn right',
+    'slight left': 'Slight left', 'slight right': 'Slight right',
+    'sharp left': 'Sharp left', 'sharp right': 'Sharp right',
+    'u-turn': 'Make a U-turn'
+  };
+  function maneuverFarText(m){
+    if(m.type === 'turn') return `In 500 feet, ${TURN_PHRASE[m.direction].toLowerCase()}${m.streetName ? ' onto '+m.streetName : ''}.`;
+    return null; // depart/continue/arrive have nothing worth a heads-up this far out
+  }
+  function maneuverNearText(m){
+    if(m.type === 'depart') return `Starting route${m.streetName ? ' on '+m.streetName : ''}.`;
+    if(m.type === 'continue') return `Continue${m.streetName ? ' onto '+m.streetName : ''}.`;
+    if(m.type === 'turn') return `${TURN_PHRASE[m.direction]}${m.streetName ? ' onto '+m.streetName : ''}.`;
+    if(m.type === 'arrive') return 'You have arrived at your destination.';
+    return null;
+  }
+  let offRoute = false, offRouteAcknowledged = false, lastOffRouteAlertAt = 0;
+  const offRouteBanner = document.getElementById('offRouteBanner');
+  function setOffRouteBannerVisible(visible){
+    offRouteBanner.style.display = visible ? 'flex' : 'none';
+  }
+  document.getElementById('btnAckOffRoute').onclick = ()=>{
+    offRouteAcknowledged = true;
+    setOffRouteBannerVisible(false);
+  };
+  // Called right after updateRouteProgress on every GPS fix, with the same
+  // {bestDist, bestCumulativeMeters} it just computed. Off-route alerting
+  // and turn narration are mutually exclusive per fix — while off route,
+  // "distance to the next maneuver" isn't a meaningful thing to announce,
+  // since bestCumulativeMeters is measuring distance to the nearest point
+  // on a route you're not actually following right now.
+  function updateVoiceGuidance(bestDist, bestCumulativeMeters){
+    if(routeManeuvers.length === 0) return;
+    if(bestDist > OFF_ROUTE_METERS){
+      if(!offRoute){
+        offRoute = true;
+        offRouteAcknowledged = false;
+        setOffRouteBannerVisible(true);
+        speak('You are off route.');
+        lastOffRouteAlertAt = Date.now();
+      } else if(!offRouteAcknowledged && Date.now() - lastOffRouteAlertAt >= OFF_ROUTE_REALERT_MS){
+        speak('You are still off route.');
+        lastOffRouteAlertAt = Date.now();
+      }
+      return;
+    }
+    if(offRoute){
+      offRoute = false;
+      offRouteAcknowledged = false;
+      setOffRouteBannerVisible(false);
+    }
+
+    while(nextManeuverIndex < routeManeuvers.length && bestCumulativeMeters > routeManeuvers[nextManeuverIndex].distanceFromStart + 3){
+      nextManeuverIndex++;
+    }
+    if(nextManeuverIndex >= routeManeuvers.length) return;
+    const m = routeManeuvers[nextManeuverIndex];
+    const distTo = m.distanceFromStart - bestCumulativeMeters;
+    if(!m.announcedFar && distTo <= FAR_ANNOUNCE_METERS){
+      speak(maneuverFarText(m));
+      m.announcedFar = true;
+    }
+    if(!m.announcedNear && distTo <= NEAR_ANNOUNCE_METERS){
+      speak(maneuverNearText(m));
+      m.announcedNear = true;
+    }
+  }
+  // Resets all turn-by-turn/off-route state for a fresh route — called from
+  // renderRoutePairs (a new plan) and anywhere liveRoutePoints gets cleared
+  // (cancelling, "Clear all data") so stale maneuvers/off-route state never
+  // carries over from a previous route.
+  function resetVoiceGuidanceState(){
+    nextManeuverIndex = 0;
+    offRoute = false;
+    offRouteAcknowledged = false;
+    setOffRouteBannerVisible(false);
+    if('speechSynthesis' in window) speechSynthesis.cancel();
   }
 
   function liveDivIcon(){
@@ -4505,7 +4800,8 @@
           const ll = [lat, lng];
           lastKnownLatLng = ll;
           lastSpeed = pos.coords.speed;
-          updateRouteProgress(lat, lng);
+          const progress = updateRouteProgress(lat, lng);
+          if(progress) updateVoiceGuidance(progress.bestDist, progress.bestCumulativeMeters);
 
           if(recording){
             trackPoints.push({
@@ -4968,6 +5264,8 @@ ${pts}
       routeLayerKeys = [];
       routeLayerKeySet = new Set();
       liveRoutePoints = [];
+      routeManeuvers = [];
+      resetVoiceGuidanceState();
       routeProgressBadge.style.display = 'none';
       autoPinLayer.clearLayers();
       Object.keys(autoPinMarkers).forEach(k=>delete autoPinMarkers[k]);
@@ -5169,6 +5467,13 @@ ${pts}
       // through the segment itself, so extend it to cover that too
       liveRoutePoints = liveRoutePoints.concat(segmentPoints);
       updateRouteProgressVisibility();
+      // Same for the maneuver list — renderRoutePairs just built it for
+      // the approach route alone, ending in an 'arrive' at the segment's
+      // start; appendGeometricManeuvers picks up from that exact distance
+      // and continues turn detection (geometry-only, no street names —
+      // see its own comment) through the segment itself.
+      const approachEndMeters = routeManeuvers.length ? routeManeuvers[routeManeuvers.length-1].distanceFromStart : 0;
+      appendGeometricManeuvers(segmentPoints, approachEndMeters);
 
       map.fitBounds(L.latLngBounds(result.pairs.flat().concat(segmentPoints)), { padding: [40, 40] });
 
