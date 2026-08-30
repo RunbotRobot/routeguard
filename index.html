@@ -279,7 +279,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.98</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.99</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -4509,16 +4509,75 @@
     try{ localStorage.setItem(LS_VOICE_GUIDANCE, voiceGuidanceEnabled ? '1' : '0'); }catch(e){}
     if(!voiceGuidanceEnabled && 'speechSynthesis' in window) speechSynthesis.cancel();
   };
+  // SpeechSynthesisUtterance.volume already defaults to 1 (its max — set
+  // explicitly below anyway, so it's never silently left lower) and the
+  // browser gives no way to push actual TTS output any louder than that:
+  // unlike an <audio>/<video> element or a Web Audio buffer, spoken output
+  // isn't exposed as something a GainNode can amplify. What IS fully in
+  // our control is a distinct alert tone played right before the words —
+  // and a sharp transient cuts through background music more reliably
+  // than raw loudness does regardless (the same reason a phone alarm or a
+  // turn-by-turn "bong" is a tone, not just louder speech). Real report:
+  // the OS wasn't ducking background music for spoken turns at all, so
+  // this tone is the one lever left that's ours alone to control.
+  let audioCtx = null;
+  function getAudioCtx(){
+    if(!audioCtx){
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if(AC){ try{ audioCtx = new AC(); }catch(e){ /* unsupported/blocked — chime just won't play */ } }
+    }
+    return audioCtx;
+  }
+  // Mobile browsers start a Web Audio context suspended until a genuine
+  // user gesture unlocks it — a GPS-fix-driven announcement is never
+  // itself a gesture, so without this, the very first chime (the one for
+  // whatever announcement fires first on a run) could silently do
+  // nothing. Priming on the page's very first tap/click (planning a
+  // route, opening Settings, anything) means the context is already
+  // unlocked long before a real announcement is ever due, since a route
+  // has to be planned — itself a series of taps — before turn-by-turn
+  // guidance has anything to say.
+  document.addEventListener('pointerdown', function unlockAudioOnce(){
+    const ctx = getAudioCtx();
+    if(ctx && ctx.state === 'suspended') ctx.resume().catch(()=>{});
+    document.removeEventListener('pointerdown', unlockAudioOnce);
+  }, { once: true });
+  function playAlertChime(){
+    const ctx = getAudioCtx();
+    if(!ctx) return;
+    if(ctx.state === 'suspended') ctx.resume().catch(()=>{});
+    const now = ctx.currentTime;
+    // two short ascending tones (an "alert" shape, not a chord) — loud but
+    // ramped in/out over ~15ms on each end so it's a clean blip rather
+    // than an audible click
+    [880, 1174.66].forEach((freq, i)=>{
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      const start = now + i * 0.13;
+      const dur = 0.12;
+      gain.gain.setValueAtTime(0, start);
+      gain.gain.linearRampToValueAtTime(1, start + 0.015);
+      gain.gain.linearRampToValueAtTime(0, start + dur);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(start);
+      osc.stop(start + dur + 0.02);
+    });
+  }
   function speak(text){
     if(!voiceGuidanceEnabled || !text) return;
     if(!('speechSynthesis' in window)) return;
     try{
+      playAlertChime();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.volume = 1;
       // Not explicitly cancelling any in-progress utterance first — the
       // browser already queues consecutive speak() calls rather than
       // talking over itself, and cancelling on every call would cut off a
       // longer instruction the instant a short one (like an off-route
       // re-alert) came in right behind it.
-      speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+      speechSynthesis.speak(utterance);
     }catch(err){ console.error('Speech synthesis failed:', err); }
   }
   const METERS_PER_FOOT = 0.3048;
