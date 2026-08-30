@@ -279,7 +279,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v1.99</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v2.00</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -4565,19 +4565,37 @@
       osc.stop(start + dur + 0.02);
     });
   }
-  function speak(text){
+  // repeat: true for anything actionable-right-now (the near-turn cue, any
+  // off-route alert) — speechSynthesis output shares the phone's ordinary
+  // media volume stream with whatever's playing music, not a separate
+  // notification channel a website could balance against it, so there's
+  // no OS setting to lean on for intelligibility over background noise.
+  // Saying the words twice in a row is the one thing fully in our own
+  // control that actually helps catch them the second time if the first
+  // was lost in the mix — the plain heads-up/depart/arrive cues stay
+  // single, since those aren't the ones you have only seconds to react to.
+  function speak(text, repeat){
     if(!voiceGuidanceEnabled || !text) return;
     if(!('speechSynthesis' in window)) return;
     try{
       playAlertChime();
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.volume = 1;
-      // Not explicitly cancelling any in-progress utterance first — the
-      // browser already queues consecutive speak() calls rather than
-      // talking over itself, and cancelling on every call would cut off a
-      // longer instruction the instant a short one (like an off-route
-      // re-alert) came in right behind it.
-      speechSynthesis.speak(utterance);
+      const times = repeat ? 2 : 1;
+      for(let i=0;i<times;i++){
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.volume = 1;
+        // A touch slower than the default rate (1) — TTS engines generally
+        // enunciate more distinctly at a slightly slower pace, which reads
+        // as clearer over background noise even at the same raw volume;
+        // still close enough to natural speed not to feel sluggish on a
+        // short phrase like these.
+        utterance.rate = 0.85;
+        // Not explicitly cancelling any in-progress utterance first — the
+        // browser already queues consecutive speak() calls rather than
+        // talking over itself, and cancelling on every call would cut off
+        // a longer instruction the instant a short one (like an off-route
+        // re-alert, or this same repeat) came in right behind it.
+        speechSynthesis.speak(utterance);
+      }
     }catch(err){ console.error('Speech synthesis failed:', err); }
   }
   const METERS_PER_FOOT = 0.3048;
@@ -4624,10 +4642,10 @@
         offRoute = true;
         offRouteAcknowledged = false;
         setOffRouteBannerVisible(true);
-        speak('You are off route.');
+        speak('You are off route.', true);
         lastOffRouteAlertAt = Date.now();
       } else if(!offRouteAcknowledged && Date.now() - lastOffRouteAlertAt >= OFF_ROUTE_REALERT_MS){
-        speak('You are still off route.');
+        speak('You are still off route.', true);
         lastOffRouteAlertAt = Date.now();
       }
       return;
@@ -4649,7 +4667,9 @@
       m.announcedFar = true;
     }
     if(!m.announcedNear && distTo <= NEAR_ANNOUNCE_METERS){
-      speak(maneuverNearText(m));
+      // repeated only for an actual turn — the one you have seconds left
+      // to act on; depart/continue/arrive are informational, not urgent
+      speak(maneuverNearText(m), m.type === 'turn');
       m.announcedNear = true;
     }
   }
