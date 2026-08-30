@@ -279,7 +279,7 @@
   <header>
     <div class="brand">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 12 2a7 7 0 0 1 7 7.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>
-      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v2.00</span>
+      RouteGuard <span style="opacity:.7;font-weight:400;font-size:12px;margin-left:2px;">v2.01</span>
     </div>
     <div class="status" id="statusLine">local · no data leaves this device</div>
   </header>
@@ -4508,6 +4508,7 @@
     voiceGuidanceEnabled = voiceGuidanceToggle.checked;
     try{ localStorage.setItem(LS_VOICE_GUIDANCE, voiceGuidanceEnabled ? '1' : '0'); }catch(e){}
     if(!voiceGuidanceEnabled && 'speechSynthesis' in window) speechSynthesis.cancel();
+    syncGuidanceAudioSession();
   };
   // SpeechSynthesisUtterance.volume already defaults to 1 (its max — set
   // explicitly below anyway, so it's never silently left lower) and the
@@ -4683,6 +4684,87 @@
     offRouteAcknowledged = false;
     setOffRouteBannerVisible(false);
     if('speechSynthesis' in window) speechSynthesis.cancel();
+    syncGuidanceAudioSession();
+  }
+
+  // ---------- silent audio-focus hold, to try for real OS-level ducking ----------
+  // speechSynthesis output and the Web Audio chime above never registered as
+  // "media" with the phone's audio-focus system the way an actual
+  // <audio>/<video> element does — confirmed by real-world testing that
+  // background music (Pandora) simply wasn't ducking for either one, and
+  // Pandora itself has no ducking setting to enable. This plays a silent,
+  // looping, barely-audible track — plus Media Session metadata, the same
+  // API a podcast or music app uses — for as long as a route is actively
+  // being narrated live, on the theory that holding continuous audio focus
+  // (like a real media app would) has a better chance of getting a
+  // co-running music app ducked than brief, transient sounds ever did.
+  // Unverifiable from this environment — it depends entirely on the phone's
+  // OS and the other app's own focus handling — and it comes with a real,
+  // known side effect: a persistent lock-screen/notification media widget
+  // for RouteGuard while active. Fully reversible and self-contained:
+  // turning off "Voice guidance", turning off "Show my location", or
+  // clearing/replanning the route all stop it via syncGuidanceAudioSession.
+  const SILENT_AUDIO_SRC = 'data:audio/wav;base64,UklGRkQDAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YSADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==';
+  let silentAudioEl = null;
+  function getSilentAudioEl(){
+    if(!silentAudioEl){
+      silentAudioEl = document.createElement('audio');
+      silentAudioEl.src = SILENT_AUDIO_SRC;
+      silentAudioEl.loop = true;
+      // not fully 0 -- some OSes ignore a completely-silent stream when
+      // deciding whether another app's audio should be ducked at all
+      silentAudioEl.volume = 0.01;
+      silentAudioEl.setAttribute('playsinline', '');
+      silentAudioEl.style.display = 'none';
+      document.body.appendChild(silentAudioEl);
+    }
+    return silentAudioEl;
+  }
+  let guidanceAudioSessionActive = false;
+  function guidanceAudioSessionShouldBeActive(){
+    return voiceGuidanceEnabled && watchId != null && routeManeuvers.length > 0;
+  }
+  // Called from every place that can change any of the three conditions
+  // above: the voice-guidance toggle, resetVoiceGuidanceState (route
+  // planned/replanned/cleared), and starting/stopping live position
+  // tracking. Cheap and idempotent — bails immediately if nothing changed.
+  function syncGuidanceAudioSession(){
+    const shouldRun = guidanceAudioSessionShouldBeActive();
+    if(shouldRun === guidanceAudioSessionActive) return;
+    guidanceAudioSessionActive = shouldRun;
+    const el = getSilentAudioEl();
+    if(shouldRun){
+      // Like the Web Audio context, this can be blocked until a user
+      // gesture unlocks it — if so, guidanceAudioSessionActive is rolled
+      // back so the next qualifying call (another toggle, another fix)
+      // retries rather than believing it's already running.
+      el.play().catch(()=>{ guidanceAudioSessionActive = false; });
+      if('mediaSession' in navigator){
+        try{
+          navigator.mediaSession.metadata = new MediaMetadata({
+            title: 'Voice guidance active',
+            artist: 'RouteGuard',
+            artwork: [{ src: 'icon-512.png', sizes: '512x512', type: 'image/png' }]
+          });
+          navigator.mediaSession.playbackState = 'playing';
+          // Some OSes offer a pause/stop control on the lock-screen widget;
+          // treat either as "resume" rather than actually stopping, since
+          // silence is the point and there's nothing meaningful to pause.
+          navigator.mediaSession.setActionHandler('pause', ()=>{ navigator.mediaSession.playbackState = 'playing'; el.play().catch(()=>{}); });
+          navigator.mediaSession.setActionHandler('stop', ()=>{ navigator.mediaSession.playbackState = 'playing'; el.play().catch(()=>{}); });
+        }catch(err){ /* MediaMetadata/mediaSession unsupported -- silent audio still plays without it */ }
+      }
+    } else {
+      el.pause();
+      if('mediaSession' in navigator){
+        try{
+          navigator.mediaSession.playbackState = 'none';
+          navigator.mediaSession.metadata = null;
+          navigator.mediaSession.setActionHandler('pause', null);
+          navigator.mediaSession.setActionHandler('stop', null);
+        }catch(err){}
+      }
+    }
   }
 
   function liveDivIcon(){
@@ -4915,6 +4997,7 @@
           // refresh nearby pins/roads only if we're nearing the edge of what's
           // loaded, and only as often as the throttle allows — not every fix
           maybeRefreshForLiveTracking(L.latLng(ll[0], ll[1]));
+          syncGuidanceAudioSession();
         }catch(err){
           console.error('Position update failed:', err);
           showWarn('Position marker hit an error — toggling "Show my location" off and on may help.', 5000);
@@ -4942,6 +5025,7 @@
     if(liveMarker){ map.removeLayer(liveMarker); liveMarker = null; coneEl = null; }
     if(liveAccuracyCircle){ map.removeLayer(liveAccuracyCircle); liveAccuracyCircle = null; }
     updateMapRotationVisual(); // showingLocation just went false — snaps rotation back to north-up if it was active
+    syncGuidanceAudioSession(); // watchId just went null -- stop the silent audio session immediately rather than waiting for a fix that will never come
   }
 
   showLocationToggle.onchange = ()=>{
